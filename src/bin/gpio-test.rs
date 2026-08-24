@@ -14,9 +14,9 @@ use esp_hal::{
     time::{Duration, Instant},
 };
 
-use esp_println as _;
-use defmt::info;
 use defmt::error;
+use defmt::info;
+use esp_println as _;
 
 #[panic_handler]
 fn panic(panic_info: &core::panic::PanicInfo) -> ! {
@@ -45,14 +45,35 @@ fn main() -> ! {
     // 按键配置 - 上拉输入 (低电平有效)
     let btn_config = InputConfig::default().with_pull(Pull::Up);
 
-    let mut btn_vol_down = Input::new(peripherals.GPIO18, btn_config);  // SW1
-    let mut btn_vol_up = Input::new(peripherals.GPIO1, btn_config);     // SW2
+    let mut btn_vol_down = Input::new(peripherals.GPIO18, btn_config); // SW1
+    let mut btn_vol_up = Input::new(peripherals.GPIO1, btn_config); // SW2
     let mut btn_config_pin = Input::new(peripherals.GPIO2, btn_config); // SW3
 
     info!("按键状态检测:");
-    info!("  音量减 (GPIO18): {}", if btn_vol_down.is_low() { "按下" } else { "未按下" });
-    info!("  音量加 (GPIO1):  {}", if btn_vol_up.is_low() { "按下" } else { "未按下" });
-    info!("  配网 (GPIO2):    {}", if btn_config_pin.is_low() { "按下" } else { "未按下" });
+    info!(
+        "  音量减 (GPIO18): {}",
+        if btn_vol_down.is_low() {
+            "按下"
+        } else {
+            "未按下"
+        }
+    );
+    info!(
+        "  音量加 (GPIO1):  {}",
+        if btn_vol_up.is_low() {
+            "按下"
+        } else {
+            "未按下"
+        }
+    );
+    info!(
+        "  配网 (GPIO2):    {}",
+        if btn_config_pin.is_low() {
+            "按下"
+        } else {
+            "未按下"
+        }
+    );
 
     // LED 闪烁测试
     info!("LED 闪烁测试 (10次)...");

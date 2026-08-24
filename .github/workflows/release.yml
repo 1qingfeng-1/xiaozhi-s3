@@ -24,26 +24,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
 
-      - name: Install espup
+      - name: Install nightly rustfmt
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: Install espup and ESP toolchain
         run: |
           cargo install espup --locked
-
-      - name: Install ESP toolchain
-        run: |
-          source $HOME/.espup/export-esp.sh
           espup install
+          if [ -f "$HOME/.espup/export-esp.sh" ]; then
+            . "$HOME/.espup/export-esp.sh"
+          fi
 
       - name: Cache cargo dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -56,7 +60,6 @@ jobs:
 
       - name: Build release firmware
         run: |
-          source $HOME/.espup/export-esp.sh
           cargo build --release
 
       - name: Check firmware size
@@ -66,7 +69,7 @@ jobs:
           echo "Flash size: 16MB (16777216 bytes)"
 
       - name: Upload firmware artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: firmware-release
           path: target/xtensa-esp32s3-none-elf/release/xiaozhi-s3
@@ -82,7 +85,7 @@ jobs:
       tag_name: ${{ steps.extract.outputs.tag_name }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -110,7 +113,7 @@ jobs:
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Upload changelog
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: changelog
           path: CHANGELOG.md
@@ -124,18 +127,18 @@ jobs:
     if: github.event_name == 'push' || inputs.tag != ''
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Download firmware
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: firmware-release
           path: release/
 
       - name: Download changelog
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: changelog
           path: release/

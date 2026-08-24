@@ -14,9 +14,9 @@ use esp_hal::{
     time::{Duration, Instant},
 };
 
-use esp_println as _;
-use defmt::info;
 use defmt::error;
+use defmt::info;
+use esp_println as _;
 
 #[panic_handler]
 fn panic(panic_info: &core::panic::PanicInfo) -> ! {
@@ -56,14 +56,14 @@ fn main() -> ! {
 
     // 配置按键 (低电平有效, 上拉输入)
     let btn_config = InputConfig::default().with_pull(Pull::Up);
-    let _btn_vol_down = Input::new(peripherals.GPIO18, btn_config);  // SW1
-    let _btn_vol_up = Input::new(peripherals.GPIO1, btn_config);     // SW2
-    let _btn_config = Input::new(peripherals.GPIO2, btn_config);     // SW3
+    let _btn_vol_down = Input::new(peripherals.GPIO18, btn_config); // SW1
+    let _btn_vol_up = Input::new(peripherals.GPIO1, btn_config); // SW2
+    let _btn_config = Input::new(peripherals.GPIO2, btn_config); // SW3
     info!("按键已配置: 音量+/音量-/配网");
 
     // 充电状态检测 (LGS4056HDA)
-    let _chg_done = Input::new(peripherals.GPIO28, InputConfig::default());  // 充电完成
-    let _chg_chrg = Input::new(peripherals.GPIO29, InputConfig::default());  // 充电中
+    let _chg_done = Input::new(peripherals.GPIO28, InputConfig::default()); // 充电完成
+    let _chg_chrg = Input::new(peripherals.GPIO29, InputConfig::default()); // 充电中
     info!("充电检测已配置");
 
     info!("================================");
