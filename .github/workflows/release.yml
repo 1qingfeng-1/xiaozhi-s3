@@ -13,7 +13,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTUP_TOOLCHAIN: esp
 
 permissions:
   contents: write
@@ -32,8 +31,17 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 'esp'
           components: rustfmt, clippy
+
+      - name: Install espup
+        run: |
+          cargo install espup --locked
+          source $HOME/.espup/export-esp.sh
+
+      - name: Install ESP toolchain
+        run: |
+          source $HOME/.espup/export-esp.sh
+          espup install
 
       - name: Cache cargo dependencies
         uses: actions/cache@v4
@@ -48,7 +56,9 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build release firmware
-        run: cargo build --release
+        run: |
+          source $HOME/.espup/export-esp.sh
+          cargo build --release
 
       - name: Check firmware size
         run: |
