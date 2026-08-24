@@ -1,2 +1,5 @@
 [toolchain]
-channel = "esp"
+channel = "stable"
+
+[targets]
+xtensa-esp32s3-none-elf = true

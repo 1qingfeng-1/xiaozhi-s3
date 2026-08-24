@@ -18,7 +18,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -26,7 +26,6 @@ jobs:
       - name: Install espup
         run: |
           cargo install espup --locked
-          source $HOME/.espup/export-esp.sh
 
       - name: Install ESP toolchain
         run: |
@@ -58,7 +57,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -66,7 +65,6 @@ jobs:
       - name: Install espup
         run: |
           cargo install espup --locked
-          source $HOME/.espup/export-esp.sh
 
       - name: Install ESP toolchain
         run: |
@@ -98,7 +96,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -106,7 +104,6 @@ jobs:
       - name: Install espup
         run: |
           cargo install espup --locked
-          source $HOME/.espup/export-esp.sh
 
       - name: Install ESP toolchain
         run: |
@@ -139,7 +136,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -147,7 +144,6 @@ jobs:
       - name: Install espup
         run: |
           cargo install espup --locked
-          source $HOME/.espup/export-esp.sh
 
       - name: Install ESP toolchain
         run: |
