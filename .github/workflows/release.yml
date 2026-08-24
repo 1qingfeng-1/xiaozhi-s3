@@ -1,0 +1,190 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v1.0.0)'
+        required: false
+        default: ''
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: esp
+
+permissions:
+  contents: write
+
+jobs:
+  # 构建 release 固件
+  build:
+    name: Build release firmware
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'esp'
+          components: rustfmt, clippy
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-cargo-
+
+      - name: Build release firmware
+        run: cargo build --release
+
+      - name: Check firmware size
+        run: |
+          echo "=== Release Firmware Size ==="
+          ls -lh target/xtensa-esp32s3-none-elf/release/xiaozhi-s3
+          echo "Flash size: 16MB (16777216 bytes)"
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-release
+          path: target/xtensa-esp32s3-none-elf/release/xiaozhi-s3
+          retention-days: 30
+
+  # 生成 changelog
+  changelog:
+    name: Generate changelog
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      changelog: ${{ steps.generate.outputs.changelog }}
+      tag_name: ${{ steps.extract.outputs.tag_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract tag name
+        id: extract
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "tag_name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "tag_name=${{ inputs.tag || 'v0.0.0' }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate changelog with git-cliff
+        id: generate
+        run: |
+          # 安装 git-cliff
+          cargo binstall git-cliff || cargo install git-cliff
+
+          # 生成 changelog
+          git-cliff --config cliff.toml --tag ${{ steps.extract.outputs.tag_name }} --strip-header > CHANGELOG.md
+
+          # 输出 changelog 内容
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          cat CHANGELOG.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Upload changelog
+        uses: actions/upload-artifact@v4
+        with:
+          name: changelog
+          path: CHANGELOG.md
+          retention-days: 30
+
+  # 创建 GitHub Release
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build, changelog]
+    if: github.event_name == 'push' || inputs.tag != ''
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware-release
+          path: release/
+
+      - name: Download changelog
+        uses: actions/download-artifact@v4
+        with:
+          name: changelog
+          path: release/
+
+      - name: Prepare release files
+        run: |
+          # 重命名固件文件
+          mv release/xiaozhi-s3 release/xiaozhi-s3-${{ needs.changelog.outputs.tag_name }}.bin
+          ls -lh release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.changelog.outputs.tag_name }}
+          name: Release ${{ needs.changelog.outputs.tag_name }}
+          body: |
+            ## 小智音箱固件发布
+
+            ### 变更日志
+
+            ${{ needs.changelog.outputs.changelog }}
+
+            ### 固件信息
+
+            - **芯片**: ESP32-S3R8
+            - **Flash**: 16MB
+            - **固件大小**: $(du -sh release/xiaozhi-s3-*.bin | cut -f1)
+            - **构建日期**: $(date +%Y-%m-%d)
+
+            ### 烧录方法
+
+            ```bash
+            # 使用 espflash
+            espflash flash --chip esp32s3 --baud 460800 xiaozhi-s3-${{ needs.changelog.outputs.tag_name }}.bin
+
+            # 或使用 cargo
+            cargo run --release
+            ```
+
+            ### 验证
+
+            ```bash
+            # 检查固件大小
+            ls -lh xiaozhi-s3-${{ needs.changelog.outputs.tag_name }}.bin
+
+            # 查看固件信息
+            espflash image_info --chip esp32s3 xiaozhi-s3-${{ needs.changelog.outputs.tag_name }}.bin
+            ```
+
+          files: |
+            release/xiaozhi-s3-${{ needs.changelog.outputs.tag_name }}.bin
+            release/CHANGELOG.md
+          draft: false
+          prerelease: false
+
+      - name: Verify release
+        run: |
+          echo "=== Release created successfully ==="
+          echo "Tag: ${{ needs.changelog.outputs.tag_name }}"
+          echo "Files:"
+          ls -lh release/
