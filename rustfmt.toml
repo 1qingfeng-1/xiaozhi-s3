@@ -1,0 +1,57 @@
+# Rust 格式化配置
+# https://rust-lang.github.io/rustfmt/
+
+# 基本设置
+hard_tabs = false
+tab_spaces = 4
+max_width = 100
+
+# 导入排序
+reorder_imports = true
+reorder_modules = true
+
+# 空行控制
+blank_lines_upper_bound = 1
+blank_lines_lower_bound = 0
+
+# 注释格式
+comment_width = 80
+wrap_comments = false
+normalize_comments = true
+
+# 字符串格式
+string_width = 60
+force_string_style = "Single"
+
+# 结构体和枚举
+struct_lit_width = 18
+struct_variant_width = 35
+array_width = 60
+chain_width = 60
+single_line_if_else_max_width = 50
+
+# 匹配器
+match_block_trailing_comma = true
+match_arm_blocks = true
+match_arm_pipelined = false
+
+# 函数
+fn_call_width = 60
+where_single_line = true
+
+# 属性
+attrs_order = "alphabetic"
+attrs_small_heuristics = "default"
+
+# 溢出
+overflow_delimited_expr = true
+
+# 其他
+use_small_heuristics = "max"
+use_field_init_shorthand = true
+use_try_shorthand = true
+
+# 嵌入式特定设置
+# 禁用某些可能影响嵌入式代码的格式化
+# format_strings = false  # 保持字符串原样，避免影响日志格式
+# format_macro_matchers = false  # 保持宏匹配器原样
