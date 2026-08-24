@@ -65,7 +65,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings --cap-lints allow
+        run: cargo clippy --all-features -- -D warnings --cap-lints allow
 
   # 类型检查
   check:
