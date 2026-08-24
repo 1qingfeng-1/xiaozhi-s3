@@ -95,39 +95,11 @@ jobs:
       - name: Run cargo check
         run: cargo check --all
 
-  # 单元测试
-  test:
-    name: Run tests
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Install ESP toolchain
-        uses: esp-rs/xtensa-toolchain@v1.7
-        with:
-          buildtargets: esp32s3
-
-      - name: Cache cargo dependencies
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-test-
-            ${{ runner.os }}-cargo-
-
-      - name: Run tests
-        run: cargo test --all-features
-
-  # 构建固件
+  # 构建固件（no_std 目标无法 cargo test，测试依赖 HIL 设备）
   build:
     name: Build firmware
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, check, test]
+    needs: [fmt, clippy, check]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
