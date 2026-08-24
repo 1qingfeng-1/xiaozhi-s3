@@ -28,23 +28,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install stable Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install ESP toolchain
+        uses: esp-rs/xtensa-toolchain@v1.7
         with:
-          components: clippy
-
-      - name: Install nightly rustfmt
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt
-
-      - name: Install espup and ESP toolchain
-        run: |
-          cargo install espup --locked
-          espup install
-          if [ -f "$HOME/.espup/export-esp.sh" ]; then
-            . "$HOME/.espup/export-esp.sh"
-          fi
+          buildtargets: esp32s3
 
       - name: Cache cargo dependencies
         uses: actions/cache@v6
