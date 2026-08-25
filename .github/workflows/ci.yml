@@ -95,11 +95,44 @@ jobs:
       - name: Run cargo check
         run: cargo check --all
 
+  # 纯逻辑核心层 (xiaozhi-core) host 单元测试
+  # 不需要 esp 工具链 (host x86_64 target), 用 stable + cargo-nextest
+  core-test:
+    name: Core unit tests (host)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (with submodule)
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            xiaozhi-core/target
+          key: ${{ runner.os }}-cargo-core-test-${{ hashFiles('xiaozhi-core/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-core-test-
+            ${{ runner.os }}-cargo-
+
+      - name: Run core unit tests
+        working-directory: xiaozhi-core
+        run: cargo nextest run
+
   # 构建固件（no_std 目标无法 cargo test，测试依赖 HIL 设备）
   build:
     name: Build firmware
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, check]
+    needs: [fmt, clippy, check, core-test]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7

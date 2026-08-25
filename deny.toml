@@ -1,11 +1,7 @@
 # Cargo deny 配置 - 针对嵌入式项目优化
 # https://github.com/EmbarkStudios/cargo-deny
 
-# 工作空间根目录
-[output]
-format = "brief"
-
-# 依赖检查配置
+# 依赖许可证检查
 [licenses]
 # 允许的许可证白名单
 allow = [
@@ -13,42 +9,24 @@ allow = [
     "Apache-2.0",
     "ISC",
     "Unicode-DFS-2016",
+    "Unicode-3.0",
     "Zlib",
 ]
 # 检查许可证兼容性
 confidence-threshold = 0.8
-# 允许私有 crate
-allow-private = true
 
 # 安全漏洞检查
 [advisories]
 # 忽略已知的安全漏洞 (需要手动维护)
 ignore = [
-    # RUSTSEC-2024-XXXX 在这里添加需要忽略的漏洞 ID
-    # 例如: "RUSTSEC-2024-0001"
+    # paste crate 标记为 unmaintained (esp-hal 依赖链), 暂接受
+    "RUSTSEC-2024-0436",
 ]
 # 检查所有依赖
 yanked = "deny"
-
-# 数据库配置
-[database]
-# 使用 RustSec 数据库
-url = "https://github.com/rustsec/advisory-db"
-
-# 目标平台配置 (嵌入式特定)
-[targets]
-# 只检查目标平台的依赖
-# 对于 ESP32-S3, 目标是 xtensa-esp32s3-none-elf
-ignore = []
 
 # 源配置
 [sources]
 # 允许的 crate 源
 unknown-registry = "deny"
 unknown-git = "allow"
-
-# 已知问题
-# 嵌入式项目中常见的依赖问题
-# 1. 某些 crate 可能包含不必要的标准库依赖
-# 2. 某些 crate 可能不兼容 no_std 环境
-# 3. 内存占用过大的依赖需要特别注意

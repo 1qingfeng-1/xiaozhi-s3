@@ -13,7 +13,7 @@
 #![no_std]
 
 // 子模块声明
-// pub mod audio;
+pub mod audio;
 // pub mod gpio;
 // pub mod system;
 // pub mod wifi;

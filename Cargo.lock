@@ -1425,6 +1425,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "xiaozhi-core"
+version = "0.1.0"
+
+[[package]]
 name = "xiaozhi-s3"
 version = "0.1.0"
 dependencies = [
@@ -1434,6 +1438,7 @@ dependencies = [
  "esp-bootloader-esp-idf",
  "esp-hal",
  "esp-println",
+ "xiaozhi-core",
 ]
 
 [[package]]

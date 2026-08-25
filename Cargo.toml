@@ -1,5 +1,6 @@
 [package]
 edition      = "2024"
+license      = "MIT"
 name         = "xiaozhi-s3"
 rust-version = "1.88"
 version      = "0.1.0"
@@ -9,6 +10,10 @@ name = "xiaozhi-s3"
 path = "./src/bin/main.rs"
 
 [dependencies]
+# 纯逻辑核心层（音量映射/时钟计算/寄存器序列/状态机），host 可单元测试
+# git submodule: xiaozhi-core
+xiaozhi-core = { path = "xiaozhi-core" }
+
 esp-hal = { version = "~1.1.0", features = ["defmt", "esp32s3", "unstable"] }
 
 

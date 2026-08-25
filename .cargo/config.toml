@@ -1,14 +1,15 @@
 [target.xtensa-esp32s3-none-elf]
 runner = "espflash flash --monitor --chip esp32s3 --log-format defmt"
+# -nostartfiles 只作用于 esp target (per-target rustflags)。
+# 放在 [build] 全局会污染 host target, 导致 xiaozhi-core 的 host 测试链接失败。
+rustflags = [
+  "-C", "link-arg=-nostartfiles",
+]
 
 [env]
 DEFMT_LOG="info"
 
 [build]
-rustflags = [
-  "-C", "link-arg=-nostartfiles",
-]
-
 target = "xtensa-esp32s3-none-elf"
 
 [unstable]

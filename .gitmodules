@@ -1,0 +1,3 @@
+[submodule "xiaozhi-core"]
+	path = xiaozhi-core
+	url = git@github.com:1qingfeng-1/xiaozhi-core.git
