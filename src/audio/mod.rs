@@ -2,9 +2,9 @@
 //! I2S 音频接口配置
 
 use esp_hal::{
-    i2s::{I2s, Mode, Standard, Config},
-    i2c::{I2c, Config as I2cConfig, Frequency},
-    peripherals::{I2S0, I2C0},
+    i2c::{Config as I2cConfig, Frequency, I2c},
+    i2s::{Config, I2s, Mode, Standard},
+    peripherals::{I2C0, I2S0},
 };
 
 /// 音频配置
@@ -35,7 +35,10 @@ impl Audio {
         // TODO: 配置 I2S 时钟 (BCLK, LRCK)
         // TODO: 配置 I2C 地址 (ES8311: 0x18, ES7210: 0x40)
 
-        Self { _i2s: i2s, _i2c: i2c }
+        Self {
+            _i2s: i2s,
+            _i2c: i2c,
+        }
     }
 
     /// 开始录音 (麦克风采集)

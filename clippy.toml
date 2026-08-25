@@ -5,14 +5,6 @@
 # ESP32-S3 的默认栈大小较小，需要特别注意
 stack-size-threshold = 1024
 
-# 允许较大的堆分配 (嵌入式项目中常见)
-# 但需要仔细评估内存占用
-# 例如: 音频缓冲区, 网络缓冲区等
-
-# 模块名称检查
-# 禁止使用不规范的模块名称
-module-inception = "warn"
-
 # 类型复杂度
 type-complexity-threshold = 250
 
@@ -20,65 +12,4 @@ type-complexity-threshold = 250
 cognitive-complexity-threshold = 25
 
 # 嵌套深度
-nesting-threshold = 4
-
-# 函数长度
-function-threshold = 100
-
-# 模块数量
-module-threshold = 10
-
-# 嵌入式特定的 Clippy 检查
-
-# 建议: 避免在嵌入式代码中使用某些高级特性
-# 1. 避免递归 (栈溢出风险)
-# 2. 避免大数组 (内存占用)
-# 3. 避免不必要的堆分配
-# 4. 避免复杂的 trait 实现
-
-# 允许: 嵌入式项目中常见的模式
-# - 使用 unsafe 代码 (硬件驱动)
-# - 使用循环 (代替递归)
-# - 使用静态缓冲区 (代替堆分配)
-
-# 忽略列表
-# 这些 Clippy lints 在嵌入式项目中可以接受
-# 根据项目需求调整
-allow = [
-    # 允许使用 println! (通过 esp-println 重定向)
-    "print_stdout",
-
-    # 允许使用 eprintln! (通过 esp-println 重定向)
-    "print_stderr",
-
-    # 允许使用 Vec (通过 esp-alloc 支持)
-    "vec_init_then_push",
-
-    # 允许使用 Box (通过 esp-alloc 支持)
-    "box_default",
-
-    # 允许使用 String (通过 esp-alloc 支持)
-    "string_to_string",
-
-    # 允许使用 HashMap (通过 esp-alloc 支持)
-    "map_entry",
-]
-
-# 禁止: 嵌入式项目中不推荐的模式
-deny = [
-    # 禁止使用 mem::forget (内存泄漏)
-    "mem_forget",
-
-    # 禁止使用 unsafe 代码 (除非有充分理由)
-    # 注意: 这个需要手动添加 unsafe 块
-    # "undocumented_unsafe_blocks",
-
-    # 禁止使用递归 (栈溢出风险)
-    "recursive_format_impl",
-
-    # 禁止使用大数组
-    "large_arrays",
-
-    # 禁止使用复杂类型
-    "type_complexity",
-]
+excessive-nesting-threshold = 4

@@ -45,9 +45,9 @@ fn main() -> ! {
     // 按键配置 - 上拉输入 (低电平有效)
     let btn_config = InputConfig::default().with_pull(Pull::Up);
 
-    let mut btn_vol_down = Input::new(peripherals.GPIO18, btn_config); // SW1
-    let mut btn_vol_up = Input::new(peripherals.GPIO1, btn_config); // SW2
-    let mut btn_config_pin = Input::new(peripherals.GPIO2, btn_config); // SW3
+    let btn_vol_down = Input::new(peripherals.GPIO18, btn_config); // SW1
+    let btn_vol_up = Input::new(peripherals.GPIO1, btn_config); // SW2
+    let btn_config_pin = Input::new(peripherals.GPIO2, btn_config); // SW3
 
     info!("按键状态检测:");
     info!(
