@@ -41,7 +41,7 @@ fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
+    esp_alloc::heap_allocator!(size: 73744);
 
     info!("=== 小智音箱启动 ===");
     info!("ESP32-S3 AI-2 智能音箱");
