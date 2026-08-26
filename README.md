@@ -16,18 +16,20 @@
 
 ## 项目结构
 
-```
+```text
 xiaozhi-s3/
 ├── src/
 │   ├── lib.rs          # 库定义
+│   ├── audio/          # 音频模块 (esp-hal 薄封装)
 │   └── bin/
 │       └── main.rs     # 主入口
+├── xiaozhi-core/       # 纯逻辑核心层 (git submodule, host 可测试)
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml      # CI 工作流
+│       ├── ci.yml      # CI 工作流 (含 core-test job)
 │       └── release.yml # Release 工作流
 ├── .cargo/
-│   └── config.toml     # ESP 工具链配置
+│   └── config.toml     # ESP 工具链配置 (-nostartfiles 为 per-target)
 ├── docs/               # 文档目录
 │   ├── README.md       # 文档导航
 │   ├── DEVELOPMENT.md  # 开发指南
@@ -72,6 +74,37 @@ cargo run --release
 espflash flash --chip esp32s3 --baud 460800 target/riscv32imc-esp-espidf/release/xiaozhi-s3
 ```
 
+## xiaozhi-core 纯逻辑核心层
+
+`xiaozhi-core` 是独立的纯逻辑 crate（git submodule），与硬件无关，**可在 host (x86_64) 上单元测试**，便于在硬件到货前开发音频逻辑。
+
+包含：
+
+- **音量映射**: 用户百分比 (0~100) ↔ ES8311 寄存器值 (0~63)
+- **时钟计算**: I2S BCLK/MCLK 频率、分频系数
+- **Codec 寄存器序列**: ES8311 (输出) / ES7210 (输入) 上电初始化序列
+- **音频状态机**: Idle/Initializing/Ready/Active/Paused/Error 状态转移
+
+### 运行单元测试
+
+```bash
+cd xiaozhi-core
+cargo +stable nextest run     # 推荐 (并行, 32 个测试)
+# 或
+cargo +stable test
+```
+
+> **注意**: 必须用 `+stable`（host 工具链）。`+esp` 是 no_std xtensa 工具链，无 host 的 std/test crate，无法跑测试。
+> 不要在 esp 仓库根目录跑 `cargo test`（会作用到 xtensa target 而失败），必须 `cd xiaozhi-core`。
+
+### 克隆仓库（含 submodule）
+
+```bash
+git clone --recurse-submodules <repo-url>
+# 或已克隆后
+git submodule update --init --recursive
+```
+
 ## 引脚映射
 
 | 功能 | GPIO | 说明 |
@@ -90,6 +123,7 @@ espflash flash --chip esp32s3 --baud 460800 target/riscv32imc-esp-espidf/release
 
 ## 依赖
 
+- `xiaozhi-core` (git submodule) - 纯逻辑核心层 (音量/时钟/寄存器序列/状态机)
 - `esp-hal` v1.1.0 - ESP32 HAL
 - `esp-alloc` v0.10.0 - 内存分配器
 - `esp-println` v0.17.0 - 打印支持
@@ -121,7 +155,9 @@ espflash flash --chip esp32s3 --baud 460800 target/riscv32imc-esp-espidf/release
 
 ## 下一步
 
-- [ ] 完善 I2S 驱动 (ES8311/ES7210)
+- [x] 纯逻辑核心层 xiaozhi-core (音量映射/时钟计算/寄存器序列/状态机 + 32 单测)
+- [x] 音频模块 esp-hal 1.1.x 薄封装 (DMA/TDM, 委托 xiaozhi-core)
+- [ ] 完善 I2S DMA 收发 (录音/播放数据通路)
 - [ ] 实现按键检测 (长按/短按)
 - [ ] LED 呼吸灯动画
 - [ ] 电池电量检测 (ADC)
