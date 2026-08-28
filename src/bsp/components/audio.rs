@@ -108,6 +108,52 @@ impl Audio {
         id
     }
 
+    /// 排查用: 回读 ES8311 关键寄存器并与期望值比对。
+    /// 全 OK 而仍无声 => 问题在电气层 (MCLK/PA/喇叭); 有 != => 配置写入未生效。
+    pub fn dump_registers(&mut self) {
+        const CHECK: [(&str, u8, u8); 11] = [
+            ("RESET slave 运行", 0x00, 0x80),
+            ("CLK MCLK直入", 0x01, 0x3F),
+            ("CLK 预分频", 0x02, 0x00),
+            ("模拟上电!", 0x0D, 0x01),
+            ("时钟门控", 0x0E, 0x02),
+            ("DAC 使能", 0x12, 0x00),
+            ("模拟无DMIC", 0x14, 0x1A),
+            ("解除数字静音", 0x31, 0x00),
+            ("音量60%=0x99", 0x32, 0x99),
+            ("DAC输出路径", 0x37, 0x08),
+            ("GP控制", 0x45, 0x00),
+        ];
+        for (name, reg, exp) in CHECK {
+            let v = self.read_reg(reg);
+            if v == exp {
+                defmt::info!("ES8311 0x{:02X}=0x{:02X} OK {}", reg, v, name);
+            } else {
+                defmt::error!(
+                    "ES8311 0x{:02X}=0x{:02X} != 期望 0x{:02X} ({})",
+                    reg,
+                    v,
+                    exp,
+                    name
+                );
+            }
+        }
+        defmt::info!("PA 使能脚电平: {}", self._pa.is_set_high());
+    }
+
+    /// 读取单个 ES8311 寄存器 (失败返回 0xFF)
+    fn read_reg(&mut self, reg: u8) -> u8 {
+        let mut v = [0u8; 1];
+        if self
+            .i2c
+            .write_read(codec_mod::CodecAddr::Es8311.value(), &[reg], &mut v)
+            .is_err()
+        {
+            return 0xFF;
+        }
+        v[0]
+    }
+
     /// 设置音量 (0~100), 0 为数字静音
     pub fn set_volume(&mut self, percent: u8) {
         self.volume = percent.clamp(0, 100);
