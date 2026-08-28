@@ -20,6 +20,13 @@
 xiaozhi-s3/
 ├── src/
 │   ├── lib.rs          # 库定义
+│   ├── bsp/            # 板级支持包 (编译时选板, 参照 xiaozhi-esp32)
+│   │   ├── mod.rs      # 选板守卫 + active/create_board 转发
+│   │   ├── board.rs    # BoardConfig 契约 (按功能细分子 struct)
+│   │   ├── components/ # 运行时组件目录 (组合成 Board)
+│   │   │   ├── mod.rs  # Board 组合对象 + 组件导出
+│   │   │   ├── leds.rs / buttons.rs / power.rs / battery.rs
+│   │   └── gezipai.rs  # gezipai 板: BOARD 配置 + create_board 工厂
 │   ├── audio/          # 音频模块 (esp-hal 薄封装)
 │   └── bin/
 │       └── main.rs     # 主入口
@@ -40,6 +47,47 @@ xiaozhi-s3/
 ├── build.rs            # 构建脚本
 └── Cargo.toml
 ```
+
+### 板级选择 (BSP)
+
+参照 [xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) 的编译时选板架构，
+Rust 版用 cargo feature 实现同等能力：
+
+| xiaozhi-esp32 (C++)           | xiaozhi-s3 (Rust)              |
+|-------------------------------|--------------------------------|
+| `main/boards/<board>/config.h` | `src/bsp/<board>.rs` 的 `BOARD` 常量 |
+| Kconfig `CONFIG_BOARD_TYPE_X` | cargo feature `board-x`        |
+| `Board` 基类 + GetXxx() 虚函数 | `board.rs` 的 `BoardConfig` 与组合式 `Board` |
+| 子类 override GetXxx()        | 各板 `create_board()` 工厂组装组件 |
+| `DECLARE_BOARD(XxxBoard)` 宏  | feature 门控的 `create_board` 转发 |
+| `GetInstance()` 单例          | main 创建一次, `&mut Board` 传递 |
+
+**组合优先于继承**: `BoardConfig`(纯数据, 编译期常量, 按功能细分 audio/codec_ctrl/
+buttons/power/leds/display) + `Board`(运行时组件集合, `components.rs`)。
+`BoardConfig` 中 Codec 地址**按 dac/adc 角色命名，与芯片型号解耦**（型号仅作日志描述字符串），
+上层驱动只认角色 (`BOARD.codec_ctrl.dac_addr`)，换 Codec 型号零改动。
+
+```rust
+// main.rs — 应用只面向组件, 不接触 GPIO
+let mut board = xiaozhi_s3::bsp::create_board(peripherals);
+board.leds.on();
+if board.buttons.boot_pressed() { /* ... */ }
+let st = board.power.status();          // 分类逻辑在 xiaozhi-core (host 单测)
+```
+
+```bash
+cargo +esp build --release                                  # 默认板 gezipai
+cargo +esp build --no-default-features --features board-x   # 其他板
+```
+
+新增板子：复制任一 `src/bsp/<board>.rs` → 填写 `BOARD` 配置 + 实现 `create_board()`
+工厂（含硬接线编译期断言）→ `src/bsp/mod.rs` 注册两行 → `Cargo.toml [features]` 加一行。
+驱动层只允许消费 `BOARD` 配置与 `Board` 组件 API，禁止硬编码 GPIO。
+
+> **重要更正**: 此前充电脚误判为 GPIO12/13。官方配置实为
+> **CHARGING=GPIO41 / DONE=GPIO42**（GPIO12/13 是灯效串口 LIGHT_RX/TX）；
+> I2S 数据线 **DIN=GPIO21(录音 RX) / DOUT=GPIO48(播放 TX)**；
+> 功放 PA 使能=**GPIO46**；I2C SDA/SCL=**GPIO38/GPIO47**（已硬件扫描验证双 Codec 在线）。
 
 ## 开发环境
 
@@ -109,17 +157,37 @@ git submodule update --init --recursive
 
 | 功能 | GPIO | 说明 |
 |------|------|------|
-| USB D- | 19 | USB通信 |
-| USB D+ | 20 | USB通信 |
-| UART0 TX | 43 | 调试串口 |
-| UART0 RX | 44 | 调试串口 |
-| LED 电源 | 4 | 红色 |
-| LED 呼吸 | 5 | 白色 |
-| 音量减 | 18 | SW1 |
-| 音量加 | 1 | SW2 |
-| 配网 | 2 | SW3 |
-| 充电完成 | 28 | LGS4056HDA |
-| 充电中 | 29 | LGS4056HDA |
+| USB D- | 19 | USB通信 (WROOM-1U 引脚35) |
+| USB D+ | 20 | USB通信 (WROOM-1U 引脚36) |
+| UART0 TX | 43 | 调试串口 (引脚6) |
+| UART0 RX | 44 | 调试串口 (引脚7) |
+| LED 电源 | 4 | 红色 (引脚20) |
+| LED 呼吸 | 17 | 白色, 下拉亮/上拉熄 (规格书 IO17) |
+| BOOT 键 | 1 | 官方 BOOT_BUTTON=1 (已验证可检测) |
+| 音量+键 | 18 | 官方 VOLUME_UP=18 (已验证可检测) |
+| 音量-键 | 2 | 官方 VOLUME_DOWN=2 (已验证可检测) |
+| Codec I2C SDA | 38 | ES8311+ES7210 共享总线 (I2C 扫描已验证) |
+| Codec I2C SCL | 47 | 同上 (已验证) |
+| ES8311 DAC 地址 | - | 0x18 (应答正常) |
+| ES7210 ADC 地址 | - | 0x40 (应答正常) |
+| I2S MCLK | 40 | 主时钟 |
+| I2S BCLK | 39 | 位时钟 |
+| I2S WS/LRCK | 45 | 字选择 |
+| I2S DIN | 21 | 录音数据输入 (麦克风→ESP32) |
+| I2S DOUT | 48 | 播放数据输出 (ESP32→DAC) |
+| 功放 PA 使能 | 46 | LPA2103A, 高电平开启 |
+| 充电中 (CHARGING) | 41 | 低电平=充电中 (官方 config.h) |
+| 充电完成 (DONE) | 42 | 低电平=充满 (官方 config.h) |
+| 电池 ADC | 3 | ADC1_CH2, 分压比 1/3 |
+| 显示屏 SCK/MOSI | 7 / 6 | ST7789 SPI |
+| 显示屏 CS/DC/RES/BLK | 15/16/5/4 | 240x240 |
+| 灯效串口 RX/TX | 12 / 13 | LIGHT UART (非充电脚!) |
+| PWM LED | 11 | TX 脚 10 |
+
+> **引脚来源**: 全部以 `src/bsp/gezipai.rs`（源自官方 config.h）为准。
+> **更正记录**: 此前把 GPIO12/13 当作充电检测是误判（那是灯效串口）；充电实为
+> GPIO41(CHARGING)/GPIO42(DONE)。早期规格书"引脚28/29"推断一并废弃。
+> ESP32-S3-WROOM-1U 的 Quad PSRAM 占用 GPIO33-37，GPIO0-32/38-48 均可作普通 GPIO。
 
 ## 依赖
 

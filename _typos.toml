@@ -1,5 +1,8 @@
 [default.extend-words]
 HDA = "HDA"
+# esp-hal I2S 数据线术语 (DOUT/DIN), 非 "doubt" 拼写错误
+dout = "dout"
+DOUT = "DOUT"
 
 [files]
 extend-exclude = ["CHANGELOG.md", "notebooks/*"]

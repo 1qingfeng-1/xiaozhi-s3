@@ -24,6 +24,15 @@ critical-section = "1.2.0"
 esp-alloc        = { version = "0.10.0", features = ["defmt"] }
 esp-println      = { version = "0.17.0", features = ["defmt-espflash", "esp32s3"] }
 
+[features]
+default = ["board-gezipai"]
+
+## gezipai 开发板 (ES8311 + ES7210 + ST7789)
+board-gezipai = []
+
+## 新增板子: 先建 src/bsp/<board>.rs, 再加 feature 与 src/bsp/mod.rs 注册
+# board-<name> = []
+
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]

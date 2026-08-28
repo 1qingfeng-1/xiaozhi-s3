@@ -11,9 +11,10 @@
 //! - llm: 大语言模型对话
 
 #![no_std]
+extern crate alloc;
 
 // 子模块声明
-pub mod audio;
+pub mod bsp;
 // pub mod gpio;
 // pub mod system;
 // pub mod wifi;

@@ -18,6 +18,11 @@ use defmt::error;
 use defmt::info;
 use esp_println as _;
 
+use xiaozhi_s3::bsp::active::BOARD;
+
+// 编译期校验: 硬接线与 BSP 配置一致
+const _: () = assert!(BOARD.power.charge_done_gpio == 42 && BOARD.power.charging_gpio == 41);
+
 #[panic_handler]
 fn panic(panic_info: &core::panic::PanicInfo) -> ! {
     error!("{}", panic_info);
@@ -37,17 +42,42 @@ fn main() -> ! {
 
     info!("=== GPIO 测试开始 ===");
 
-    // LED 电源指示 (GPIO4) - 推挽输出
-    let led_config = OutputConfig::default();
-    let mut led = Output::new(peripherals.GPIO4, Level::High, led_config);
-    info!("LED GPIO4 已开启 (高电平)");
+    // LED1 电源指示灯，红色， 接2号引脚，3.3V, 通电即亮
+
+    // LED2 白色 用作呼吸灯，下拉亮，上拉熄 (GPIO17) - 推挽输出
+    let led2_config = OutputConfig::default();
+    let mut led = Output::new(peripherals.GPIO17, Level::Low, led2_config);
+    info!("LED2 GPIO17 已开启 (低电平)");
+
+    // 充电检测 - 引脚来自 BSP (官方 config: CHARGING=41, DONE=42)
+    let chg_done = Input::new(peripherals.GPIO42, InputConfig::default()); // 充电完成
+    let chg_chrg = Input::new(peripherals.GPIO41, InputConfig::default()); // 充电中
+    info!(
+        "充电 DONE (GPIO{}): {}",
+        BOARD.power.charge_done_gpio,
+        if chg_done.is_low() {
+            "低 (充电中)"
+        } else {
+            "高 (完成/未充)"
+        }
+    );
+    info!(
+        "充电 CHRG (GPIO{}): {}",
+        BOARD.power.charging_gpio,
+        if chg_chrg.is_low() {
+            "低 (充电中)"
+        } else {
+            "高 (未充电)"
+        }
+    );
 
     // 按键配置 - 上拉输入 (低电平有效)
+    // 官方映射: BOOT=GPIO1, VOL+=GPIO18, VOL-=GPIO2
     let btn_config = InputConfig::default().with_pull(Pull::Up);
 
-    let btn_vol_down = Input::new(peripherals.GPIO18, btn_config); // SW1
-    let btn_vol_up = Input::new(peripherals.GPIO1, btn_config); // SW2
-    let btn_config_pin = Input::new(peripherals.GPIO2, btn_config); // SW3
+    let btn_vol_down = Input::new(peripherals.GPIO18, btn_config); // VOLUME_UP
+    let btn_vol_up = Input::new(peripherals.GPIO1, btn_config); // BOOT
+    let btn_config_pin = Input::new(peripherals.GPIO2, btn_config); // VOLUME_DOWN
 
     info!("按键状态检测:");
     info!(
