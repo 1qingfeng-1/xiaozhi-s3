@@ -77,7 +77,7 @@ fn main() -> ! {
     info!(
         "电池: {} mV, {}%",
         mv,
-        board.battery.percentage().unwrap_or(0)
+        board.battery.reported_percentage(last_power).unwrap_or(0)
     );
 
     // LED 灯语演示: 无键=慢呼吸(待机) / 音量-=中呼吸(识别) / 音量+=快呼吸(唤醒) / BOOT=常亮(回答)
@@ -141,7 +141,7 @@ fn main() -> ! {
             info!(
                 "电池: {} mV, {}%",
                 mv,
-                board.battery.percentage().unwrap_or(0)
+                board.battery.reported_percentage(st).unwrap_or(0)
             );
         }
 

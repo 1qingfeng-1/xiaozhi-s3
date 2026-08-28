@@ -6,11 +6,8 @@ use esp_hal::{
     peripherals::{ADC1, GPIO3},
 };
 
-use xiaozhi_core::board::battery_percentage;
+use xiaozhi_core::board::{PowerStatus, battery_percentage, reported_battery_percentage};
 
-/// ADC 换算常数: 11dB 衰减下满量程约 3300mV, 12bit
-const ADC_FULL_SCALE_MV: u32 = 3300;
-const ADC_MAX_CODE: u32 = 4095;
 /// 每次读取的采样数 (均值滤波, 对齐参考实现)
 const SAMPLE_COUNT: u32 = 10;
 
@@ -47,8 +44,9 @@ impl Battery {
         }
     }
 
-    /// 单次采样 (阻塞至转换完成)
-    fn read_raw(&mut self) -> u16 {
+    /// 单次采样。AdcCalCurve (basic+line+curve) 校准后返回值已是引脚电压 mV,
+    /// 勿再按 12bit raw code 换算 (参考 esp-hal calibration/line.rs 文档)。
+    fn read_raw_mv(&mut self) -> u16 {
         loop {
             if let Ok(v) = self.adc.read_oneshot(&mut self.pin) {
                 return v;
@@ -60,11 +58,9 @@ impl Battery {
     pub fn read_voltage_mv(&mut self) -> u32 {
         let mut acc = 0u32;
         for _ in 0..SAMPLE_COUNT {
-            acc += self.read_raw() as u32;
+            acc += self.read_raw_mv() as u32;
         }
-        let raw = acc / SAMPLE_COUNT;
-        let pin_mv = raw * ADC_FULL_SCALE_MV / ADC_MAX_CODE;
-        pin_mv * self.multiplier as u32
+        acc / SAMPLE_COUNT * self.multiplier as u32
     }
 
     /// 读取电量百分比 (0~100); 配置非法时 None
@@ -72,5 +68,13 @@ impl Battery {
         let mv = self.read_voltage_mv() as i32;
         let p = battery_percentage(mv, self.min_mv as i32, self.max_mv as i32);
         (p >= 0).then_some(p as u8)
+    }
+
+    /// 读取上报电量 (0~100): 充电完成 (DONE 有效) 钳位 100%,
+    /// 其余状态按电压线性映射; 配置非法时 None
+    pub fn reported_percentage(&mut self, status: PowerStatus) -> Option<u8> {
+        let mv = self.read_voltage_mv() as i32;
+        reported_battery_percentage(status, mv, self.min_mv as i32, self.max_mv as i32)
+            .map(|p| p as u8)
     }
 }

@@ -162,6 +162,8 @@ pub fn create_board(peripherals: Peripherals) -> Board {
     );
 
     // 电池: GPIO3 (ADC1_CH2), 分压还原 x3, 量程 3.0V~4.2V
+    // (对齐官方 gezipai_board.cc ReadBatteryVoltage 的 voltage * 3;
+    //  其注释"分压电阻1:2所以乘以2"与代码矛盾, 以代码为准)
     let battery = components::Battery::new(
         peripherals.ADC1,
         peripherals.GPIO3,

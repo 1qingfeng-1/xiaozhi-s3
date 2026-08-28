@@ -28,6 +28,7 @@ impl Power {
 pub fn power_label(s: PowerStatus) -> &'static str {
     match s {
         PowerStatus::Charging => "充电中",
+        PowerStatus::Charged => "充电完成",
         PowerStatus::Discharging => "放电中",
         PowerStatus::Idle => "空闲",
     }
