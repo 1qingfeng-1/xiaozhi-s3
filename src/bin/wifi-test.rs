@@ -437,9 +437,8 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
                             (resp.len(), ())
                         })
                         .await;
-                    let _ = socket.flush().await;
-                    // 等响应发出后重启
-                    embassy_time::Timer::after(embassy_time::Duration::from_millis(500)).await;
+                    graceful_close(&mut socket).await;
+                    // 响应已送达, 重启进入 STA 模式
                     esp_hal::system::software_reset();
                 },
                 Err(e) => {
@@ -451,7 +450,7 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
                             (resp.len(), ())
                         })
                         .await;
-                    let _ = socket.flush().await;
+                    graceful_close(&mut socket).await;
                 },
             }
         } else {
@@ -471,9 +470,25 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
                     (n, ())
                 })
                 .await;
-            let _ = socket.flush().await; // 等 ACK, 否则循环顶的 abort 会丢响应
+            graceful_close(&mut socket).await;
         }
     }
+}
+
+/// 优雅关闭: flush → FIN → 等FIN完成。直接 abort 会发 RST,
+/// 客户端内核未读的接收数据随 RST 丢弃, 浏览器表现为"连接被重置"。
+async fn graceful_close(socket: &mut tcp::TcpSocket<'_>) {
+    let _ = socket.flush().await;
+    socket.close();
+    // FIN 发出并被对端确认后, smoltcp 状态回到 Closed; 兜底限时
+    for _ in 0..100 {
+        if socket.state() == tcp::State::Closed {
+            break;
+        }
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(10)).await;
+    }
+    embassy_time::Timer::after(embassy_time::Duration::from_millis(50)).await;
+    socket.abort();
 }
 
 /// 解析 query string (url-decode: %XX 与 +)
