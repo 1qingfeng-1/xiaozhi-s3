@@ -396,12 +396,15 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
             embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
             continue;
         }
+        info!("HTTP: 已接受连接");
 
         let mut request = [0u8; 1024];
         let n = socket.read(&mut request).await.unwrap_or(0);
+        info!("HTTP: 收到 {}B", n);
         let req = core::str::from_utf8(&request[..n]).unwrap_or("");
         let first_line = req.lines().next().unwrap_or("");
         let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+        info!("HTTP: 请求路径 {}", path);
 
         if let Some(query) = path.strip_prefix("/save?") {
             let (ssid, pass, server) = parse_query(query);
@@ -447,6 +450,7 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
                 },
             }
         } else {
+            info!("HTTP: 回送表单页");
             let body = FORM;
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
