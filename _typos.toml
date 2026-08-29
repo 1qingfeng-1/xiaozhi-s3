@@ -8,4 +8,4 @@ bck = "bck"
 BCK = "BCK"
 
 [files]
-extend-exclude = ["CHANGELOG.md", "notebooks/*", "assets/wifi-config/vue.global.prod.js"]
+extend-exclude = ["CHANGELOG.md", "notebooks/*", "assets/wifi-config/vue.global.prod.js", "vendor/*"]

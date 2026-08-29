@@ -1,7 +1,11 @@
-//! M4.1 调试: WebSocket 协议层 — 握手 + hello + BOOT 按键 listen 消息
+//! M4.2 调试: opus 音频集成 — 麦克风 opus 编码上行 + 服务器 TTS 解码播放
 //!
-//! 流程: 读 Flash 凭据 → STA 连接 → WebSocket 连接 xiaozhi 服务器 →
-//! hello 握手 → 按住 BOOT 发送 listen start (对讲框架, opus 音频后续接入)
+//! 流程: create_board (音频 + 内部堆 + PSRAM) → STA 连接 → WebSocket →
+//! hello 握手 → 会话循环:
+//! - 按住 BOOT = 对讲: listen start/stop + 60ms opus 帧上行 (16kHz 单声道)
+//! - 服务器二进制帧 = TTS opus → 以 16kHz 解码 (libopus 内部重采样) → 播放
+//!
+//! 上行/下行二进制帧均为裸 opus 载荷 (协议 version 1, 与 C++ 参考一致)。
 //!
 //! ```bash
 //! cargo run --release --bin xiaozhi-cloud --features wifi
@@ -16,11 +20,10 @@
 )]
 
 use embassy_executor::Spawner;
-use embassy_net::{Ipv4Address, Stack, StackResources, tcp::TcpSocket};
+use embassy_net::{Ipv4Address, StackResources, tcp::TcpSocket};
 use esp_hal::{
-    clock::CpuClock,
-    gpio::{Input, InputConfig, Pull},
-    interrupt::software::SoftwareInterruptControl,
+    Blocking, clock::CpuClock, dma::DmaTransferRxCircular, i2s::master::I2sRx,
+    interrupt::software::SoftwareInterruptControl, peripherals::Peripherals,
     timer::timg::TimerGroup,
 };
 use esp_storage::FlashStorage;
@@ -28,6 +31,10 @@ use esp_storage::FlashStorage;
 use defmt::{error, info, warn};
 use esp_println as _;
 
+use xiaozhi_core::audio::capture::{apply_gain_percent, extract_slot};
+use xiaozhi_s3::audio::opus::{MAX_PACKET_BYTES, OpusDecoder, OpusEncoder};
+use xiaozhi_s3::bsp::components::{Audio, Buttons};
+use xiaozhi_s3::bsp::create_board;
 use xiaozhi_s3::wifi::{self, Mode, store};
 
 #[panic_handler]
@@ -37,7 +44,7 @@ fn panic(panic_info: &core::panic::PanicInfo) -> ! {
 }
 
 extern crate alloc;
-use alloc::format;
+use alloc::{format, string::ToString, vec};
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -54,27 +61,43 @@ macro_rules! mk_static {
 const WS_PORT: u16 = 8000;
 const WS_PATH: &str = "/xiaozhi/v1/";
 
+/// 上行音频参数 (与 hello.audio_params 一致, 对齐 C++ 参考)
+const SAMPLE_RATE: u32 = 16_000;
+const FRAME_MS: u32 = 60;
+const FRAME_SAMPLES: usize = SAMPLE_RATE as usize / 1000 * FRAME_MS as usize; // 960
+/// 软件增益百分比 (100 = 0dB): 麦克风数字电平约 1~5% 满幅, +18dB 后 ASR 可用
+const GAIN_PERCENT: u16 = 800;
+
+/// 乒乓窗口 = 单个 DMA 描述符 (4092B ≈ 64ms): available() 按完整描述符计数
+const BLOCK_BYTES: usize = 4092;
+/// 采集积压缓冲上限 16KB (4 描述符); 超过说明处理跟不上 → 结束会话重连
+const POP_BUF_SIZE: usize = 16 * 1024;
+/// 帧累积缓冲: 2 帧余量 (pop 分块追加, 见 uplink)
+const ACC_SAMPLES: usize = FRAME_SAMPLES * 2;
+
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    esp_alloc::heap_allocator!(size: 160 * 1024);
+    info!("=== xiaozhi 云连接 + opus 音频 (M4.2) ===");
 
-    info!("=== xiaozhi 云连接调试 (M4.1 协议层) ===");
+    // 板子工厂: 内部堆第一行注册 → 音频 DMA 缓冲 → PSRAM 最后注册
+    // (顺序不可换: S3 GDMA 访问不了 PSRAM, 见 bsp/gezipai.rs)
+    let mut board = create_board(peripherals);
+    info!("板子 [{}] 初始化完成", board.name);
 
-    let timg0 = TimerGroup::new(peripherals.TIMG0);
-    let sw_interrupt = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    // create_board 按值消耗了 Peripherals; 音频不用的 WIFI/FLASH/TIMG0 经
+    // steal 再取 (各自仅初始化一次, 无重复初始化风险)
+    let p = unsafe { Peripherals::steal() };
+    let timg0 = TimerGroup::new(p.TIMG0);
+    let sw_interrupt = SoftwareInterruptControl::new(p.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
-    let flash = mk_static!(FlashStorage<'static>, FlashStorage::new(peripherals.FLASH));
+    let flash = mk_static!(FlashStorage<'static>, FlashStorage::new(p.FLASH));
 
     // BOOT 键: 清除配置强制重回配网
-    let boot_btn = Input::new(
-        peripherals.GPIO1,
-        InputConfig::default().with_pull(Pull::Up),
-    );
-    if boot_btn.is_low() {
+    if board.buttons.boot_pressed() {
         info!("BOOT 按下: 清除 WiFi 配置...");
         let _ = store::clear(flash);
         embassy_time::Timer::after(embassy_time::Duration::from_millis(200)).await;
@@ -95,7 +118,7 @@ async fn main(spawner: Spawner) -> ! {
     let interface = esp_radio::wifi::Interface::station();
     let mac_bytes = interface.mac_address();
     let mut controller = esp_radio::wifi::WifiController::new(
-        peripherals.WIFI,
+        p.WIFI,
         esp_radio::wifi::ControllerConfig::default().with_initial_config(config.station_config()),
     )
     .unwrap();
@@ -156,6 +179,23 @@ async fn main(spawner: Spawner) -> ! {
         s
     };
 
+    // 采集常驻启动 (整个运行期): RX 为 I2S 从机, 无 TX 时钟时自然无数据,
+    // 无需按 listen 状态启停 (跨 await 重启采集有借用/时序双坑)。
+    // TX 时钟由会话循环里的静音窗/播放维持。
+    let mut cap = match board.capture.start() {
+        Ok(t) => t,
+        Err(e) => {
+            error!("采集启动失败: {:?}", e);
+            esp_hal::system::software_reset()
+        },
+    };
+
+    // 会话常驻缓冲 (mk_static 一次, 重连不重复分配)
+    let pop_buf = mk_static!([u8; POP_BUF_SIZE], [0u8; POP_BUF_SIZE]);
+    let mono_buf = mk_static!([i16; POP_BUF_SIZE / 4], [0i16; POP_BUF_SIZE / 4]);
+    let acc_buf = mk_static!([i16; ACC_SAMPLES], [0i16; ACC_SAMPLES]);
+    let silence_buf = mk_static!([u8; BLOCK_BYTES], [0u8; BLOCK_BYTES]);
+
     // WebSocket 重连循环
     loop {
         info!(
@@ -166,8 +206,8 @@ async fn main(spawner: Spawner) -> ! {
         );
         // 重连循环内不可用 mk_static! (同一调用点二次初始化会 panic), 改堆泄漏
         // (仅断线重连时分配一次, 量级极小)
-        let rx = alloc::vec![0u8; 4096].leak();
-        let tx = alloc::vec![0u8; 4096].leak();
+        let rx = vec![0u8; 4096].leak();
+        let tx = vec![0u8; 4096].leak();
         let mut socket = TcpSocket::new(stack, rx, tx);
         match socket.connect((server, WS_PORT)).await {
             Ok(()) => {},
@@ -191,36 +231,101 @@ async fn main(spawner: Spawner) -> ! {
             continue;
         }
 
-        // 等待服务器 hello
-        match ws.recv_frame().await {
-            Ok((opcode, payload)) => {
-                if opcode == 1 {
-                    info!(
-                        "服务器 hello: {}",
-                        core::str::from_utf8(&payload).unwrap_or("?")
-                    );
-                } else {
-                    warn!("服务器首帧非文本 (opcode {})", opcode);
-                }
+        // 等待服务器 hello: 解析 frame_duration 决定解码缓冲大小
+        let server_hello = match ws.recv_frame().await {
+            Ok((1, payload)) => core::str::from_utf8(&payload).unwrap_or("?").to_string(),
+            Ok((opcode, _)) => {
+                warn!("服务器首帧非文本 (opcode {})", opcode);
+                continue;
             },
             Err(e) => {
                 error!("服务器 hello 接收失败: {} — 重连", e);
                 continue;
             },
-        }
+        };
+        let server_rate = json_num_field(&server_hello, "sample_rate").unwrap_or(24_000);
+        let frame_ms = json_num_field(&server_hello, "frame_duration").unwrap_or(60);
+        info!(
+            "服务器 hello: rate={}Hz frame={}ms — {}",
+            server_rate,
+            frame_ms,
+            server_hello.as_str()
+        );
 
-        info!("=== 协议层 OK — 按住 BOOT 说话 (listen start/stop, opus 后续接入) ===");
-        session_loop(&mut ws, &boot_btn).await;
+        // 编解码器 (每会话新建, 重连即复位状态)
+        // 解码器建在 16kHz: libopus 内部把服务器 (通常 24kHz) 流重采样到本地
+        let mut encoder = match OpusEncoder::new_voip_mono(SAMPLE_RATE, FRAME_MS) {
+            Ok(e) => e,
+            Err(e) => {
+                error!("opus 编码器创建失败: {} — 重连", e);
+                embassy_time::Timer::after(embassy_time::Duration::from_secs(5)).await;
+                continue;
+            },
+        };
+        let mut decoder = match OpusDecoder::new_mono(SAMPLE_RATE) {
+            Ok(d) => d,
+            Err(e) => {
+                error!("opus 解码器创建失败: {} — 重连", e);
+                embassy_time::Timer::after(embassy_time::Duration::from_secs(5)).await;
+                continue;
+            },
+        };
+        // 解码输出 = frame_ms @ 16kHz (与服务器采样率无关)
+        let dec_samples = frame_ms as usize * SAMPLE_RATE as usize / 1000;
+        let pcm_dec = vec![0i16; dec_samples].leak();
+        let stereo_out = vec![0u8; dec_samples * 4].leak();
+
+        info!("=== 会话就绪 — 按住 BOOT 对讲, 服务器 TTS 自动播放 ===");
+        board.audio.beep(150);
+        // 板子组件按字段拆分借用: cap 持有 capture 的借用贯穿会话,
+        // audio/buttons 需与其 disjoint (async 生成器要求借用区域完整)
+        session_loop(
+            &mut ws,
+            &mut board.audio,
+            &mut board.buttons,
+            &mut cap,
+            &mut encoder,
+            &mut decoder,
+            &mut pcm_dec[..],
+            &mut stereo_out[..],
+            &mut pop_buf[..],
+            &mut mono_buf[..],
+            &mut acc_buf[..],
+            &mut silence_buf[..],
+        )
+        .await;
         // session_loop 返回 = 连接断开, 重连
         embassy_time::Timer::after(embassy_time::Duration::from_secs(2)).await;
     }
 }
 
-/// WebSocket 会话循环: BOOT 按键 → listen 消息, 服务器消息 → 日志
-async fn session_loop(ws: &mut WsClient<'_>, boot_btn: &Input<'_>) {
+/// 会话循环: BOOT 对讲 (采集→opus→上行) + 服务器 TTS (下行→解码→播放)
+///
+/// 半双工: 时钟由任一方向的 I2S 播放维持 (RX 从机依赖 TX 时钟,
+/// 见 bsp/components/audio.rs) —— 对讲时无下行则补静音窗。
+#[allow(clippy::too_many_arguments)]
+async fn session_loop(
+    ws: &mut WsClient<'_>,
+    audio: &mut Audio,
+    buttons: &mut Buttons,
+    cap: &mut DmaTransferRxCircular<'_, I2sRx<'static, Blocking>>,
+    encoder: &mut OpusEncoder,
+    decoder: &mut OpusDecoder,
+    pcm_dec: &mut [i16],
+    stereo_out: &mut [u8],
+    pop_buf: &mut [u8],
+    mono_buf: &mut [i16],
+    acc_buf: &mut [i16],
+    silence_buf: &mut [u8],
+) {
     let mut held = false;
+    let mut acc_len = 0usize;
+    let mut enc_out = [0u8; MAX_PACKET_BYTES];
+
     loop {
-        // 收服务器消息 (非阻塞轮询)
+        let mut played = false;
+
+        // ---- 服务器消息 (非阻塞轮询) ----
         if ws.socket.can_recv() {
             match ws.recv_frame().await {
                 Ok((opcode, payload)) => match opcode {
@@ -228,11 +333,30 @@ async fn session_loop(ws: &mut WsClient<'_>, boot_btn: &Input<'_>) {
                         info!("服务器: {}", core::str::from_utf8(&payload).unwrap_or("?"));
                     },
                     2 => {
-                        info!("服务器二进制帧: {}B (音频, opus 接入后处理)", payload.len());
+                        // TTS opus → 16kHz 解码 → 立体声播放
+                        match decoder.decode(&payload, pcm_dec) {
+                            Ok(n) if n > 0 => {
+                                let mut o = 0;
+                                for &s in &pcm_dec[..n] {
+                                    let le = s.to_le_bytes();
+                                    stereo_out[o..o + 2].copy_from_slice(&le);
+                                    stereo_out[o + 2..o + 4].copy_from_slice(&le);
+                                    o += 4;
+                                }
+                                audio.play_block(&stereo_out[..n * 4]);
+                                played = true;
+                            },
+                            Ok(_) => {},
+                            Err(e) => warn!("opus 解码失败: {}", e),
+                        }
                     },
                     8 => {
                         info!("服务器关闭连接");
                         return;
+                    },
+                    9 => {
+                        // ping → pong 维持长连接
+                        let _ = ws.send_pong(&payload).await;
                     },
                     _ => {},
                 },
@@ -243,23 +367,132 @@ async fn session_loop(ws: &mut WsClient<'_>, boot_btn: &Input<'_>) {
             }
         }
 
-        // BOOT 按键 → listen 消息
-        let pressed = boot_btn.is_low();
+        // ---- BOOT 按键 → listen 状态切换 ----
+        let pressed = buttons.boot_pressed();
         if pressed != held {
             held = pressed;
-            let msg = if pressed {
-                "{\"type\":\"listen\",\"state\":\"start\"}"
+            if held {
+                info!("listen start (对讲)");
+                acc_len = 0;
+                // 冲掉 listen 期间残留的采集积压 (TTS 播放期间时钟在跑,
+                // RX 里存着回声/旧数据)
+                if let Ok(avail) = cap.available() {
+                    let discard = usize::min(avail, pop_buf.len());
+                    let _ = cap.pop(&mut pop_buf[..discard]);
+                }
+            } else {
+                info!("listen stop");
+            }
+            let msg = if held {
+                "{\"type\":\"listen\",\"state\":\"start\",\"mode\":\"manual\"}"
             } else {
                 "{\"type\":\"listen\",\"state\":\"stop\"}"
             };
-            info!("发送: {}", msg);
             if let Err(e) = ws.send_text(msg.as_bytes()).await {
                 error!("listen 发送失败: {}", e);
                 return;
             }
         }
-        embassy_time::Timer::after(embassy_time::Duration::from_millis(50)).await;
+
+        // ---- 对讲: 采集 → 提取 MIC1 → 增益 → 累积 960 样本 → opus 上行 ----
+        if held {
+            match cap.available() {
+                Ok(avail) if avail > pop_buf.len() => {
+                    // 积压超限 ( >0.25s 停顿): 处理已跟不上, 结束会话重连对齐
+                    error!("采集积压 {}B 超限, 重连", avail);
+                    return;
+                },
+                Ok(avail) if avail >= BLOCK_BYTES => match cap.pop(&mut pop_buf[..avail]) {
+                    Ok(n) => {
+                        let frames = n / 4;
+                        let ns = extract_slot(&pop_buf[..frames * 4], 2, 0, mono_buf);
+                        apply_gain_percent(&mut mono_buf[..ns], GAIN_PERCENT);
+                        if uplink(
+                            &mut acc_buf[..],
+                            &mut acc_len,
+                            &mono_buf[..ns],
+                            encoder,
+                            ws,
+                            &mut enc_out,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        warn!("RX pop 失败: {:?}", e);
+                        return;
+                    },
+                },
+                Ok(_) => {},
+                Err(e) => {
+                    warn!("RX available 失败: {:?}", e);
+                    return;
+                },
+            }
+            // 时钟维持: 对讲期间无下行播放则补静音窗 (RX 从机依赖 TX 时钟,
+            // 与 audio-loopback 相同策略)
+            if !played {
+                audio.play_block(silence_buf);
+            }
+        }
+
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(10)).await;
     }
+}
+
+/// 把新采集的样本追加进帧累积缓冲, 凑满 960 样本即编码上行
+///
+/// 返回 Err 表示 WS 发送失败 (会话结束)。
+async fn uplink(
+    acc_buf: &mut [i16],
+    acc_len: &mut usize,
+    new_samples: &[i16],
+    encoder: &mut OpusEncoder,
+    ws: &mut WsClient<'_>,
+    enc_out: &mut [u8; MAX_PACKET_BYTES],
+) -> Result<(), ()> {
+    let mut src = new_samples;
+    while !src.is_empty() {
+        // 追加到累积缓冲满为止
+        let take = usize::min(acc_buf.len() - *acc_len, src.len());
+        acc_buf[*acc_len..*acc_len + take].copy_from_slice(&src[..take]);
+        *acc_len += take;
+        src = &src[take..];
+        // 凑满整帧 → 编码 → 二进制帧上行 (裸 opus, 协议 version 1)
+        while *acc_len >= FRAME_SAMPLES {
+            match encoder.encode(&acc_buf[..FRAME_SAMPLES], enc_out) {
+                Ok(n) => {
+                    if ws.send_frame(2, &enc_out[..n]).await.is_err() {
+                        return Err(());
+                    }
+                },
+                Err(e) => {
+                    warn!("opus 编码失败: {}", e);
+                },
+            }
+            acc_buf.copy_within(FRAME_SAMPLES..*acc_len, 0);
+            *acc_len -= FRAME_SAMPLES;
+        }
+    }
+    Ok(())
+}
+
+/// 从 JSON 文本提取 `"key":<数字>` 字段值 (xiaozhi hello 的 audio_params 用)
+fn json_num_field(json: &str, key: &str) -> Option<u32> {
+    let pat = format!("\"{key}\":");
+    let mut rest = json;
+    while let Some(i) = rest.find(&pat) {
+        let after = rest[i + pat.len()..].trim_start();
+        let digits = after.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits > 0 {
+            return after[..digits].parse().ok();
+        }
+        rest = &rest[i + pat.len()..];
+    }
+    None
 }
 
 /// 极简 WebSocket 客户端 (客户端帧强制掩码, 服务端帧不掩码)
@@ -273,9 +506,14 @@ impl WsClient<'_> {
         self.send_frame(0x1, payload).await
     }
 
-    /// 发送帧 (FIN + opcode, 掩码)
+    /// 回复 ping (pong = opcode 0xA, 载荷原样返回)
+    async fn send_pong(&mut self, payload: &[u8]) -> Result<(), &'static str> {
+        self.send_frame(0xA, payload).await
+    }
+
+    /// 发送帧 (FIN + opcode, 掩码); 载荷上限 = opus 单包最大值
     async fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), &'static str> {
-        if payload.len() > 1000 {
+        if payload.len() > MAX_PACKET_BYTES {
             return Err("帧过长");
         }
         let rng = esp_hal::rng::Rng::new();
@@ -285,7 +523,7 @@ impl WsClient<'_> {
             (rng.random() >> 16) as u8,
             (rng.random() >> 24) as u8,
         ];
-        let mut frame: heapless::Vec<u8, 1024> = heapless::Vec::new();
+        let mut frame: heapless::Vec<u8, 2048> = heapless::Vec::new();
         frame.push(0x80 | opcode).ok();
         let len = payload.len();
         if len < 126 {
@@ -302,7 +540,7 @@ impl WsClient<'_> {
     }
 
     /// 接收一帧 (服务端帧不掩码), 返回 (opcode, payload)
-    async fn recv_frame(&mut self) -> Result<(u8, heapless::Vec<u8, 1024>), &'static str> {
+    async fn recv_frame(&mut self) -> Result<(u8, heapless::Vec<u8, 2048>), &'static str> {
         let mut hdr = [0u8; 2];
         read_exact(&mut self.socket, &mut hdr)
             .await
@@ -321,7 +559,7 @@ impl WsClient<'_> {
             127 => return Err("64 位长度不支持"),
             n => n,
         };
-        if len > 1024 {
+        if len > 2048 {
             return Err("帧过长");
         }
         let mut mask = [0u8; 4];
@@ -330,7 +568,7 @@ impl WsClient<'_> {
                 .await
                 .map_err(|_| "读取掩码失败")?;
         }
-        let mut payload = heapless::Vec::<u8, 1024>::new();
+        let mut payload = heapless::Vec::<u8, 2048>::new();
         payload.resize(len, 0).map_err(|_| "帧过长")?;
         if len > 0 {
             read_exact(&mut self.socket, &mut payload)
@@ -452,7 +690,7 @@ async fn ws_handshake(
     Ok(())
 }
 
-/// 发送 hello 消息 (xiaozhi 协议)
+/// 发送 hello 消息 (xiaozhi 协议, version 1 = 裸二进制音频帧)
 async fn ws_send_hello(ws: &mut WsClient<'_>) -> Result<(), &'static str> {
     ws.send_text(
         b"{\"type\":\"hello\",\"version\":1,\"features\":{\"mcp\":true},\

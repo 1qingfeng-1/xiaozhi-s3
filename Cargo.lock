@@ -2213,6 +2213,7 @@ version = "0.1.0"
 name = "xiaozhi-s3"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "critical-section",
  "defmt 1.1.1",
  "embassy-executor",

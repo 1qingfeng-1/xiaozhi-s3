@@ -19,6 +19,10 @@ name = "xiaozhi-cloud"
 path = "./src/bin/xiaozhi-cloud.rs"
 required-features = ["wifi"]
 
+[build-dependencies]
+# vendor/libopus (xiph/opus v1.6.1 裁剪副本) 的 C 交叉编译
+cc = "1"
+
 [dependencies]
 # 纯逻辑核心层（音量映射/时钟计算/寄存器序列/状态机），host 可单元测试
 # git submodule: xiaozhi-core
@@ -31,7 +35,8 @@ defmt                  = "1.0.1"
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["defmt", "esp32s3"] }
 
 critical-section = "1.2.0"
-esp-alloc        = { version = "0.10.0", features = ["defmt"] }
+# compat: 提供 malloc/free/calloc/realloc —— libopus C 代码的堆分配入口
+esp-alloc        = { version = "0.10.0", features = ["defmt", "compat"] }
 esp-println      = { version = "0.17.0", features = ["defmt-espflash", "esp32s3"] }
 esp-radio = { version = "1.0.0-beta.0", optional = true, features = ["esp32s3", "wifi", "esp-alloc", "defmt", "unstable"] }
 esp-rtos = { version = "0.3.0", optional = true, features = ["esp32s3", "esp-radio", "esp-alloc", "embassy", "defmt"] }

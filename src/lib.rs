@@ -14,6 +14,7 @@
 extern crate alloc;
 
 // 子模块声明
+pub mod audio;
 pub mod bsp;
 // pub mod gpio;
 // pub mod system;

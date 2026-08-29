@@ -32,10 +32,12 @@ cd xiaozhi-core && cargo +stable nextest run   # 或 cargo +stable test
 ```text
 xiaozhi-s3/          固件 crate (no_std, esp-hal 薄封装)
 ├── src/bin/         main.rs 主入口 + gpio-test / i2c-scan 硬件调试工具
-└── src/bsp/         板级支持包（编译时选板，cargo feature）
-    ├── board.rs     BoardConfig 契约（纯数据常量，按功能细分）
-    ├── components/  Board 运行时组件 (leds/buttons/power/battery/audio)
-    └── gezipai.rs   gezipai 板: BOARD 常量 + create_board() 工厂
+├── src/audio/       opus 编解码 (libopus FFI 安全封装, M4.2)
+├── src/bsp/         板级支持包（编译时选板，cargo feature）
+│   ├── board.rs     BoardConfig 契约（纯数据常量，按功能细分）
+│   ├── components/  Board 运行时组件 (leds/buttons/power/battery/audio)
+│   └── gezipai.rs   gezipai 板: BOARD 常量 + create_board() 工厂
+├── vendor/libopus/  xiph/opus v1.6.1 裁剪副本 (fixed-point 构建所需 125 个 .c)
 xiaozhi-core/        git submodule，纯逻辑层（音量映射/I2S 时钟/Codec 寄存器序列/状态机），host 可单测
 ```
 
@@ -58,7 +60,31 @@ xiaozhi-core/        git submodule，纯逻辑层（音量映射/I2S 时钟/Code
 - 板载 8MB PSRAM 实际为 **Octal SPI**（esp-hal 自动探测）。PSRAM 注册（`psram_allocator!`）必须在音频 DMA 缓冲分配**之后**（`create_board` 末尾）：S3 GDMA 访问不了 PSRAM，先注册会让 I2S 缓冲落外部 RAM 报 `DmaError(UnsupportedMemoryRegion)`。
 - 音频 DMA 缓冲必须在**内部 RAM**；内部堆（160KB）在 `create_board` 第一行注册（各 bin 共用，先于任何分配）。
 - I2S 全双工（esp-hal 1.1）：TX 主机经 `signal_loopback` 把时钟共享给 RX（等价 IDF `i2s_ll_share_bck_ws`）。**循环采集的描述符数量必须与缓冲精确等分**（`available()` 从链尾描述符回溯，多余空描述符 → 空指针崩溃）；**RX 从机依赖 TX 时钟**——TX 不跑 ES7210 不出数据（回环用"采集不足一个描述符就补播静音窗"维持时钟）；一次性 TX 重启约有 ~28B 采集损耗；`available()` 按完整描述符（4092B）计数。
-- 音量注意：ES8311 REG32 是 **dB 线性映射**（0%= -95.5dB → 100%= +32dB），35% ≈ -51dB 基本不可闻；麦克风数字电平仅 1~5% 满幅，回放前需软件增益（回环用 800%）。
+- 音量注意：ES8311 REG32 是 **dB 线性映射**（0%= -95.5dB → 100%= +32dB），35% ≈ -51dB 基本不可闻；麦克风数字电平仅 1~5% 满幅，回放前需软件增益（回环/上行均用 800%）。
+
+## opus 集成（M4.2）
+
+- **vendor/libopus 是 xiph/opus v1.6.1 的裁剪副本**（仅 fixed-point 构建所需源码，无
+  float/dnn/x86/ARM），由 `build.rs` 用 `cc` 交叉编译。更新它时以官方 `*_sources.mk`
+  清单为准重新裁剪。许可证 BSD-3（`vendor/libopus/COPYING`）。
+- **xtensa GCC 探测顺序**（`build.rs::find_xtensa_gcc`）：环境变量
+  `CC_xtensa_esp32s3_none_elf` / `CC` → PATH 中的 `xtensa-esp32s3-elf-gcc` →
+  espup 默认目录 `~/.espressif/tools/xtensa-esp-elf/*/xtensa-esp-elf/bin`。
+  CI 由 `esp-rs/xtensa-toolchain` action（espup）自带 GCC，无需额外安装。
+- **C 堆分配走 esp-alloc 的 `compat` feature**（malloc/free/calloc/realloc）：
+  libopus 状态经 `opus_alloc` → malloc 分配（编码器 ~25KB / 解码器 ~5KB，落内部堆）。
+  compat 的 4 字节对齐**已够用**——FIXED_POINT 构建下 opus 状态无 64 位字段
+  （`ec_window` 默认 32 位、无 float），若未来开浮点构建需重估对齐。
+- **解码器建在本地 16kHz**：libopus 解码时内部重采样，服务器 24kHz 的 TTS 流
+  直接输出 16kHz，无需外部重采样器（C++ 参考用的是 SILK 重采样器，两法皆可）。
+- **协议参数**（对齐 C++ `websocket_protocol.cc`）：hello `version:1` → 二进制帧
+  为**裸 opus 载荷**（无帧头）；上行 16kHz/60ms/单声道 VoIP、complexity 0、DTX 开；
+  服务器 hello 的 `sample_rate`（默认 24000）只影响其下行流，本地解码不受影响，
+  `frame_duration`（默认 60ms）决定解码缓冲大小。
+- **跨 await 借用坑**：async 会话循环里不可对 `board.capture` 做"释放句柄再重启"
+  （生成器借用区域粗于 NLL，`E0499`）。做法是采集**常驻启动**（RX 从机无时钟时
+  自然无数据），listen 开始时冲掉残留积压即可。板子组件按字段拆分借用传参
+  （`&mut board.audio` / `&mut board.buttons` 与采集句柄 disjoint）。
 
 ## C++ 参考实现（本机）
 
