@@ -76,11 +76,16 @@ async fn main(spawner: Spawner) -> ! {
 
     match wifi::boot_mode(flash) {
         Mode::Station(config) => {
-            info!("已有配置: ssid={}", config.ssid.as_str());
+            info!(
+                "启动模式: STA ssid={} 密码长度={} 服务器={}",
+                config.ssid.as_str(),
+                config.password.len(),
+                config.server.as_str()
+            );
             station_mode(spawner, config, peripherals.WIFI, flash).await;
         },
         Mode::Provision => {
-            info!("无配置, 进入配网模式");
+            info!("启动模式: 配网 (Flash 无有效凭据)");
             provision_mode(spawner, peripherals.WIFI, flash).await;
         },
     }
