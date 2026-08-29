@@ -399,14 +399,14 @@ async fn serve_bytes(socket: &mut tcp::TcpSocket<'_>, ctype: &str, body: &[u8]) 
         ctype,
         body.len()
     );
-    let mut out = alloc::vec::Vec::with_capacity(head.len() + body.len());
-    out.extend_from_slice(head.as_bytes());
-    out.extend_from_slice(body);
-    while !out.is_empty() {
+    // 零拷贝分块写: 头部与正文直接从源切片写出 (大文件不进堆,
+    // WiFi 协议栈已占用内部堆大部分, 158KB 级 Vec 会 OOM panic)
+    let mut head_slice = head.as_str();
+    while !head_slice.is_empty() {
         let n = socket
             .write_with(|buf| {
-                let n = usize::min(buf.len(), out.len());
-                buf[..n].copy_from_slice(&out[..n]);
+                let n = usize::min(buf.len(), head_slice.len());
+                buf[..n].copy_from_slice(head_slice[..n].as_bytes());
                 (n, n)
             })
             .await
@@ -414,7 +414,22 @@ async fn serve_bytes(socket: &mut tcp::TcpSocket<'_>, ctype: &str, body: &[u8]) 
         if n == 0 {
             break;
         }
-        out.drain(..n);
+        head_slice = &head_slice[n..];
+    }
+    let mut body_slice = body;
+    while !body_slice.is_empty() {
+        let n = socket
+            .write_with(|buf| {
+                let n = usize::min(buf.len(), body_slice.len());
+                buf[..n].copy_from_slice(&body_slice[..n]);
+                (n, n)
+            })
+            .await
+            .unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        body_slice = &body_slice[n..];
     }
     let _ = socket.flush().await;
     // 官方验证过的时序: flush 后延时, close 后延时, 再 abort
