@@ -91,7 +91,9 @@ async fn main(spawner: Spawner) -> ! {
     };
 
     // STA 连接 + 网络栈
+    // Interface::station() 是单例 (二次调用 panic): 只取一次, MAC 先读后移交
     let interface = esp_radio::wifi::Interface::station();
+    let mac_bytes = interface.mac_address();
     let mut controller = esp_radio::wifi::WifiController::new(
         peripherals.WIFI,
         esp_radio::wifi::ControllerConfig::default().with_initial_config(config.station_config()),
@@ -143,7 +145,16 @@ async fn main(spawner: Spawner) -> ! {
         },
     };
 
-    let mac = device_mac();
+    let mac = {
+        let mut s = heapless::String::<32>::new();
+        for (i, b) in mac_bytes.iter().enumerate() {
+            if i > 0 {
+                let _ = s.push_str(":");
+            }
+            let _ = core::fmt::write(&mut s, format_args!("{:02X}", b));
+        }
+        s
+    };
 
     // WebSocket 重连循环
     loop {
@@ -203,19 +214,6 @@ async fn main(spawner: Spawner) -> ! {
         // session_loop 返回 = 连接断开, 重连
         embassy_time::Timer::after(embassy_time::Duration::from_secs(2)).await;
     }
-}
-
-/// 设备 MAC (冒号分隔)
-fn device_mac() -> heapless::String<32> {
-    let mac = esp_radio::wifi::Interface::station().mac_address();
-    let mut s = heapless::String::<32>::new();
-    for (i, b) in mac.iter().enumerate() {
-        if i > 0 {
-            let _ = s.push_str(":");
-        }
-        let _ = core::fmt::write(&mut s, format_args!("{:02X}", b));
-    }
-    s
 }
 
 /// WebSocket 会话循环: BOOT 按键 → listen 消息, 服务器消息 → 日志
