@@ -25,7 +25,9 @@ use defmt::{error, info};
 use esp_println as _;
 
 use xiaozhi_s3::app::{self, AppArgs};
+use xiaozhi_s3::bsp::components::Rgb565;
 use xiaozhi_s3::bsp::create_board;
+use xiaozhi_s3::ota_check;
 use xiaozhi_s3::wifi::{self, Mode, store};
 
 #[panic_handler]
@@ -99,8 +101,17 @@ async fn main(spawner: Spawner) -> ! {
     let acc_buf = xiaozhi_s3::mk_static!([i16; 1920], [0i16; 1920]);
     let silence_buf = xiaozhi_s3::mk_static!([u8; BLOCK_BYTES], [0u8; BLOCK_BYTES]);
 
-    // 开机提示音
+    // 开机画面 + 提示音
+    board.display.draw_status("XIAOZHI S3", Rgb565::WHITE);
     board.audio.beep(150);
+
+    // OTA 版本检查 (仅上报, 下载烧写待分区表改造)
+    match ota_check::check(stack, server).await {
+        Some(report) if report.update_available => {
+            info!("OTA: 新版本 {} 可升级", report.latest_version.as_str());
+        },
+        _ => {},
+    }
 
     // 采集常驻 + 主循环 (采集故障 → 直线路径重建 → 重进)
     let mut cap = match board.capture.start() {
@@ -116,6 +127,9 @@ async fn main(spawner: Spawner) -> ! {
                 audio: &mut board.audio,
                 buttons: &mut board.buttons,
                 leds: &mut board.leds,
+                display: &mut board.display,
+                battery: &mut board.battery,
+                power: &mut board.power,
                 cap: &mut cap,
                 stack,
                 server,

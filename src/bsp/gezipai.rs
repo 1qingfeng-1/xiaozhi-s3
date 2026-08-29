@@ -203,6 +203,20 @@ pub fn create_board(peripherals: Peripherals) -> Board {
         BOARD.audio.output_sample_rate,
     );
 
+    // 显示: ST7789 240x240, SPI2 (SCK=7 MOSI=6 CS=15 DC=16 RST=5 BL=4)
+    let display = {
+        let spi = components::make_spi(
+            peripherals.SPI2,
+            peripherals.GPIO7,
+            peripherals.GPIO6,
+            peripherals.GPIO15,
+        );
+        let dc = Output::new(peripherals.GPIO16, Level::High, OutputConfig::default());
+        let rst = Output::new(peripherals.GPIO5, Level::High, OutputConfig::default());
+        let bl = Output::new(peripherals.GPIO4, Level::Low, OutputConfig::default());
+        components::Display::new(spi, dc, rst, bl)
+    };
+
     // 板载 8MB Octal PSRAM 接入全局堆 (esp-hal 自动探测模式)。
     // ⚠️ 必须在音频 DMA 缓冲分配之后注册: S3 的 GDMA 访问不了 PSRAM,
     // 先注册 PSRAM 会让 I2S 缓冲落进外部 RAM 导致 DmaError(UnsupportedMemoryRegion)。
@@ -216,5 +230,6 @@ pub fn create_board(peripherals: Peripherals) -> Board {
         buttons,
         power,
         battery,
+        display,
     }
 }

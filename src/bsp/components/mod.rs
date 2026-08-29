@@ -6,12 +6,14 @@
 mod audio;
 mod battery;
 mod buttons;
+mod display;
 mod leds;
 mod power;
 
 pub use audio::{Audio, Capture};
 pub use battery::Battery;
 pub use buttons::Buttons;
+pub use display::{Display, Rgb565, make_spi};
 pub use leds::{BreathSpeed, LedMode, Leds, led_mode_label};
 pub use power::{Power, power_label};
 
@@ -27,5 +29,5 @@ pub struct Board {
     pub buttons: Buttons,
     pub power: Power,
     pub battery: Battery,
-    // TODO: display 组件实现后加入组合
+    pub display: Display,
 }

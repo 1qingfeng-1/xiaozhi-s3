@@ -22,9 +22,12 @@ use xiaozhi_core::audio::wake::{
     VadWakeDetector, WakeEngine, WakeEvent, WakePolicy, WakePolicyConfig,
 };
 use xiaozhi_core::dialog::{Action, DialogEvent, DialogSm, DialogState, ListenMode};
+use xiaozhi_core::mcp;
 
 use crate::audio::opus::{MAX_PACKET_BYTES, OpusDecoder, OpusEncoder};
-use crate::bsp::components::{Audio, BreathSpeed, Buttons, LedMode, Leds};
+use crate::bsp::components::{
+    Audio, Battery, BreathSpeed, Buttons, Display, LedMode, Leds, Power, Rgb565,
+};
 use crate::session;
 
 /// 上行音频参数 (16kHz 单声道 60ms, 对齐 hello.audio_params)
@@ -63,6 +66,9 @@ pub struct AppArgs<'a, 'b> {
     pub audio: &'a mut Audio,
     pub buttons: &'a mut Buttons,
     pub leds: &'a mut Leds,
+    pub display: &'a mut Display,
+    pub battery: &'a mut Battery,
+    pub power: &'a mut Power,
     pub cap: &'a mut DmaTransferRxCircular<'b, I2sRx<'static, Blocking>>,
     pub stack: Stack<'static>,
     pub server: Ipv4Address,
@@ -85,6 +91,9 @@ pub async fn run(
         audio,
         buttons,
         leds,
+        display,
+        battery,
+        power,
         cap,
         stack,
         server,
@@ -101,6 +110,7 @@ pub async fn run(
     let mut held = false;
     let mut vol_edge = false;
     let mut last_led: Option<LedMode> = None;
+    let mut last_state: Option<DialogState> = None;
     // 状态机输出的待发网络动作 (listen/abort; Connect/提示音在注入点就地处理)
     let mut pending: heapless::Vec<Action, 8> = heapless::Vec::new();
 
@@ -130,6 +140,9 @@ pub async fn run(
                                     info!("服务器: tts stop");
                                     wake.policy_mut().note_playback_end(now_ms);
                                     dispatch(&mut sm, &mut pending, DialogEvent::TtsStop);
+                                },
+                                (Some("mcp"), _) => {
+                                    handle_mcp(text, audio, battery, power, &mut sess.ws).await;
                                 },
                                 _ => info!("服务器: {}", text),
                             }
@@ -361,6 +374,29 @@ pub async fn run(
             last_led = Some(led);
         }
         leds.tick();
+
+        // ---- 9. 显示状态 (状态切换时刷新, 英文点阵字库) ----
+        if last_state != Some(sm.state()) {
+            last_state = Some(sm.state());
+            let text = state_text(sm.state());
+            let color = match sm.state() {
+                DialogState::Speaking => Rgb565::YELLOW,
+                DialogState::Listening => Rgb565::GREEN,
+                _ => Rgb565::CYAN,
+            };
+            display.draw_status(text, color);
+        }
+    }
+}
+
+/// 显示面板状态文本 (3x5 点阵字库仅 ASCII)
+fn state_text(state: DialogState) -> &'static str {
+    match state {
+        DialogState::Idle => "IDLE",
+        DialogState::Connecting => "CONN",
+        DialogState::Listening => "LISTEN",
+        DialogState::WaitingReply => "WAIT",
+        DialogState::Speaking => "TTS",
     }
 }
 
@@ -390,4 +426,49 @@ fn dispatch(sm: &mut DialogSm, pending: &mut heapless::Vec<Action, 8>, ev: Dialo
         }
     }
     info!("状态: {}", state_label(state));
+}
+
+/// MCP 请求处理: 解析 JSON-RPC 并执行工具 (音量/设备状态), 回应答帧
+async fn handle_mcp(
+    text: &str,
+    audio: &mut Audio,
+    battery: &mut Battery,
+    power: &mut Power,
+    ws: &mut session::WsClient<'_>,
+) {
+    let Some(req) = mcp::parse_request(text) else {
+        return; // notifications / 无法解析: 无需回应
+    };
+    const BOARD_NAME: &str = crate::bsp::active::BOARD.name;
+    const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+    let resp: heapless::String<1024> = match req.method {
+        mcp::McpMethod::Initialize => mcp::initialize_response(req.id, BOARD_NAME, APP_VERSION),
+        mcp::McpMethod::ToolsList => mcp::tools_list_response(req.id),
+        mcp::McpMethod::ToolsCall { name, volume } => match (name, volume) {
+            ("self.get_device_status", _) => {
+                let battery_pct = battery.reported_percentage(power.status());
+                let status = mcp::status_json(
+                    audio.volume(),
+                    battery_pct,
+                    power.status() == xiaozhi_core::board::PowerStatus::Charging,
+                );
+                mcp::text_result_response(req.id, status.as_str())
+            },
+            ("self.audio_speaker.set_volume", Some(v)) => {
+                let v = v.clamp(0, 100) as u8;
+                audio.set_volume(v);
+                info!("MCP: 音量设为 {}%", v);
+                mcp::text_result_response(req.id, "true")
+            },
+            ("self.audio_speaker.set_volume", None) => {
+                mcp::error_response(req.id, "Missing argument: volume")
+            },
+            (_other, _) => mcp::error_response(req.id, "Unknown tool"),
+        },
+        mcp::McpMethod::Unknown(_) => mcp::error_response(req.id, "Method not implemented"),
+    };
+    if let Err(e) = ws.send_text(resp.as_bytes()).await {
+        warn!("MCP 响应发送失败: {}", e);
+    }
 }
