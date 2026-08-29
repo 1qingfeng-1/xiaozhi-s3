@@ -392,7 +392,9 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
     info!("HTTP 配置页就绪 (:80)");
 
     loop {
-        if socket.accept(80).await.is_err() {
+        info!("HTTP: 等待连接 (:80)...");
+        if let Err(e) = socket.accept(80).await {
+            error!("HTTP: accept 失败");
             embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
             continue;
         }
