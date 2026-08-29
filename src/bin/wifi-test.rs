@@ -471,7 +471,7 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
             // 官方验证过的格式: HTTP/1.0 + EOF 定界 + flush→延时→close→延时→abort
             let _ = socket
                 .write_with(|buf| {
-                    let resp = "HTTP/1.0 200 OK\r\n\r\n\"
+                    let resp = "HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\"
             <html><head><meta charset='utf-8'><title>xiaozhi 配网</title>\
 <meta name='viewport' content='width=device-width,initial-scale=1'></head><body>\
 <h3>xiaozhi 音箱配网</h3>\
