@@ -454,16 +454,26 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
                 },
             }
         } else {
-            info!("HTTP: 回送最小响应");
+            info!("HTTP: 回送官方格式响应");
+            // 完全对齐官方 embassy_access_point 示例: HTTP/1.0 + EOF 定界 + 官方时序
             let _ = socket
                 .write_with(|buf| {
-                    let resp =
-                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+                    let resp = "HTTP/1.0 200 OK\r\n\r\n\
+            <html>\
+                <body>\
+                    <h1>Hello xiaozhi!</h1>\
+                </body>\
+            </html>\r\n\
+            ";
                     buf[..resp.len()].copy_from_slice(resp.as_bytes());
                     (resp.len(), ())
                 })
                 .await;
-            graceful_close(&mut socket).await;
+            let _ = socket.flush().await;
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)).await;
+            socket.close();
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)).await;
+            socket.abort();
         }
     }
 }
