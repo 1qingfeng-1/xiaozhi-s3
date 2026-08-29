@@ -451,6 +451,7 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
                             (resp.len(), ())
                         })
                         .await;
+                    let _ = socket.flush().await;
                 },
             }
         } else {
@@ -470,6 +471,7 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
                     (n, ())
                 })
                 .await;
+            let _ = socket.flush().await; // 等 ACK, 否则循环顶的 abort 会丢响应
         }
     }
 }
