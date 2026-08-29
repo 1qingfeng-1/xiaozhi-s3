@@ -18,6 +18,7 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
+use embassy_executor::Spawner;
 use esp_hal::{
     clock::CpuClock,
     main,
@@ -55,14 +56,20 @@ const VAD_THRESHOLD: i16 = 300;
 /// pop 缓冲上限 16KB; 积压超过此值说明处理跟不上, 重启采集丢弃积压
 const POP_BUF_SIZE: usize = 16 * 1024;
 
-#[main]
-fn main() -> ! {
+#[esp_rtos::main]
+async fn main(_spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
     info!("=== 音频回环调试 (M1) ===");
 
     let mut board = create_board(peripherals);
+
+    // esp-radio 已无条件入链: 调度器必须启动 (外设经 steal 重取)
+    let p = unsafe { esp_hal::peripherals::Peripherals::steal() };
+    let timg0 = esp_hal::timer::timg::TimerGroup::new(p.TIMG0);
+    let sw_interrupt = esp_hal::interrupt::software::SoftwareInterruptControl::new(p.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
     info!("板子 [{}] 初始化完成", board.name);
 
     // 回放音量: ES8311 REG32 为 dB 线性映射, 35% = -51dB 几乎不可闻;
@@ -102,7 +109,7 @@ fn main() -> ! {
     info!("开始回环, 对着麦克风说话...");
 
     loop {
-        // 等待采集数据
+        // 等待采集数据 (match 两臂都 break, 1ms 忙等窗已无必要)
         let avail = loop {
             match rx.available() {
                 Ok(n) => break n,
@@ -119,8 +126,6 @@ fn main() -> ! {
                     break 0;
                 },
             }
-            let t0 = Instant::now();
-            while t0.elapsed() < Duration::from_millis(1) {}
         };
 
         // 积压超过 pop 缓冲: 处理跟不上, 重启采集丢弃积压 (重新对齐)

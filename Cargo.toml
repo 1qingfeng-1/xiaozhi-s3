@@ -12,12 +12,6 @@ path = "./src/bin/main.rs"
 [[bin]]
 name = "wifi-test"
 path = "./src/bin/wifi-test.rs"
-required-features = ["wifi"]
-
-[[bin]]
-name = "xiaozhi-cloud"
-path = "./src/bin/xiaozhi-cloud.rs"
-required-features = ["wifi"]
 
 [build-dependencies]
 # vendor/libopus (xiph/opus v1.6.1 裁剪副本) 的 C 交叉编译
@@ -38,15 +32,15 @@ critical-section = "1.2.0"
 # compat: 提供 malloc/free/calloc/realloc —— libopus C 代码的堆分配入口
 esp-alloc        = { version = "0.10.0", features = ["defmt", "compat"] }
 esp-println      = { version = "0.17.0", features = ["defmt-espflash", "esp32s3"] }
-esp-radio = { version = "1.0.0-beta.0", optional = true, features = ["esp32s3", "wifi", "esp-alloc", "defmt", "unstable"] }
-esp-rtos = { version = "0.3.0", optional = true, features = ["esp32s3", "esp-radio", "esp-alloc", "embassy", "defmt"] }
-embassy-time = { version = "0.5.0", optional = true }
-static_cell = { version = "2.1.0", optional = true }
-embassy-net = { version = "0.8.0", optional = true, features = ["dhcpv4", "medium-ethernet", "tcp", "udp", "dns"] }
-esp-storage = { version = "0.8.1", optional = true, features = ["esp32s3"] }
-embedded-storage = { version = "0.3.1", optional = true }
-embassy-executor = { version = "0.10.0", optional = true }
-heapless = { version = "0.8.0", optional = true }
+esp-radio = { version = "1.0.0-beta.0", features = ["esp32s3", "wifi", "esp-alloc", "defmt", "unstable"] }
+esp-rtos = { version = "0.3.0", features = ["esp32s3", "esp-radio", "esp-alloc", "embassy", "defmt"] }
+embassy-time = "0.5.0"
+static_cell = "2.1.0"
+embassy-net = { version = "0.8.0", features = ["dhcpv4", "medium-ethernet", "tcp", "udp", "dns"] }
+esp-storage = { version = "0.8.1", features = ["esp32s3"] }
+embedded-storage = "0.3.1"
+embassy-executor = "0.10.0"
+heapless = "0.8.0"
 
 [features]
 default = ["board-gezipai"]
@@ -56,19 +50,6 @@ board-gezipai = []
 
 ## 新增板子: 先建 src/bsp/<board>.rs, 再加 feature 与 src/bsp/mod.rs 注册
 # board-<name> = []
-
-## WiFi (esp-radio + esp-rtos + 配网/网络栈)
-wifi = [
-    "dep:esp-radio",
-    "dep:esp-rtos",
-    "dep:esp-storage",
-    "dep:embedded-storage",
-    "dep:heapless",
-    "dep:embassy-net",
-    "dep:embassy-executor",
-    "dep:embassy-time",
-    "dep:static_cell",
-]
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html

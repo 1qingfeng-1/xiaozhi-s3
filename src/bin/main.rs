@@ -1,6 +1,10 @@
-//! 主入口 - 面向 BSP 组合对象 (Board) 的应用骨架
+//! 主入口 — 智能音箱产品固件
 //!
-//! 流程: 创建 Board → 主循环轮询电源状态/按键 → LED 指示
+//! 流程: create_board (音频+PSRAM) → esp-rtos → 读凭据 (无则配网) →
+//! WiFi 连接 → 主应用循环 (唤醒监听 / 对话 / 播报 / 打断)。
+//!
+//! 采集常驻运行; RX 饱和故障时在直线路径重建句柄后重进主循环
+//! (async 生成器里条件路径的 drop→重启借用检查过不去, 见 AGENTS.md)。
 
 #![no_std]
 #![no_main]
@@ -9,25 +13,24 @@
     reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
     holding buffers for the duration of a data transfer."
 )]
-#![deny(clippy::large_stack_frames)]
 
+use embassy_executor::Spawner;
 use esp_hal::{
-    clock::CpuClock,
-    main,
-    time::{Duration, Instant},
+    clock::CpuClock, interrupt::software::SoftwareInterruptControl, peripherals::Peripherals,
+    timer::timg::TimerGroup,
 };
+use esp_storage::FlashStorage;
 
-use defmt::error;
-use defmt::info;
+use defmt::{error, info};
 use esp_println as _;
 
-use xiaozhi_s3::bsp::components::{BreathSpeed, LedMode, led_mode_label};
-use xiaozhi_s3::bsp::{create_board, power_label};
+use xiaozhi_s3::app::{self, AppArgs};
+use xiaozhi_s3::bsp::create_board;
+use xiaozhi_s3::wifi::{self, Mode, store};
 
 #[panic_handler]
 fn panic(panic_info: &core::panic::PanicInfo) -> ! {
     error!("{}", panic_info);
-    // 打印后软复位, 避免 loop{} 卡死掩盖问题 (调试期现场自动恢复)
     esp_hal::system::software_reset()
 }
 
@@ -36,115 +39,103 @@ extern crate alloc;
 // This creates a default app-descriptor required by the esp-idf bootloader.
 esp_bootloader_esp_idf::esp_app_desc!();
 
-#[allow(
-    clippy::large_stack_frames,
-    reason = "it's not unusual to allocate larger buffers etc. in main"
-)]
-#[main]
-fn main() -> ! {
+/// 会话常驻缓冲尺寸
+const POP_BUF_SIZE: usize = 16 * 1024;
+/// 单 DMA 描述符字节数 (4092B ≈ 64ms @ 16kHz 立体声)
+const BLOCK_BYTES: usize = 4092;
+
+#[esp_rtos::main]
+async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // 内部堆在 create_board 内注册 (先于音频 DMA 缓冲分配, 各 bin 共用)
     info!("=== 小智音箱启动 ===");
 
-    // 组合式板子: 引脚接线/断言全部收敛在 BSP 工厂内
+    // 板子工厂: 内部堆第一行注册 → 音频 DMA 缓冲 → PSRAM 最后注册
     let mut board = create_board(peripherals);
     info!("板子 [{}] 初始化完成", board.name);
 
-    // 音频通路验证: 开机 250Hz 提示音 300ms (Codec init + I2S DMA + PA)
-    info!("音频初始化: 播放提示音...");
-    board.audio.beep(300);
-    let id = board.audio.es8311_chip_id();
-    info!(
-        "音频通路 OK (音量 {}%, ES8311 ID=0x{:02X}0x{:02X})",
-        board.audio.volume(),
-        id[0],
-        id[1]
-    );
+    // create_board 按值消耗了 Peripherals; 音频不用的 WIFI/FLASH/TIMG0 经 steal 再取
+    let p = unsafe { Peripherals::steal() };
+    let timg0 = TimerGroup::new(p.TIMG0);
+    let sw_interrupt = SoftwareInterruptControl::new(p.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
-    let mut last_power = board.power.status();
-    info!("电源状态: {}", power_label(last_power));
+    let flash = xiaozhi_s3::mk_static!(FlashStorage<'static>, FlashStorage::new(p.FLASH));
 
-    let mut last_boot = board.buttons.boot_pressed();
-    let mut last_up = board.buttons.volume_up_pressed();
-    let mut last_down = board.buttons.volume_down_pressed();
-    let mut tick = 0u32;
+    // BOOT 键开机按住: 清除凭据强制重回配网
+    if board.buttons.boot_pressed() {
+        info!("BOOT 按下: 清除 WiFi 配置...");
+        let _ = store::clear(flash);
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(200)).await;
+    }
 
-    // 初始读取一次电池 (对齐参考实现: 每 10s 刷新)
-    let mv = board.battery.read_voltage_mv();
-    info!(
-        "电池: {} mV, {}%",
-        mv,
-        board.battery.reported_percentage(last_power).unwrap_or(0)
-    );
+    // WiFi: 有凭据连 STA; 无凭据/连接失败 → 配网模式 (SoftAP 表单, 保存后重启)
+    let (stack, server, _controller, mac) = match wifi::boot_mode(flash) {
+        Mode::Station(config) => match wifi::connect_station(&spawner, &config, p.WIFI).await {
+            Ok((stack, controller, mac)) => {
+                let server = match config.server.as_str().parse() {
+                    Ok(ip) => ip,
+                    Err(_) => {
+                        error!("服务器地址无效: {}", config.server.as_str());
+                        esp_hal::system::software_reset();
+                    },
+                };
+                (stack, server, controller, mac)
+            },
+            Err(_) => {
+                error!("WiFi 连接失败, 清除凭据重启进入配网");
+                let _ = store::clear(flash);
+                esp_hal::system::software_reset();
+            },
+        },
+        Mode::Provision => wifi::provision::run(spawner, p.WIFI, flash).await,
+    };
+    info!("设备 ID: {}", mac.as_str());
 
-    // LED 灯语演示: 无键=慢呼吸(待机) / 音量-=中呼吸(识别) / 音量+=快呼吸(唤醒) / BOOT=常亮(回答)
-    let mut last_mode = LedMode::Breathing(BreathSpeed::Slow);
-    board.leds.set_mode(last_mode);
-    info!("LED 灯语: 待机=慢呼吸 音量-=中呼吸 音量+=快呼吸 BOOT=常亮");
+    // 会话常驻缓冲 (帧长/常量与 app.rs 对齐: 960 样本 @16kHz 60ms)
+    let pop_buf = xiaozhi_s3::mk_static!([u8; POP_BUF_SIZE], [0u8; POP_BUF_SIZE]);
+    let mono_buf = xiaozhi_s3::mk_static!([i16; POP_BUF_SIZE / 4], [0i16; POP_BUF_SIZE / 4]);
+    let acc_buf = xiaozhi_s3::mk_static!([i16; 1920], [0i16; 1920]);
+    let silence_buf = xiaozhi_s3::mk_static!([u8; BLOCK_BYTES], [0u8; BLOCK_BYTES]);
 
-    info!("系统初始化完成, 进入主循环");
+    // 开机提示音
+    board.audio.beep(150);
 
+    // 采集常驻 + 主循环 (采集故障 → 直线路径重建 → 重进)
+    let mut cap = match board.capture.start() {
+        Ok(t) => t,
+        Err(e) => {
+            error!("采集启动失败: {:?}", e);
+            esp_hal::system::software_reset()
+        },
+    };
     loop {
-        // 1. 电源状态变化时打印 (分类逻辑在 xiaozhi-core, host 单测覆盖)
-        let st = board.power.status();
-        if st != last_power {
-            info!(
-                "电源状态: {} -> {}",
-                power_label(last_power),
-                power_label(st)
-            );
-            last_power = st;
-        }
-
-        // 2. 按键边沿检测
-        let boot = board.buttons.boot_pressed();
-        if boot != last_boot {
-            info!("BOOT 键 {}", if boot { "按下" } else { "松开" });
-            last_boot = boot;
-        }
-        let up = board.buttons.volume_up_pressed();
-        if up != last_up {
-            info!("音量+ 键 {}", if up { "按下" } else { "松开" });
-            last_up = up;
-        }
-        let down = board.buttons.volume_down_pressed();
-        if down != last_down {
-            info!("音量- 键 {}", if down { "按下" } else { "松开" });
-            last_down = down;
-        }
-
-        // 3. LED 灯语: 按键切换模式 (LEDC 硬件渐变)
-        //    BOOT=常亮(回答) / 音量+=快呼吸(唤醒) / 音量-=中呼吸(识别) / 无键=慢呼吸(待机)
-        let mode = if boot {
-            LedMode::On
-        } else if up {
-            LedMode::Breathing(BreathSpeed::Fast)
-        } else if down {
-            LedMode::Breathing(BreathSpeed::Medium)
-        } else {
-            LedMode::Breathing(BreathSpeed::Slow)
+        let outcome = app::run(
+            AppArgs {
+                audio: &mut board.audio,
+                buttons: &mut board.buttons,
+                leds: &mut board.leds,
+                cap: &mut cap,
+                stack,
+                server,
+                mac: mac.clone(),
+            },
+            &mut pop_buf[..],
+            &mut mono_buf[..],
+            &mut acc_buf[..],
+            &mut silence_buf[..],
+        )
+        .await;
+        // app::run 仅在采集故障时返回: 直线路径 drop→重建 (async 借用约束)
+        debug_assert_eq!(outcome, app::RunOutcome::CaptureFault);
+        drop(cap);
+        cap = match board.capture.start() {
+            Ok(t) => t,
+            Err(e) => {
+                error!("采集重建失败: {:?}", e);
+                esp_hal::system::software_reset()
+            },
         };
-        if mode != last_mode {
-            info!("灯语切换 -> {}", led_mode_label(mode));
-            board.leds.set_mode(mode);
-            last_mode = mode;
-        }
-        board.leds.tick();
-
-        // 4. 电池状态: 每 10 秒刷新一次 (50ms tick × 200)
-        tick += 1;
-        if tick.is_multiple_of(200) {
-            let mv = board.battery.read_voltage_mv();
-            info!(
-                "电池: {} mV, {}%",
-                mv,
-                board.battery.reported_percentage(st).unwrap_or(0)
-            );
-        }
-
-        let delay_start = Instant::now();
-        while delay_start.elapsed() < Duration::from_millis(50) {}
     }
 }

@@ -11,6 +11,8 @@ allow = [
     "Unicode-DFS-2016",
     "Unicode-3.0",
     "Zlib",
+    "0BSD",   # managed / smoltcp (embassy-net 传递依赖)
+    "BSD-3-Clause",  # smoltcp 等网络栈依赖
 ]
 # 检查许可证兼容性
 confidence-threshold = 0.8

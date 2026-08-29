@@ -7,6 +7,7 @@
 #![no_std]
 #![no_main]
 
+use embassy_executor::Spawner;
 use esp_hal::{
     clock::CpuClock,
     gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
@@ -33,10 +34,18 @@ extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-#[main]
-fn main() -> ! {
+#[esp_rtos::main]
+async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
+
+    // esp-radio 已无条件入链: 调度器必须先于任何 radio 符号使用启动
+    esp_alloc::heap_allocator!(size: 64 * 1024);
+    let timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
+    let sw_interrupt =
+        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+    let _ = spawner;
 
     esp_alloc::heap_allocator!(size: 73744);
 
