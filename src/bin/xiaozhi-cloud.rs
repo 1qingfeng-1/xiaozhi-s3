@@ -179,9 +179,9 @@ async fn main(spawner: Spawner) -> ! {
         s
     };
 
-    // 采集常驻启动 (整个运行期): RX 为 I2S 从机, 无 TX 时钟时自然无数据,
-    // 无需按 listen 状态启停 (跨 await 重启采集有借用/时序双坑)。
-    // TX 时钟由会话循环里的静音窗/播放维持。
+    // 采集常驻启动: RX 为 I2S 从机, 无 TX 时钟时自然无数据, 无需按 listen
+    // 状态启停 (跨 await 重启采集有借用/时序双坑)。会话结束时在下方主循环
+    // 重建句柄。TX 时钟由会话循环里的静音窗/TTS 播放维持。
     let mut cap = match board.capture.start() {
         Ok(t) => t,
         Err(e) => {
@@ -294,6 +294,18 @@ async fn main(spawner: Spawner) -> ! {
             &mut silence_buf[..],
         )
         .await;
+        // 会话结束 (WS 断开/关闭, 或采集积压超限) —— 无论原因都重建采集句柄:
+        // RX 饱和触发 Late 后 available() 计数已损坏, 只能整体重建; 常规重连
+        // 场景下重启也仅损失 ~28B 采集。此处 drop→start 是直线路径 (async
+        // 生成器里条件路径的 drop→重启借用检查过不去, 见 AGENTS.md)。
+        drop(cap);
+        cap = match board.capture.start() {
+            Ok(t) => t,
+            Err(e) => {
+                error!("采集重启失败: {:?}", e);
+                esp_hal::system::software_reset()
+            },
+        };
         // session_loop 返回 = 连接断开, 重连
         embassy_time::Timer::after(embassy_time::Duration::from_secs(2)).await;
     }
@@ -394,49 +406,56 @@ async fn session_loop(
             }
         }
 
-        // ---- 对讲: 采集 → 提取 MIC1 → 增益 → 累积 960 样本 → opus 上行 ----
-        if held {
-            match cap.available() {
-                Ok(avail) if avail > pop_buf.len() => {
-                    // 积压超限 ( >0.25s 停顿): 处理已跟不上, 结束会话重连对齐
-                    error!("采集积压 {}B 超限, 重连", avail);
-                    return;
-                },
-                Ok(avail) if avail >= BLOCK_BYTES => match cap.pop(&mut pop_buf[..avail]) {
+        // ---- 采集排空 (每轮必做, 无论是否对讲) ----
+        // I2S 时钟运行期间 (TTS 播放或对讲静音窗) RX 持续填充, 不排空会让
+        // 描述符链 ~0.5s 后全部饱和 → 之后 available() 永远返回 Late,
+        // 且内部计数已损坏 (只能重建采集句柄恢复)。对讲时取走的数据走
+        // opus 上行, 其余 (TTS 回声/残留) 排空即弃。
+        match cap.available() {
+            Ok(avail) if avail > pop_buf.len() => {
+                // 积压超限 (处理 >0.25s 没跟上): 结束会话, 由 main 重建采集
+                error!("采集积压 {}B 超限, 结束会话", avail);
+                return;
+            },
+            Ok(avail) if avail >= BLOCK_BYTES => {
+                match cap.pop(&mut pop_buf[..avail]) {
                     Ok(n) => {
-                        let frames = n / 4;
-                        let ns = extract_slot(&pop_buf[..frames * 4], 2, 0, mono_buf);
-                        apply_gain_percent(&mut mono_buf[..ns], GAIN_PERCENT);
-                        if uplink(
-                            &mut acc_buf[..],
-                            &mut acc_len,
-                            &mono_buf[..ns],
-                            encoder,
-                            ws,
-                            &mut enc_out,
-                        )
-                        .await
-                        .is_err()
-                        {
-                            return;
+                        if held {
+                            // 提取 MIC1 → 增益 → 累积 960 样本 → opus 上行
+                            let frames = n / 4;
+                            let ns = extract_slot(&pop_buf[..frames * 4], 2, 0, mono_buf);
+                            apply_gain_percent(&mut mono_buf[..ns], GAIN_PERCENT);
+                            if uplink(
+                                &mut acc_buf[..],
+                                &mut acc_len,
+                                &mono_buf[..ns],
+                                encoder,
+                                ws,
+                                &mut enc_out,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                return;
+                            }
                         }
                     },
                     Err(e) => {
                         warn!("RX pop 失败: {:?}", e);
                         return;
                     },
-                },
-                Ok(_) => {},
-                Err(e) => {
-                    warn!("RX available 失败: {:?}", e);
-                    return;
-                },
-            }
-            // 时钟维持: 对讲期间无下行播放则补静音窗 (RX 从机依赖 TX 时钟,
-            // 与 audio-loopback 相同策略)
-            if !played {
-                audio.play_block(silence_buf);
-            }
+                }
+            },
+            Ok(_) => {},
+            Err(e) => {
+                warn!("RX available 失败: {:?} — 结束会话重建采集", e);
+                return;
+            },
+        }
+        // 时钟维持: 对讲期间无下行播放则补静音窗 (RX 从机依赖 TX 时钟,
+        // 与 audio-loopback 相同策略)
+        if held && !played {
+            audio.play_block(silence_buf);
         }
 
         embassy_time::Timer::after(embassy_time::Duration::from_millis(10)).await;

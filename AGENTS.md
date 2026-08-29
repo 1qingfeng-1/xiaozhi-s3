@@ -82,9 +82,14 @@ xiaozhi-core/        git submodule，纯逻辑层（音量映射/I2S 时钟/Code
   服务器 hello 的 `sample_rate`（默认 24000）只影响其下行流，本地解码不受影响，
   `frame_duration`（默认 60ms）决定解码缓冲大小。
 - **跨 await 借用坑**：async 会话循环里不可对 `board.capture` 做"释放句柄再重启"
-  （生成器借用区域粗于 NLL，`E0499`）。做法是采集**常驻启动**（RX 从机无时钟时
-  自然无数据），listen 开始时冲掉残留积压即可。板子组件按字段拆分借用传参
+  （生成器借用区域粗于 NLL，`E0499`）。采集**常驻启动**，重建只能在 main 的
+  直线路径上做（会话结束时 drop→start）；板子组件按字段拆分借用传参
   （`&mut board.audio` / `&mut board.buttons` 与采集句柄 disjoint）。
+- **I2S RX 环形缓冲饱和 = `DmaError::Late`**：esp-hal 的 `available()` 从链尾
+  描述符回溯计数，整条描述符链都被 CPU 持有（0.5s 没排空）时绕链一圈报 Late，
+  且内部 available 计数已被重复累加**损坏**——唯一恢复手段是丢弃句柄重建采集。
+  因此**I2S 时钟运行期间必须每轮循环排空采集**（TTS 播放、对讲静音窗都在驱动
+  时钟），不是只有对讲时才需要处理 RX。
 
 ## C++ 参考实现（本机）
 
