@@ -6,6 +6,8 @@ DOUT = "DOUT"
 # IDF I2S 位时钟标识符 i2s_ll_share_bck_ws, 非 "back" 拼写错误
 bck = "bck"
 BCK = "BCK"
+# ESP-SR 音频前端 (Audio Front End), 非 "safe" 拼写错误
+AFE = "AFE"
 
 [files]
 extend-exclude = ["CHANGELOG.md", "notebooks/*", "assets/wifi-config/vue.global.prod.js", "vendor/*"]
