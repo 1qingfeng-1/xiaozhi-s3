@@ -17,7 +17,8 @@ extern crate alloc;
 pub mod bsp;
 // pub mod gpio;
 // pub mod system;
-// pub mod wifi;
+#[cfg(feature = "wifi")]
+pub mod wifi;
 // pub mod network;
 // pub mod asr;
 // pub mod tts;
