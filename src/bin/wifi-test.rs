@@ -274,8 +274,20 @@ async fn dhcp_server(stack: Stack<'static>) {
         let mut buf = [0u8; 600];
         let (n, remote) = match socket.recv_from(&mut buf).await {
             Ok(x) => x,
-            Err(_) => continue,
+            Err(_) => {
+                error!("DHCP recv 错误");
+                continue;
+            },
         };
+        match remote.endpoint.addr {
+            embassy_net::IpAddress::Ipv4(a) => {
+                let o = a.octets();
+                info!(
+                    "DHCP 收包: {}B from {}.{}.{}.{}:{}",
+                    n, o[0], o[1], o[2], o[3], remote.endpoint.port
+                );
+            },
+        }
 
         let reply = match dhcp_build_reply(&buf[..n]) {
             Some(r) => r,
