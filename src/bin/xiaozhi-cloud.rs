@@ -164,11 +164,11 @@ async fn main(spawner: Spawner) -> ! {
             WS_PORT,
             WS_PATH
         );
-        let mut socket = TcpSocket::new(
-            stack,
-            mk_static!([u8; 4096], [0u8; 4096]),
-            mk_static!([u8; 4096], [0u8; 4096]),
-        );
+        // 重连循环内不可用 mk_static! (同一调用点二次初始化会 panic), 改堆泄漏
+        // (仅断线重连时分配一次, 量级极小)
+        let rx = alloc::vec![0u8; 4096].leak();
+        let tx = alloc::vec![0u8; 4096].leak();
+        let mut socket = TcpSocket::new(stack, rx, tx);
         match socket.connect((server, WS_PORT)).await {
             Ok(()) => {},
             Err(_) => {
