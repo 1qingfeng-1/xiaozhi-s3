@@ -317,7 +317,7 @@ fn dhcp_build_reply(req: &[u8]) -> Option<heapless::Vec<u8, 320>> {
     let mut out: heapless::Vec<u8, 320> = heapless::Vec::new();
     out.extend_from_slice(&[2, 1, 6, 0]).ok()?; // op=BOOTREPLY, htype, hlen, hops
     out.extend_from_slice(&req[4..8]).ok()?; // xid
-    out.extend_from_slice(&[0, 0]).ok()?; // secs/flags
+    out.extend_from_slice(&[0, 0, 0, 0]).ok()?; // secs(2) + flags(2)
     out.extend_from_slice(&req[12..16]).ok()?; // ciaddr
     out.extend_from_slice(&client_ip).ok()?; // yiaddr
     out.extend_from_slice(&ap_ip).ok()?; // siaddr
