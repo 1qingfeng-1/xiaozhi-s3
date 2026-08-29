@@ -55,6 +55,10 @@ xiaozhi-core/        git submodule，纯逻辑层（音量映射/I2S 时钟/Code
 - 日志用 defmt（`DEFMT_LOG=info`），打印走 esp-println。
 - edition 2024，rust-version 1.88；`profile.dev` 也开 `opt-level = "s"`（默认 debug 对嵌入式太慢太大，勿改回）。
 - CI（`.github/workflows/ci.yml`）用 `esp-rs/xtensa-toolchain` action 装 esp 工具链；core-test job 用 stable + cargo-nextest。不要在 CI 里手动 `source ~/.espup/export-esp.sh`（runner 上不存在该路径）。
+- 板载 8MB PSRAM 实际为 **Octal SPI**（esp-hal 自动探测）。PSRAM 注册（`psram_allocator!`）必须在音频 DMA 缓冲分配**之后**（`create_board` 末尾）：S3 GDMA 访问不了 PSRAM，先注册会让 I2S 缓冲落外部 RAM 报 `DmaError(UnsupportedMemoryRegion)`。
+- 音频 DMA 缓冲必须在**内部 RAM**；内部堆（160KB）在 `create_board` 第一行注册（各 bin 共用，先于任何分配）。
+- I2S 全双工（esp-hal 1.1）：TX 主机经 `signal_loopback` 把时钟共享给 RX（等价 IDF `i2s_ll_share_bck_ws`）。**循环采集的描述符数量必须与缓冲精确等分**（`available()` 从链尾描述符回溯，多余空描述符 → 空指针崩溃）；**RX 从机依赖 TX 时钟**——TX 不跑 ES7210 不出数据（回环用"采集不足一个描述符就补播静音窗"维持时钟）；一次性 TX 重启约有 ~28B 采集损耗；`available()` 按完整描述符（4092B）计数。
+- 音量注意：ES8311 REG32 是 **dB 线性映射**（0%= -95.5dB → 100%= +32dB），35% ≈ -51dB 基本不可闻；麦克风数字电平仅 1~5% 满幅，回放前需软件增益（回环用 800%）。
 
 ## C++ 参考实现（本机）
 

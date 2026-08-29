@@ -1,6 +1,6 @@
 //! gezipai 开发板配置 (源自官方 config.h / gezipai_board.cc)
 //!
-//! ESP32-S3-WROOM-1U, Quad PSRAM 占用 GPIO33-37。
+//! ESP32-S3-WROOM-1U, 8MB Octal PSRAM (esp-hal 自动探测, 占用 GPIO33-37)。
 //! 注意: GPIO12/13 是 LIGHT 串口, 并非充电检测 (此前误判已纠正)。
 
 use super::BoardConfig;
@@ -105,6 +105,10 @@ use alloc::boxed::Box;
 
 /// 组装 gezipai 板子运行时对象
 pub fn create_board(peripherals: Peripherals) -> Board {
+    // 内部堆必须先于任何分配注册 (所有 bin 共用本工厂):
+    // 音频 DMA 缓冲必须落内部 RAM (S3 GDMA 访问不了 PSRAM)
+    esp_alloc::heap_allocator!(size: 160_000);
+
     // 编译期校验: 硬接线与所选板子的 BSP 配置一致 (换板时改错立即报错)
     const _: () = assert!(
         BOARD.leds.builtin_gpio == 17
@@ -185,8 +189,8 @@ pub fn create_board(peripherals: Peripherals) -> Board {
     // 功放使能: PA=GPIO46, 高电平开启
     let pa = Output::new(peripherals.GPIO46, Level::Low, OutputConfig::default());
 
-    // 音频: I2S0 + DMA_CH0, MCLK=40/BCLK=39/WS=45/DOUT=48, 16kHz
-    let audio = components::Audio::new(
+    // 音频: I2S0 全双工 + DMA_CH0, MCLK=40/BCLK=39/WS=45/DOUT=48/DIN=21, 16kHz
+    let (audio, capture) = components::Audio::new(
         i2c,
         peripherals.I2S0,
         peripherals.DMA_CH0,
@@ -194,13 +198,20 @@ pub fn create_board(peripherals: Peripherals) -> Board {
         peripherals.GPIO45,
         peripherals.GPIO48,
         peripherals.GPIO40,
+        peripherals.GPIO21,
         pa,
         BOARD.audio.output_sample_rate,
     );
 
+    // 板载 8MB Octal PSRAM 接入全局堆 (esp-hal 自动探测模式)。
+    // ⚠️ 必须在音频 DMA 缓冲分配之后注册: S3 的 GDMA 访问不了 PSRAM,
+    // 先注册 PSRAM 会让 I2S 缓冲落进外部 RAM 导致 DmaError(UnsupportedMemoryRegion)。
+    esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
+
     Board {
         name: BOARD.name,
         audio,
+        capture,
         leds,
         buttons,
         power,

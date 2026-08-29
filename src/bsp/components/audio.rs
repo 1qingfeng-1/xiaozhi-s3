@@ -1,18 +1,23 @@
-//! 音频组件 — ES8311 播放 + ES7210 录音控制 + I2S TX 数据通路 + PA 功放
+//! 音频组件 — ES8311 播放 + ES7210 录音 + I2S 全双工数据通路 + PA 功放
 //!
 //! 分层: 寄存器序列来自 xiaozhi-core (纯逻辑, host 可测),
 //! 本组件只做 I2C 写入、I2S DMA、PA 开关。
-//! 录音通路 (I2S RX TDM) 下阶段接入。
+//!
+//! 全双工: 播放 (TX) 与采集 (RX) 共用 I2S0。TX 为时钟主机,
+//! 经 `SIG_LOOPBACK` 把 BCLK/WS 共享给 RX (RX 为 slave 跟随,
+//! 对齐 IDF 全双工 `i2s_ll_share_bck_ws`)。线格式统一 2ch 立体声
+//! 16bit @16k (ES7210 非-TDM, MIC1→L / MIC2→R);
+//! TDM 4ch + 参考通道留待 AEC 阶段 (M5) 启用。
 
 use esp_hal::{
     Blocking,
-    dma::{DmaChannelFor, DmaDescriptor},
+    dma::{DmaChannelFor, DmaDescriptor, DmaTransferRxCircular},
     i2c::master::I2c,
     i2s::{
         AnyI2s,
-        master::{Channels, Config, DataFormat, I2s, I2sTx},
+        master::{Channels, Config, DataFormat, Error, I2s, I2sRx, I2sTx},
     },
-    peripherals::{GPIO39, GPIO40, GPIO45, GPIO48},
+    peripherals::{GPIO21, GPIO39, GPIO40, GPIO45, GPIO48},
     time::{Duration, Instant},
 };
 
@@ -22,12 +27,19 @@ use xiaozhi_core::audio::codec::{
     self as codec_mod, RegWrite, es7210_init_sequence, es8311_init_sequence, es8311_volume_write,
 };
 
-/// DMA 描述符数量 (每个最大管理 ~4092B)
+/// TX DMA 描述符数量 (每个最大管理 ~4092B; 一次性播放路径不做链回溯, 余量即可)
 const TX_DESCRIPTOR_COUNT: usize = 64;
 /// 发送缓冲 16KB ≈ 0.25s @ 16kHz 立体声 16bit
 const TX_BUF_SIZE: usize = 16 * 1024;
+/// 单个 DMA 描述符管理的最大字节数
+const DMA_CHUNK_SIZE: usize = 4092;
+/// RX 循环缓冲 = 8 个整描述符 ≈ 0.25s @ 16kHz 立体声 16bit。
+/// 描述符必须与缓冲精确等分: esp-hal 循环采集的软件状态回溯从链尾
+/// 描述符出发, 数量不匹配 (多余空描述符) 会导致空指针崩溃
+const RX_BUF_SIZE: usize = DMA_CHUNK_SIZE * 8;
+const RX_DESCRIPTOR_COUNT: usize = 8;
 
-/// 音频子系统
+/// 音频播放子系统 (I2S TX + Codec 控制 + PA)
 pub struct Audio {
     i2c: I2c<'static, Blocking>,
     i2s_tx: I2sTx<'static, Blocking>,
@@ -36,12 +48,20 @@ pub struct Audio {
     volume: u8,
 }
 
+/// 录音子系统 (I2S RX, ES7210 麦克风)
+pub struct Capture {
+    i2s_rx: I2sRx<'static, Blocking>,
+    rx_buf: &'static mut [u8],
+}
+
 impl Audio {
-    /// 组装音频子系统 (完成 I2S 引脚接线 + Codec 寄存器初始化 + PA 使能)
+    /// 组装音频子系统 (I2S 全双工接线 + Codec 寄存器初始化 + PA 使能)
+    ///
+    /// 返回 (播放, 采集) 两个独立组件, 可分别借用 (回环同时收发)。
     ///
     /// # 参数
     /// - `i2c`: 已初始化的 Codec 控制总线
-    /// - 引脚: BCLK=39, WS(LRCK)=45, DOUT=48, MCLK=40 (gezipai, 见 BoardConfig)
+    /// - 引脚: BCLK=39, WS(LRCK)=45, DOUT=48, MCLK=40, DIN=21 (gezipai, 见 BoardConfig)
     /// - `pa`: 功放使能脚 (高电平开启)
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -52,9 +72,10 @@ impl Audio {
         ws: GPIO45<'static>,
         dout: GPIO48<'static>,
         mclk: GPIO40<'static>,
+        din: GPIO21<'static>,
         pa: esp_hal::gpio::Output<'static>,
         sample_rate_hz: u32,
-    ) -> Self {
+    ) -> (Self, Capture) {
         // 1. Codec 寄存器初始化 (序列来自 xiaozhi-core)
         let es8311_seq = es8311_init_sequence();
         // 复位保持 (0x1F) → delay 5ms → 其余寄存器
@@ -64,15 +85,16 @@ impl Audio {
         let start = Instant::now();
         while start.elapsed() < Duration::from_millis(5) {}
 
-        // 2. I2S 引脚接线与 DMA (先于音量写入, 构造结构体后补日志)
+        // 2. I2S 全双工: TX 主机驱动时钟, SIG_LOOPBACK 共享给 RX (slave 跟随)
         let cfg = Config::new_tdm_philips()
             .with_sample_rate(esp_hal::time::Rate::from_hz(sample_rate_hz))
             .with_data_format(DataFormat::Data16Channel16)
-            .with_channels(Channels::STEREO);
+            .with_channels(Channels::STEREO)
+            .with_signal_loopback(true);
         let i2s = I2s::new(i2s0, dma, cfg)
             .expect("I2S init failed")
             .with_mclk(mclk);
-        let descriptors: &'static mut [DmaDescriptor] =
+        let tx_descriptors: &'static mut [DmaDescriptor] =
             Box::leak(vec![DmaDescriptor::EMPTY; TX_DESCRIPTOR_COUNT].into_boxed_slice());
         let tx_buf: &'static mut [u8] = Box::leak(vec![0u8; TX_BUF_SIZE].into_boxed_slice());
         let i2s_tx = i2s
@@ -80,9 +102,16 @@ impl Audio {
             .with_bclk(bclk)
             .with_ws(ws)
             .with_dout(dout)
-            .build(descriptors);
+            .build(tx_descriptors);
+
+        // RX 只接 DIN; BCLK/WS 经 SIG_LOOPBACK 跟随 TX (同一物理线, 无需引脚)
+        let rx_descriptors: &'static mut [DmaDescriptor] =
+            Box::leak(vec![DmaDescriptor::EMPTY; RX_DESCRIPTOR_COUNT].into_boxed_slice());
+        let rx_buf: &'static mut [u8] = Box::leak(vec![0u8; RX_BUF_SIZE].into_boxed_slice());
+        let i2s_rx = i2s.i2s_rx.with_din(din).build(rx_descriptors);
 
         // 3. 组装 (PA 默认关, init 完成后统一拉高)
+        //    ES7210 立体声 (非 TDM): 与 2 槽位线格式匹配, AEC 阶段切 TDM
         let mut audio = Self {
             i2c,
             i2s_tx,
@@ -91,12 +120,13 @@ impl Audio {
             volume: 60,
         };
         audio.write_seq_logged("ES8311", &es8311_seq[1..]);
-        audio.write_seq_logged("ES7210", es7210_init_sequence());
+        audio.write_seq_logged("ES7210", es7210_init_sequence(false));
         audio.write_seq_logged("音量", &es8311_volume_write(60));
         // 功放使能 (高电平)
         audio._pa.set_high();
 
-        audio
+        let capture = Capture { i2s_rx, rx_buf };
+        (audio, capture)
     }
 
     /// 读取 ES8311 芯片 ID (寄存器 0xFD/0xFE), 用于 I2C 通路自检
@@ -186,6 +216,23 @@ impl Audio {
         }
     }
 
+    /// 播放一块原始立体声 i16-LE 数据 (阻塞)
+    ///
+    /// `data` 长度应与采集块匹配 (2ch × i16); 超过内部缓冲截断。
+    pub fn play_block(&mut self, data: &[u8]) {
+        let n = data.len().min(self.tx_buf.len());
+        self.tx_buf[..n].copy_from_slice(&data[..n]);
+        self.tx_buf[n..].fill(0);
+        // write_dma 形参为 &'t impl ReadBuffer (T 需 Sized): 传切片的引用
+        let words: &[u8] = &self.tx_buf[..n];
+        match self.i2s_tx.write_dma(&words) {
+            Ok(t) => {
+                let _ = t.wait();
+            },
+            Err(e) => defmt::error!("I2S DMA 发送失败: {:?}", e),
+        }
+    }
+
     /// 填充正弦波 (250Hz @16kHz: 64 采样/周期, 立体声 16bit)
     fn fill_sine(buf: &mut [u8], ms: u32) {
         const TAB: [i16; 64] = build_sine_table();
@@ -213,6 +260,16 @@ impl Audio {
         if let Err(e) = Self::write_seq(&mut self.i2c, seq) {
             defmt::error!("Codec {} 初始化失败: {:?}", name, e);
         }
+    }
+}
+
+impl Capture {
+    /// 启动连续采集 (循环 DMA)
+    ///
+    /// 返回的句柄存活期间 DMA 持续运行, 周期性 `available()` / `pop()`
+    /// 取走数据; 句柄丢弃即停止采集。
+    pub fn start(&mut self) -> Result<DmaTransferRxCircular<'_, I2sRx<'static, Blocking>>, Error> {
+        self.i2s_rx.read_dma_circular(&mut self.rx_buf)
     }
 }
 

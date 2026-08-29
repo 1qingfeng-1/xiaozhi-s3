@@ -45,8 +45,7 @@ fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    esp_alloc::heap_allocator!(size: 73744);
-
+    // 内部堆在 create_board 内注册 (先于音频 DMA 缓冲分配, 各 bin 共用)
     info!("=== 小智音箱启动 ===");
 
     // 组合式板子: 引脚接线/断言全部收敛在 BSP 工厂内

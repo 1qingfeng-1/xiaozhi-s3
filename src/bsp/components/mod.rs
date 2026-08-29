@@ -9,7 +9,7 @@ mod buttons;
 mod leds;
 mod power;
 
-pub use audio::Audio;
+pub use audio::{Audio, Capture};
 pub use battery::Battery;
 pub use buttons::Buttons;
 pub use leds::{BreathSpeed, LedMode, Leds, led_mode_label};
@@ -22,9 +22,10 @@ pub use power::{Power, power_label};
 pub struct Board {
     pub name: &'static str,
     pub audio: Audio,
+    pub capture: Capture,
     pub leds: Leds,
     pub buttons: Buttons,
     pub power: Power,
     pub battery: Battery,
-    // TODO: audio / display 组件实现后加入组合
+    // TODO: display 组件实现后加入组合
 }

@@ -3,6 +3,9 @@ HDA = "HDA"
 # esp-hal I2S 数据线术语 (DOUT/DIN), 非 "doubt" 拼写错误
 dout = "dout"
 DOUT = "DOUT"
+# IDF I2S 位时钟标识符 i2s_ll_share_bck_ws, 非 "back" 拼写错误
+bck = "bck"
+BCK = "BCK"
 
 [files]
 extend-exclude = ["CHANGELOG.md", "notebooks/*"]
