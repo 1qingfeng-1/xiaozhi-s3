@@ -46,6 +46,14 @@ pub fn load(flash: &mut FlashStorage<'_>) -> Option<WifiConfig> {
 
     let magic = u32::from_le_bytes(buf[..4].try_into().ok()?);
     if magic != MAGIC {
+        let h0 = u32::from_le_bytes(buf[..4].try_into().unwrap_or([0; 4]));
+        let h1 = u32::from_le_bytes(buf[4..8].try_into().unwrap_or([0; 4]));
+        defmt::error!(
+            "凭据无效: 扇区头=0x{:08X} 0x{:08X} (期望 magic=0x{:08X})",
+            h0,
+            h1,
+            MAGIC
+        );
         return None;
     }
 
@@ -72,4 +80,33 @@ pub fn load(flash: &mut FlashStorage<'_>) -> Option<WifiConfig> {
 /// 清除配置 (连接失败时调用, 回到配网模式)
 pub fn clear(flash: &mut FlashStorage<'_>) -> Result<(), &'static str> {
     NorFlash::erase(flash, SECTOR, SECTOR + SECTOR_SIZE).map_err(|_| "Flash 擦除失败")
+}
+
+/// 启动自检: 写已知模式到备用扇区并读回, 验证存储层工作正常
+pub fn self_test(flash: &mut FlashStorage<'_>) -> bool {
+    const TEST_SECTOR: u32 = 0x9000; // NVS 分区首扇区 (未使用)
+    let mut w = [0u8; 256];
+    for (i, b) in w.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    if NorFlash::erase(flash, TEST_SECTOR, TEST_SECTOR + 4096).is_err() {
+        defmt::error!("存储自检: 擦除失败");
+        return false;
+    }
+    if NorFlash::write(flash, TEST_SECTOR, &w).is_err() {
+        defmt::error!("存储自检: 写入失败");
+        return false;
+    }
+    let mut r = [0u8; 256];
+    if flash.read(TEST_SECTOR, &mut r).is_err() {
+        defmt::error!("存储自检: 读取失败");
+        return false;
+    }
+    let ok = w == r;
+    if ok {
+        defmt::info!("存储自检: 通过");
+    } else {
+        defmt::error!("存储自检: 读回数据不一致!");
+    }
+    ok
 }

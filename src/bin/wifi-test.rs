@@ -74,6 +74,10 @@ async fn main(spawner: Spawner) -> ! {
 
     let flash = mk_static!(FlashStorage<'static>, FlashStorage::new(peripherals.FLASH));
 
+    if !store::self_test(flash) {
+        error!("存储层自检失败!");
+    }
+
     match wifi::boot_mode(flash) {
         Mode::Station(config) => {
             info!(
