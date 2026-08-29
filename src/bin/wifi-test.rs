@@ -437,12 +437,16 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
                     );
                     let _ = socket
                         .write_with(|buf| {
-                            let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n已保存, 设备将重启并连接 WiFi";
+                            let resp = "HTTP/1.0 200 OK\r\n\r\n已保存, 设备将重启并连接 WiFi";
                             buf[..resp.len()].copy_from_slice(resp.as_bytes());
                             (resp.len(), ())
                         })
                         .await;
-                    graceful_close(&mut socket).await;
+                    let _ = socket.flush().await;
+                    embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)).await;
+                    socket.close();
+                    embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)).await;
+                    socket.abort();
                     // 响应已送达, 重启进入 STA 模式
                     esp_hal::system::software_reset();
                 },
@@ -450,25 +454,33 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
                     error!("保存失败: {}", e);
                     let _ = socket
                         .write_with(|buf| {
-                            let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n保存失败";
+                            let resp = "HTTP/1.0 200 OK\r\n\r\n保存失败";
                             buf[..resp.len()].copy_from_slice(resp.as_bytes());
                             (resp.len(), ())
                         })
                         .await;
-                    graceful_close(&mut socket).await;
+                    let _ = socket.flush().await;
+                    embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)).await;
+                    socket.close();
+                    embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)).await;
+                    socket.abort();
                 },
             }
         } else {
-            info!("HTTP: 回送官方格式响应");
-            // 完全对齐官方 embassy_access_point 示例: HTTP/1.0 + EOF 定界 + 官方时序
+            info!("HTTP: 回送配网表单");
+            // 官方验证过的格式: HTTP/1.0 + EOF 定界 + flush→延时→close→延时→abort
             let _ = socket
                 .write_with(|buf| {
-                    let resp = "HTTP/1.0 200 OK\r\n\r\n\
-            <html>\
-                <body>\
-                    <h1>Hello xiaozhi!</h1>\
-                </body>\
-            </html>\r\n\
+                    let resp = "HTTP/1.0 200 OK\r\n\r\n\"
+            <html><head><meta charset='utf-8'><title>xiaozhi 配网</title>\
+<meta name='viewport' content='width=device-width,initial-scale=1'></head><body>\
+<h3>xiaozhi 音箱配网</h3>\
+<form action='/save'>\
+WiFi 名称:<br><input name='ssid'><br>\
+WiFi 密码:<br><input name='pass' type='password'><br>\
+服务器地址:<br><input name='server' value='192.168.123.14'><br><br>\
+<input type='submit' value='保存并连接'>\
+</form><p>保存后设备将自动重启连接。</p></body></html>\r\n\
             ";
                     buf[..resp.len()].copy_from_slice(resp.as_bytes());
                     (resp.len(), ())
