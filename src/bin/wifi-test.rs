@@ -24,7 +24,10 @@
 use embassy_executor::Spawner;
 use embassy_net::{Ipv4Address, Ipv4Cidr, Stack, StackResources, tcp, udp};
 use esp_hal::{
-    clock::CpuClock, interrupt::software::SoftwareInterruptControl, timer::timg::TimerGroup,
+    clock::CpuClock,
+    gpio::{Input, InputConfig, Pull},
+    interrupt::software::SoftwareInterruptControl,
+    timer::timg::TimerGroup,
 };
 use esp_storage::FlashStorage;
 
@@ -76,6 +79,18 @@ async fn main(spawner: Spawner) -> ! {
 
     if !store::self_test(flash) {
         error!("存储层自检失败!");
+    }
+
+    // BOOT 键 (GPIO1, 低电平有效): 开机按住 → 清除 WiFi 凭据, 强制进入配网
+    let boot_btn = Input::new(
+        peripherals.GPIO1,
+        InputConfig::default().with_pull(Pull::Up),
+    );
+    if boot_btn.is_low() {
+        info!("BOOT 按下: 清除 WiFi 配置...");
+        let _ = store::clear(flash);
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(200)).await;
+        info!("配置已清除, 进入配网模式");
     }
 
     match wifi::boot_mode(flash) {
