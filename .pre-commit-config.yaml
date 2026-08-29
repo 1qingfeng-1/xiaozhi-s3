@@ -70,6 +70,8 @@ repos:
         files: \.md$
 
 # 排除不需要的文件
+# vendor/ 为三方资产 (esp-sr 预编译库/头文件/esp-dsp/cjson/libopus):
+# 保持与上游一致, 不做空白修复, 且允许大文件 (.a 静态库)
 exclude: |
   (?x)^(
     target/.*|
@@ -77,5 +79,6 @@ exclude: |
     \.github/.*|
     CHANGELOG\.md|
     \.pre-commit-config\.yaml|
-    Cargo\.lock
+    Cargo\.lock|
+    vendor/.*
   )$

@@ -101,6 +101,13 @@ async fn main(spawner: Spawner) -> ! {
     let acc_buf = xiaozhi_s3::mk_static!([i16; 1920], [0i16; 1920]);
     let silence_buf = xiaozhi_s3::mk_static!([u8; BLOCK_BYTES], [0u8; BLOCK_BYTES]);
 
+    // wakenet 自检 (feature `wakenet`): 强制链接 esp-sr 符号闭包
+    #[cfg(feature = "wakenet")]
+    match xiaozhi_s3::audio::wake_net::wakenet_selftest() {
+        Ok(()) => info!("wakenet 自检通过"),
+        Err(e) => error!("wakenet 自检失败: {}", e),
+    }
+
     // 开机画面 + 提示音
     board.display.draw_status("XIAOZHI S3", Rgb565::WHITE);
     board.audio.beep(150);

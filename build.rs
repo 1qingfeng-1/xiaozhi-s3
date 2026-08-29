@@ -65,6 +65,78 @@ fn build_libopus() {
 
     build.compile("opus");
     println!("cargo:rerun-if-changed={OPUS_DIR}");
+
+    if env::var_os("CARGO_FEATURE_WAKENET").is_some() {
+        build_wakenet(&compiler);
+    }
+}
+
+/// esp-sr v1.9.5 (feature `wakenet`): 预编译库链接 + 环境垫片
+fn build_wakenet(compiler: &str) {
+    let sr = "vendor/esp-sr";
+    // 1) 环境垫片 (model_path/文件 IO/日志/队列桩)
+    let mut shim = cc::Build::new();
+    shim.compiler(compiler)
+        .warnings(false)
+        .opt_level_str("s")
+        .flag("-mlongcalls")
+        .include(format!("{sr}/include"))
+        .include("vendor/cjson")
+        .file(format!("{sr}/src/model_path_shim.c"));
+    shim.compile("esp_sr_shim");
+
+    // cJSON (dl_lib_coefgetter_if.h 头引用)
+    let mut cjson = cc::Build::new();
+    cjson
+        .compiler(compiler)
+        .warnings(false)
+        .opt_level_str("s")
+        .flag("-mlongcalls")
+        .include("vendor/cjson")
+        .file("vendor/cjson/cJSON.c");
+    cjson.compile("cjson_wrap");
+
+    // 2) esp-dsp 子集 (MFCC 所需 FFT/点积; C + Xtensa 汇编)
+    //    源码: vendor/esp-dsp (v1.5.2 子集)
+    let dsp = "vendor/esp-dsp";
+    let mut dsp_build = cc::Build::new();
+    dsp_build
+        .compiler(compiler)
+        .warnings(false)
+        .opt_level_str("s")
+        .flag("-mlongcalls")
+        .include(format!("{dsp}/modules/fft/include"))
+        .include(format!("{dsp}/modules/dotprod/include"))
+        .include(format!("{dsp}/modules/common/include"))
+        .include(format!("{dsp}/compat"))
+        .include(format!("{dsp}/compat/xtensa/config"));
+    let dsp_files = [
+        "modules/fft/float/dsps_fft2r_fc32_ansi.c",
+        "modules/fft/float/dsps_fft4r_fc32_ansi.c",
+        "modules/fft/float/dsps_fft2r_bitrev_tables_fc32.c",
+        "modules/fft/float/dsps_fft4r_bitrev_tables_fc32.c",
+        "modules/dotprod/float/dsps_dotprod_f32_ansi.c",
+        "modules/support/support_func_c.c",
+        "compat/esp_dsp_compat.c",
+    ];
+    for f in dsp_files {
+        let path = format!("{dsp}/{f}");
+        if std::path::Path::new(&path).exists() {
+            dsp_build.file(path);
+        }
+    }
+    dsp_build.compile("esp_dsp_subset");
+
+    // 3) 预编译库 (顺序敏感: wakenet 最后; group 允许循环引用)
+    println!("cargo:rustc-link-search=native={sr}/lib");
+    println!("cargo:rustc-link-lib=static=c_speech_features");
+    println!("cargo:rustc-link-lib=static=dl_lib");
+    println!("cargo:rustc-link-lib=static=hufzip");
+    println!("cargo:rustc-link-lib=static=wakenet");
+    println!("cargo:rerun-if-changed={sr}");
+
+    // 数学函数 (libm; libc 的 ssp/stdio 与固件冲突, 缺口全部走 shim)
+    println!("cargo:rustc-link-lib=m");
 }
 
 /// 按文件头注释的顺序探测 xtensa GCC

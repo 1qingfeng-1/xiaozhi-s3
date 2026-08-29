@@ -51,6 +51,9 @@ board-gezipai = []
 ## 新增板子: 先建 src/bsp/<board>.rs, 再加 feature 与 src/bsp/mod.rs 注册
 # board-<name> = []
 
+## 关键词唤醒 (esp-sr WakeNet, "你好小智"): 链接级验证待完成, 见 vendor/esp-sr/README.md
+wakenet = []
+
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]

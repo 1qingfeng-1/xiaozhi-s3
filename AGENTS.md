@@ -64,6 +64,9 @@ xiaozhi-core/        git submodule，纯逻辑层（音量映射/I2S 时钟/Code
 
 ## opus 集成（M4.2）
 
+- **wakenet 特性 (esp-sr v1.9.5)**: 关键词唤醒「你好小智」的 vendoring 已
+  链接级闭环 (`cargo build --release --features wakenet`), 运行时待真机验证,
+  垫片清单与风险见 `vendor/esp-sr/README.md`。默认关闭, 声音唤醒 (VAD) 为默认路径。
 - **vendor/libopus 是 xiph/opus v1.6.1 的裁剪副本**（仅 fixed-point 构建所需源码，无
   float/dnn/x86/ARM），由 `build.rs` 用 `cc` 交叉编译。更新它时以官方 `*_sources.mk`
   清单为准重新裁剪。许可证 BSD-3（`vendor/libopus/COPYING`）。
