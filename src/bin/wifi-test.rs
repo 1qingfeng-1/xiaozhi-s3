@@ -395,7 +395,7 @@ const INDEX_HTML: &str = include_str!("../../assets/wifi-config/index.html");
 /// 发送完整 HTTP 响应 (头部 + 分块写 body + 官方验证过的关闭时序)
 async fn serve_bytes(socket: &mut tcp::TcpSocket<'_>, ctype: &str, body: &[u8]) {
     let head = format!(
-        "HTTP/1.0 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.0 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
         ctype,
         body.len()
     );

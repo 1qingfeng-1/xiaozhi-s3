@@ -14,6 +14,11 @@ name = "wifi-test"
 path = "./src/bin/wifi-test.rs"
 required-features = ["wifi"]
 
+[[bin]]
+name = "xiaozhi-cloud"
+path = "./src/bin/xiaozhi-cloud.rs"
+required-features = ["wifi"]
+
 [dependencies]
 # 纯逻辑核心层（音量映射/时钟计算/寄存器序列/状态机），host 可单元测试
 # git submodule: xiaozhi-core
