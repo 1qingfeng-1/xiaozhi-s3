@@ -392,7 +392,9 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
     info!("HTTP 配置页就绪 (:8080)");
 
     loop {
-        socket.abort(); // 重置到 Closed 状态, 否则再次 listen 会 InvalidState
+        if socket.state() != tcp::State::Closed {
+            socket.abort(); // 仅异常残留时复位
+        }
         info!("HTTP: 等待连接 (:8080)...");
         if let Err(e) = socket.accept(8080).await {
             error!("HTTP: accept 失败");
@@ -401,7 +403,6 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
         }
         info!("HTTP: 已接受连接");
 
-        socket.abort(); // 上一个连接处理完毕, 复位后再服务下一个
         let mut request = [0u8; 1024];
         let n = socket.read(&mut request).await.unwrap_or(0);
         info!("HTTP: 收到 {}B", n);
@@ -482,20 +483,19 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
     }
 }
 
-/// 优雅关闭: flush → FIN → 等FIN完成。直接 abort 会发 RST,
-/// 客户端内核未读的接收数据随 RST 丢弃, 浏览器表现为"连接被重置"。
-async fn graceful_close(socket: &mut tcp::TcpSocket<'_>) {
+/// 优雅关闭: flush → FIN → 等待连接完全关闭。
+/// 任何 abort/RST 都会丢弃对端内核未读的响应数据 (表现为"连接被重置"),
+/// 因此成功路径全程不使用 abort。
+async fn graceful_close(socket: &mut tcp::TcpSocket<'_>) -> bool {
     let _ = socket.flush().await;
     socket.close();
-    // FIN 发出并被对端确认后, smoltcp 状态回到 Closed; 兜底限时
-    for _ in 0..100 {
+    for _ in 0..200 {
         if socket.state() == tcp::State::Closed {
-            break;
+            return true;
         }
         embassy_time::Timer::after(embassy_time::Duration::from_millis(10)).await;
     }
-    embassy_time::Timer::after(embassy_time::Duration::from_millis(50)).await;
-    socket.abort();
+    false // 对端未正常关闭 (2s 超时)
 }
 
 /// 解析 query string (url-decode: %XX 与 +)
