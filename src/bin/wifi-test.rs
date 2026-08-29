@@ -119,7 +119,12 @@ async fn station_mode(
 
     // 连接 (重试 3 次, 失败清凭据重回配网)
     for attempt in 1..=3u8 {
-        info!("连接 WiFi: {} (第 {} 次)...", config.ssid.as_str(), attempt);
+        info!(
+            "连接 WiFi: [{}] 长度 {} (第 {} 次)...",
+            config.ssid.as_str(),
+            config.ssid.len(),
+            attempt
+        );
         match controller.connect_async().await {
             Ok(_) => break,
             Err(_) => {
@@ -527,7 +532,8 @@ fn parse_query(
             Some(x) => x,
             None => continue,
         };
-        let decoded = url_decode(v);
+        let full = url_decode(v);
+        let decoded = heapless::String::<64>::try_from(full.trim()).unwrap_or_default();
         match k {
             "ssid" => ssid = heapless::String::try_from(decoded.as_str()).unwrap_or_default(),
             "pass" => pass = decoded,
