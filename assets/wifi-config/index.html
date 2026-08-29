@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>xiaozhi 音箱配网</title>
+<script src="/vue.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: linear-gradient(160deg, #1a2332 0%, #2c3e50 100%);
+    min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px;
+  }
+  .card {
+    background: #fff; border-radius: 16px; padding: 28px 24px; width: 100%; max-width: 380px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.4);
+  }
+  h1 { font-size: 20px; color: #1a2332; margin-bottom: 4px; }
+  .sub { font-size: 13px; color: #8a94a6; margin-bottom: 20px; }
+  label { display: block; font-size: 13px; color: #5a6478; margin: 14px 0 6px; font-weight: 600; }
+  input {
+    width: 100%; padding: 11px 12px; font-size: 15px; border: 1.5px solid #d8dee9;
+    border-radius: 10px; outline: none; transition: border .15s; background: #f7f9fc;
+  }
+  input:focus { border-color: #4a7dff; background: #fff; }
+  button {
+    width: 100%; margin-top: 22px; padding: 13px; font-size: 16px; font-weight: 600;
+    color: #fff; background: linear-gradient(135deg, #4a7dff, #6c5ce7);
+    border: none; border-radius: 10px; cursor: pointer; transition: opacity .15s;
+  }
+  button:disabled { opacity: .55; cursor: default; }
+  .msg { margin-top: 16px; padding: 10px 12px; border-radius: 8px; font-size: 13px; text-align: center; }
+  .msg.ok { background: #e8f7ee; color: #1e7e46; }
+  .msg.err { background: #fdeceb; color: #c0392b; }
+  .footer { margin-top: 18px; text-align: center; font-size: 11px; color: #b0b8c4; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="card">
+    <h1>xiaozhi 音箱配网</h1>
+    <div class="sub">连接音箱热点后填写家庭 WiFi 信息</div>
+    <form @submit.prevent="submit">
+      <label>WiFi 名称 (2.4GHz)</label>
+      <input v-model.trim="ssid" required maxlength="32" placeholder="WiFi 名称" autocomplete="off">
+      <label>WiFi 密码</label>
+      <input v-model="pass" type="password" maxlength="63" placeholder="WiFi 密码">
+      <label>服务器地址</label>
+      <input v-model.trim="server" maxlength="63" placeholder="192.168.123.14">
+      <button type="submit" :disabled="state === 'saving'">{{ btnText }}</button>
+    </form>
+    <div v-if="message" class="msg" :class="state === 'error' ? 'err' : 'ok'">{{ message }}</div>
+    <div class="footer">xiaozhi-esp32 · Rust 固件</div>
+  </div>
+</div>
+<script>
+const { createApp, ref, computed } = Vue;
+createApp({
+  setup() {
+    const ssid = ref('');
+    const pass = ref('');
+    const server = ref('192.168.123.14');
+    const state = ref('idle'); // idle | saving | saved | error
+    const message = ref('');
+    const btnText = computed(() =>
+      state.value === 'saving' ? '保存中...' : '保存并连接'
+    );
+
+    async function submit() {
+      if (!ssid.value) {
+        state.value = 'error';
+        message.value = 'WiFi 名称不能为空';
+        return;
+      }
+      state.value = 'saving';
+      message.value = '';
+      try {
+        const q =
+          'ssid=' + encodeURIComponent(ssid.value) +
+          '&pass=' + encodeURIComponent(pass.value) +
+          '&server=' + encodeURIComponent(server.value);
+        await fetch('/save?' + q, { method: 'GET' });
+      } catch (e) {
+        // 设备保存后立即重启, 连接中断属预期
+      }
+      state.value = 'saved';
+      message.value = '已保存, 设备正在重启并连接 WiFi (约 10 秒)...';
+    }
+
+    return { ssid, pass, server, state, message, btnText, submit };
+  }
+}).mount('#app');
+</script>
+</body>
+</html>

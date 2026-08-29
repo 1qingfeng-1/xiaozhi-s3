@@ -375,147 +375,130 @@ fn dhcp_option(req: &[u8], code: u8) -> Option<u8> {
     None
 }
 
-/// 配网表单页
-const FORM: &str = "<html><head><meta charset='utf-8'><title>xiaozhi 配网</title>\
-<meta name='viewport' content='width=device-width,initial-scale=1'></head><body>\
-<h3>xiaozhi 音箱配网</h3>\
-<form action='/save'>\
-WiFi 名称:<br><input name='ssid'><br>\
-WiFi 密码:<br><input name='pass' type='password'><br>\
-服务器地址:<br><input name='server' value='192.168.123.14'><br><br>\
-<input type='submit' value='保存并连接'>\
-</form><p>保存后设备将自动重启连接。</p></body></html>";
+/// 嵌入资源: Vue3 运行时 + 配网页 (构建时打包进固件)
+const VUE_JS: &str = include_str!("../../assets/wifi-config/vue.global.prod.js");
+const INDEX_HTML: &str = include_str!("../../assets/wifi-config/index.html");
 
-/// HTTP 配网服务: 表单 + 保存 (保存成功即软件重启)
+/// 发送完整 HTTP 响应 (头部 + 分块写 body + 官方验证过的关闭时序)
+async fn serve_bytes(socket: &mut tcp::TcpSocket<'_>, ctype: &str, body: &[u8]) {
+    let head = format!(
+        "HTTP/1.0 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        ctype,
+        body.len()
+    );
+    let mut out = alloc::vec::Vec::with_capacity(head.len() + body.len());
+    out.extend_from_slice(head.as_bytes());
+    out.extend_from_slice(body);
+    while !out.is_empty() {
+        let n = socket
+            .write_with(|buf| {
+                let n = usize::min(buf.len(), out.len());
+                buf[..n].copy_from_slice(&out[..n]);
+                (n, n)
+            })
+            .await
+            .unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        out.drain(..n);
+    }
+    let _ = socket.flush().await;
+    // 官方验证过的时序: flush 后延时, close 后延时, 再 abort
+    embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)).await;
+    socket.close();
+    embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)).await;
+    socket.abort();
+}
+
+/// HTTP 配网服务: Vue3 表单 (/) + Vue 运行时 (/vue.js) + 保存 (/save)
 #[embassy_executor::task]
 async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'static>) {
     let mut socket = tcp::TcpSocket::new(
         stack,
-        mk_static!([u8; 1024], [0u8; 1024]),
-        mk_static!([u8; 1024], [0u8; 1024]),
+        mk_static!([u8; 2048], [0u8; 2048]),
+        mk_static!([u8; 2048], [0u8; 2048]),
     );
     info!("HTTP 配置页就绪 (:8080)");
 
     loop {
-        if socket.state() != tcp::State::Closed {
-            socket.abort(); // 仅异常残留时复位
-        }
-        info!("HTTP: 等待连接 (:8080)...");
-        if let Err(e) = socket.accept(8080).await {
-            error!("HTTP: accept 失败");
+        if socket.accept(8080).await.is_err() {
             embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
             continue;
         }
-        info!("HTTP: 已接受连接");
 
         let mut request = [0u8; 1024];
         let n = socket.read(&mut request).await.unwrap_or(0);
-        info!("HTTP: 收到 {}B", n);
         let req = core::str::from_utf8(&request[..n]).unwrap_or("");
-        // 打印完整请求头 (区分浏览器请求 vs 系统探针)
-        for line in req.split("\r\n").take(6) {
-            info!("HTTP> {}", line);
-        }
         let first_line = req.lines().next().unwrap_or("");
         let path = first_line.split_whitespace().nth(1).unwrap_or("/");
-        info!("HTTP: 请求路径 {}", path);
+        let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
+        info!("HTTP: 请求路径 {}", path_only);
 
-        if let Some(query) = path.strip_prefix("/save?") {
-            let (ssid, pass, server) = parse_query(query);
-            if ssid.is_empty() {
-                let _ = socket
-                    .write_with(|buf| {
-                        let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nSSID 不能为空";
-                        buf[..resp.len()].copy_from_slice(resp.as_bytes());
-                        (resp.len(), ())
-                    })
+        match path_only {
+            "/save" => {
+                let (ssid, pass, server) = parse_query(query);
+                if ssid.is_empty() {
+                    serve_bytes(
+                        &mut socket,
+                        "text/plain; charset=utf-8",
+                        "SSID 不能为空".as_bytes(),
+                    )
                     .await;
-                continue;
-            }
-            let config = wifi::WifiConfig::new(&ssid, &pass, &server);
-            match store::save(flash, &config) {
-                Ok(()) => {
-                    info!(
-                        "配网成功: ssid={} 服务器={}",
-                        config.ssid.as_str(),
-                        config.server.as_str()
-                    );
-                    let _ = socket
-                        .write_with(|buf| {
-                            let resp = "HTTP/1.0 200 OK\r\n\r\n已保存, 设备将重启并连接 WiFi";
-                            buf[..resp.len()].copy_from_slice(resp.as_bytes());
-                            (resp.len(), ())
-                        })
+                    continue;
+                }
+                let config = wifi::WifiConfig::new(&ssid, &pass, &server);
+                match store::save(flash, &config) {
+                    Ok(()) => {
+                        info!(
+                            "配网成功: ssid={} 服务器={}",
+                            config.ssid.as_str(),
+                            config.server.as_str()
+                        );
+                        serve_bytes(
+                            &mut socket,
+                            "text/plain; charset=utf-8",
+                            "已保存, 设备将重启并连接 WiFi".as_bytes(),
+                        )
                         .await;
-                    let _ = socket.flush().await;
-                    embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)).await;
-                    socket.close();
-                    embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)).await;
-                    socket.abort();
-                    // 响应已送达, 重启进入 STA 模式
-                    esp_hal::system::software_reset();
-                },
-                Err(e) => {
-                    error!("保存失败: {}", e);
-                    let _ = socket
-                        .write_with(|buf| {
-                            let resp = "HTTP/1.0 200 OK\r\n\r\n保存失败";
-                            buf[..resp.len()].copy_from_slice(resp.as_bytes());
-                            (resp.len(), ())
-                        })
+                        // 响应已完整关闭, 重启进入 STA 模式
+                        esp_hal::system::software_reset();
+                    },
+                    Err(e) => {
+                        error!("保存失败: {}", e);
+                        serve_bytes(
+                            &mut socket,
+                            "text/plain; charset=utf-8",
+                            "保存失败".as_bytes(),
+                        )
                         .await;
-                    let _ = socket.flush().await;
-                    embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)).await;
-                    socket.close();
-                    embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)).await;
-                    socket.abort();
-                },
-            }
-        } else {
-            info!("HTTP: 回送配网表单");
-            // 官方验证过的格式: HTTP/1.0 + EOF 定界 + flush→延时→close→延时→abort
-            let _ = socket
-                .write_with(|buf| {
-                    let resp = "HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\"
-            <html><head><meta charset='utf-8'><title>xiaozhi 配网</title>\
-<meta name='viewport' content='width=device-width,initial-scale=1'></head><body>\
-<h3>xiaozhi 音箱配网</h3>\
-<form action='/save'>\
-WiFi 名称:<br><input name='ssid'><br>\
-WiFi 密码:<br><input name='pass' type='password'><br>\
-服务器地址:<br><input name='server' value='192.168.123.14'><br><br>\
-<input type='submit' value='保存并连接'>\
-</form><p>保存后设备将自动重启连接。</p></body></html>\r\n\
-            ";
-                    buf[..resp.len()].copy_from_slice(resp.as_bytes());
-                    (resp.len(), ())
-                })
+                    },
+                }
+            },
+            "/vue.js" => {
+                serve_bytes(
+                    &mut socket,
+                    "application/javascript; charset=utf-8",
+                    VUE_JS.as_bytes(),
+                )
                 .await;
-            let _ = socket.flush().await;
-            embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)).await;
-            socket.close();
-            embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)).await;
-            socket.abort();
+            },
+            "/" | "/index.html" => {
+                serve_bytes(
+                    &mut socket,
+                    "text/html; charset=utf-8",
+                    INDEX_HTML.as_bytes(),
+                )
+                .await;
+            },
+            _ => {
+                serve_bytes(&mut socket, "text/plain; charset=utf-8", b"404").await;
+            },
         }
     }
 }
 
-/// 优雅关闭: flush → FIN → 等待连接完全关闭。
-/// 任何 abort/RST 都会丢弃对端内核未读的响应数据 (表现为"连接被重置"),
-/// 因此成功路径全程不使用 abort。
-async fn graceful_close(socket: &mut tcp::TcpSocket<'_>) -> bool {
-    let _ = socket.flush().await;
-    socket.close();
-    for _ in 0..200 {
-        if socket.state() == tcp::State::Closed {
-            return true;
-        }
-        embassy_time::Timer::after(embassy_time::Duration::from_millis(10)).await;
-    }
-    false // 对端未正常关闭 (2s 超时)
-}
-
-/// 解析 query string (url-decode: %XX 与 +)
+/// 解析 query string (url-decode: %XX 与 +), 值去首尾空白
 fn parse_query(
     query: &str,
 ) -> (
