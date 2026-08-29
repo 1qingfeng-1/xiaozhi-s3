@@ -1,0 +1,148 @@
+//! M4.0 调试: WiFi 配网 → 连接 → 服务器可达性验证
+//!
+//! 流程:
+//! 1. 读 Flash 凭据; 无 → 进入配网 (手机连热点 `xiaozhi-gezipai`,
+//!    浏览器打开 http://192.168.4.1/ 填表单), 保存后自动重启
+//! 2. STA 连接 (失败自动清凭据重回配网)
+//! 3. DHCP 获取 IP
+//! 4. TCP 探测服务器 OTA 接口 (:8003), 打印响应
+//!
+//! ```bash
+//! cargo run --release --bin wifi-test
+//! ```
+
+#![no_std]
+#![no_main]
+#![deny(
+    clippy::mem_forget,
+    reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
+    holding buffers for the duration of a data transfer."
+)]
+#![deny(clippy::large_stack_frames)]
+
+use esp_hal::{clock::CpuClock, main, timer::timg::TimerGroup};
+use esp_storage::FlashStorage;
+
+use defmt::{error, info};
+use esp_println as _;
+
+use xiaozhi_s3::wifi::{self, net::StaNet, provision, store};
+
+#[panic_handler]
+fn panic(panic_info: &core::panic::PanicInfo) -> ! {
+    error!("{}", panic_info);
+    esp_hal::system::software_reset()
+}
+
+extern crate alloc;
+
+// This creates a default app-descriptor required by the esp-idf bootloader.
+esp_bootloader_esp_idf::esp_app_desc!();
+
+/// WiFi 连接失败后的重启等待 (ms)
+const RETRY_DELAY_MS: u32 = 5000;
+
+#[main]
+fn main() -> ! {
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    let peripherals = esp_hal::init(config);
+
+    info!("=== WiFi 配网/连接调试 (M4.0) ===");
+
+    // WiFi 占用 TIMG0 + RNG + RADIO_CLK + WIFI; 本 bin 不初始化音频
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let (_wifi_init, mut controller, sta, ap) =
+        wifi::init(timg0, peripherals.RADIO_CLK, peripherals.WIFI);
+    info!("esp-wifi 初始化完成");
+
+    let mut flash = FlashStorage::new(peripherals.SPI1);
+
+    // 1. 读凭据, 无则配网 (配网页保存后会软件重启, 重新走到这里)
+    let config = match store::load(&mut flash) {
+        Some(c) => {
+            info!("已有配置: ssid={}", c.ssid.as_str());
+            c
+        },
+        None => {
+            info!("无配置, 进入配网模式");
+            match provision::run(&mut controller, ap, &mut flash) {
+                Some(_) => {
+                    info!("配网完成, 3s 后重启...");
+                    wifi::busy_wait_ms(3000);
+                    esp_hal::system::software_reset()
+                },
+                None => {
+                    error!("配网内部错误, 重启");
+                    esp_hal::system::software_reset()
+                },
+            }
+        },
+    };
+
+    // 2. STA 连接 (失败清凭据重回配网)
+    info!("连接 WiFi: {}...", config.ssid.as_str());
+    if let Err(e) = wifi::connect_sta(&mut controller, &config) {
+        error!("WiFi 连接失败: {} — 清除配置, {}ms 后重回配网", e, RETRY_DELAY_MS);
+        let _ = store::clear(&mut flash);
+        wifi::busy_wait_ms(RETRY_DELAY_MS);
+        esp_hal::system::software_reset();
+    }
+    info!("WiFi 已连接!");
+
+    // 3. 网络栈 + DHCP
+    let mut net = StaNet::new(sta);
+    let ip = loop {
+        if let Some(ip) = net.poll() {
+            let o = ip.octets();
+            info!("DHCP 分配: {}.{}.{}.{}", o[0], o[1], o[2], o[3]);
+            break ip;
+        }
+        wifi::busy_wait_ms(10);
+    };
+
+    // 4. 服务器可达性探测: TCP GET http://<server>:8003/xiaozhi/ota/
+    let server: smoltcp::wire::Ipv4Address = config
+        .server
+        .as_str()
+        .parse()
+        .map_err(|_| ())
+        .unwrap_or_else(|_| {
+            error!("服务器地址无效: {} (需为 IP)", config.server.as_str());
+            esp_hal::system::software_reset()
+        });
+    let so = server.octets();
+    let mut request = heapless::String::<256>::new();
+    let _ = core::fmt::write(
+        &mut request,
+        format_args!(
+            "GET /xiaozhi/ota/ HTTP/1.1\r\nHost: {}.{}.{}.{}\r\nConnection: close\r\n\r\n",
+            so[0], so[1], so[2], so[3]
+        ),
+    );
+
+    info!("探测服务器 OTA 接口: {}.{}.{}.{}:8003", so[0], so[1], so[2], so[3]);
+    loop {
+        match net.tcp_get(server, 8003, &request, 10_000) {
+            Ok(resp) => {
+                // 打印状态行与正文前段
+                let head = resp.lines().next().unwrap_or("");
+                let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+                info!("服务器响应: {} | {}", head, body);
+                break;
+            },
+            Err(e) => {
+                error!("探测失败: {} — 5s 后重试", e);
+                wifi::busy_wait_ms(5000);
+                net.poll();
+            },
+        }
+    }
+
+    info!("=== 网络链路 OK (IP / 服务器均可达), M4.0 完成 ===");
+
+    // 保持网络栈运行 (供后续扩展观察)
+    loop {
+        net.poll();
+        wifi::busy_wait_ms(100);
+    }
+}
