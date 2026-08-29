@@ -392,6 +392,7 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
     info!("HTTP 配置页就绪 (:80)");
 
     loop {
+        socket.abort(); // 重置到 Closed 状态, 否则再次 listen 会 InvalidState
         info!("HTTP: 等待连接 (:80)...");
         if let Err(e) = socket.accept(80).await {
             error!("HTTP: accept 失败");
@@ -400,6 +401,7 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
         }
         info!("HTTP: 已接受连接");
 
+        socket.abort(); // 上一个连接处理完毕, 复位后再服务下一个
         let mut request = [0u8; 1024];
         let n = socket.read(&mut request).await.unwrap_or(0);
         info!("HTTP: 收到 {}B", n);
