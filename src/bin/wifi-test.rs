@@ -406,6 +406,10 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
         let n = socket.read(&mut request).await.unwrap_or(0);
         info!("HTTP: 收到 {}B", n);
         let req = core::str::from_utf8(&request[..n]).unwrap_or("");
+        // 打印完整请求头 (区分浏览器请求 vs 系统探针)
+        for line in req.split("\r\n").take(6) {
+            info!("HTTP> {}", line);
+        }
         let first_line = req.lines().next().unwrap_or("");
         let path = first_line.split_whitespace().nth(1).unwrap_or("/");
         info!("HTTP: 请求路径 {}", path);
