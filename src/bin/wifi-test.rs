@@ -389,12 +389,12 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
         mk_static!([u8; 1024], [0u8; 1024]),
         mk_static!([u8; 1024], [0u8; 1024]),
     );
-    info!("HTTP 配置页就绪 (:80)");
+    info!("HTTP 配置页就绪 (:8080)");
 
     loop {
         socket.abort(); // 重置到 Closed 状态, 否则再次 listen 会 InvalidState
-        info!("HTTP: 等待连接 (:80)...");
-        if let Err(e) = socket.accept(80).await {
+        info!("HTTP: 等待连接 (:8080)...");
+        if let Err(e) = socket.accept(8080).await {
             error!("HTTP: accept 失败");
             embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
             continue;
@@ -454,20 +454,13 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
                 },
             }
         } else {
-            info!("HTTP: 回送表单页");
-            let body = FORM;
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-                body.len()
-            );
-            let mut total = heapless::Vec::<u8, 1024>::new();
-            total.extend_from_slice(head.as_bytes()).ok();
-            total.extend_from_slice(body.as_bytes()).ok();
+            info!("HTTP: 回送最小响应");
             let _ = socket
                 .write_with(|buf| {
-                    let n = total.len();
-                    buf[..n].copy_from_slice(&total);
-                    (n, ())
+                    let resp =
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+                    buf[..resp.len()].copy_from_slice(resp.as_bytes());
+                    (resp.len(), ())
                 })
                 .await;
             graceful_close(&mut socket).await;
