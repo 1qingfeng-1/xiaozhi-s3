@@ -273,13 +273,9 @@ async fn provision_mode(
     );
     spawner.spawn(net_task(runner).unwrap());
 
-    info!("配网模式: 热点 xiaozhi-gezipai, 配置页 http://192.168.4.1/");
+    info!("配网模式: 热点 xiaozhi-gezipai, 配置页 http://192.168.4.1:8080/");
     spawner.spawn(dhcp_server(stack).unwrap());
-    spawner.spawn(http_server(stack, flash).unwrap());
-
-    loop {
-        embassy_time::Timer::after(embassy_time::Duration::from_secs(3600)).await;
-    }
+    http_accept_loop(spawner, stack, flash).await
 }
 
 #[embassy_executor::task]
@@ -426,21 +422,23 @@ async fn serve_bytes(socket: &mut tcp::TcpSocket<'_>, ctype: &str, body: &[u8]) 
     socket.abort();
 }
 
-/// HTTP 配网服务: Vue3 表单 (/) + Vue 运行时 (/vue.js) + 保存 (/save)
-#[embassy_executor::task]
-async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'static>) {
-    let mut socket = tcp::TcpSocket::new(
-        stack,
-        mk_static!([u8; 2048], [0u8; 2048]),
-        mk_static!([u8; 2048], [0u8; 2048]),
-    );
+/// HTTP 接受循环: 监听窗口最小化 — 连接一建立立即重建监听,
+/// 页面/JS 请求放入池化任务并行处理 (浏览器紧随 HTML 的 /vue.js 请求不会被 RST)
+async fn http_accept_loop(
+    spawner: Spawner,
+    stack: Stack<'static>,
+    flash: &'static mut FlashStorage<'static>,
+) -> ! {
     info!("HTTP 配置页就绪 (:8080)");
-
     loop {
+        let rx = alloc::vec![0u8; 2048].leak();
+        let tx = alloc::vec![0u8; 2048].leak();
+        let mut socket = tcp::TcpSocket::new(stack, rx, tx);
         if socket.accept(8080).await.is_err() {
-            embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(50)).await;
             continue;
         }
+        info!("HTTP: 已接受连接");
 
         let mut request = [0u8; 1024];
         let n = socket.read(&mut request).await.unwrap_or(0);
@@ -452,64 +450,77 @@ async fn http_server(stack: Stack<'static>, flash: &'static mut FlashStorage<'st
 
         match path_only {
             "/save" => {
-                let (ssid, pass, server) = parse_query(query);
-                if ssid.is_empty() {
-                    serve_bytes(
-                        &mut socket,
-                        "text/plain; charset=utf-8",
-                        "SSID 不能为空".as_bytes(),
-                    )
-                    .await;
-                    continue;
-                }
-                let config = wifi::WifiConfig::new(&ssid, &pass, &server);
-                match store::save(flash, &config) {
-                    Ok(()) => {
-                        info!(
-                            "配网成功: ssid={} 服务器={}",
-                            config.ssid.as_str(),
-                            config.server.as_str()
-                        );
-                        serve_bytes(
-                            &mut socket,
-                            "text/plain; charset=utf-8",
-                            "已保存, 设备将重启并连接 WiFi".as_bytes(),
-                        )
-                        .await;
-                        // 响应已完整关闭, 重启进入 STA 模式
-                        esp_hal::system::software_reset();
-                    },
-                    Err(e) => {
-                        error!("保存失败: {}", e);
-                        serve_bytes(
-                            &mut socket,
-                            "text/plain; charset=utf-8",
-                            "保存失败".as_bytes(),
-                        )
-                        .await;
-                    },
-                }
-            },
-            "/vue.js" => {
-                serve_bytes(
-                    &mut socket,
-                    "application/javascript; charset=utf-8",
-                    VUE_JS.as_bytes(),
-                )
-                .await;
-            },
-            "/" | "/index.html" => {
-                serve_bytes(
-                    &mut socket,
-                    "text/html; charset=utf-8",
-                    INDEX_HTML.as_bytes(),
-                )
-                .await;
+                // 保存需要 Flash (独占借用), 走同步路径 (毫秒级, 不影响后续监听)
+                handle_save(&mut socket, query, flash).await;
             },
             _ => {
-                serve_bytes(&mut socket, "text/plain; charset=utf-8", b"404").await;
+                // 页面与 Vue 运行时: 无 Flash 访问, 放入池化任务并行服务
+                let path_owned = heapless::String::<32>::try_from(path_only).unwrap_or_default();
+                spawner.spawn(http_asset_task(socket, path_owned).unwrap());
             },
         }
+    }
+}
+
+/// 静态资源任务: 配网页 / Vue3 运行时 / 404
+#[embassy_executor::task(pool_size = 4)]
+async fn http_asset_task(mut socket: tcp::TcpSocket<'static>, path: heapless::String<32>) {
+    match path.as_str() {
+        "/vue.js" => {
+            serve_bytes(
+                &mut socket,
+                "application/javascript; charset=utf-8",
+                VUE_JS.as_bytes(),
+            )
+            .await;
+        },
+        "/" | "/index.html" => {
+            serve_bytes(
+                &mut socket,
+                "text/html; charset=utf-8",
+                INDEX_HTML.as_bytes(),
+            )
+            .await;
+        },
+        _ => {
+            serve_bytes(&mut socket, "text/plain; charset=utf-8", b"404").await;
+        },
+    }
+}
+
+/// 处理 /save: 凭据写入 Flash 并优雅应答
+async fn handle_save(socket: &mut tcp::TcpSocket<'_>, query: &str, flash: &mut FlashStorage<'_>) {
+    let (ssid, pass, server) = parse_query(query);
+    if ssid.is_empty() {
+        serve_bytes(
+            socket,
+            "text/plain; charset=utf-8",
+            "SSID 不能为空".as_bytes(),
+        )
+        .await;
+        return;
+    }
+    let config = wifi::WifiConfig::new(&ssid, &pass, &server);
+    match store::save(flash, &config) {
+        Ok(()) => {
+            info!(
+                "配网成功: ssid={} 服务器={}",
+                config.ssid.as_str(),
+                config.server.as_str()
+            );
+            serve_bytes(
+                socket,
+                "text/plain; charset=utf-8",
+                "已保存, 设备将重启并连接 WiFi".as_bytes(),
+            )
+            .await;
+            // 响应已完整关闭, 重启进入 STA 模式
+            esp_hal::system::software_reset();
+        },
+        Err(e) => {
+            error!("保存失败: {}", e);
+            serve_bytes(socket, "text/plain; charset=utf-8", "保存失败".as_bytes()).await;
+        },
     }
 }
 
