@@ -295,6 +295,7 @@ async fn dhcp_server(stack: Stack<'static>) {
         };
         let port = remote.endpoint.port;
         let _ = socket.send_to(&reply, (Ipv4Address::BROADCAST, port)).await;
+        info!("DHCP 应答: {}B (类型 {})", reply.len(), reply[242]);
     }
 }
 
@@ -335,6 +336,10 @@ fn dhcp_build_reply(req: &[u8]) -> Option<heapless::Vec<u8, 320>> {
     opt(51, &[0xFF, 0xFF, 0xFF, 0xFF])?; // lease: 无限
     opt(1, &[255, 255, 255, 0])?; // subnet mask
     opt(3, &ap_ip)?; // router
+    // BOOTP 规定最小包长 300B: 不足则用 padding option (0) 填充, 客户端会丢弃短包
+    while out.len() < 299 {
+        out.extend_from_slice(&[0]).ok()?;
+    }
     out.extend_from_slice(&[255]).ok()?; // end
     Some(out)
 }
