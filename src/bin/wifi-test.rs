@@ -265,10 +265,12 @@ async fn provision_mode(
         gateway: Some(Ipv4Address::from(AP_ADDR)),
         dns_servers: heapless::Vec::<Ipv4Address, 3>::new(),
     });
+    // 容量: DHCP UDP socket 1 + 并发 TCP 连接 7 (StackResources 按 socket 计数,
+    // 超容量时 TcpSocket::new panic → 设备重启循环)
     let (stack, runner) = embassy_net::new(
         interface,
         static_cfg,
-        mk_static!(StackResources<3>, StackResources::<3>::new()),
+        mk_static!(StackResources<8>, StackResources::<8>::new()),
         0x0FED_CBA9_8765_4321,
     );
     spawner.spawn(net_task(runner).unwrap());
