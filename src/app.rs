@@ -41,6 +41,13 @@ pub const VAD_THRESHOLD: i16 = 800;
 
 /// 乒乓窗口 = 单个 DMA 描述符 (4092B ≈ 64ms): available() 按完整描述符计数
 const BLOCK_BYTES: usize = 4092;
+/// 当前系统毫秒 (主循环用)
+fn now0() -> u64 {
+    esp_hal::time::Instant::now()
+        .duration_since_epoch()
+        .as_millis()
+}
+
 /// 主循环返回原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
@@ -107,9 +114,12 @@ pub async fn run(
     );
     let mut session: Option<SessionState> = None;
     let mut acc_len = 0usize;
+    let mut uplink_frames: u64 = 0;
     let mut held = false;
     let mut vol_edge = false;
     let mut last_led: Option<LedMode> = None;
+    let mut last_state: Option<DialogState> = None;
+    let mut state_since_ms = now0();
     let mut last_state: Option<DialogState> = None;
     // 状态机输出的待发网络动作 (listen/abort; Connect/提示音在注入点就地处理)
     let mut pending: heapless::Vec<Action, 8> = heapless::Vec::new();
@@ -120,6 +130,7 @@ pub async fn run(
         let now_ms = esp_hal::time::Instant::now()
             .duration_since_epoch()
             .as_millis();
+        let mut played = false;
 
         // ---- 1. 服务器消息 → 状态机事件 / 音频播放 ----
         if let Some(sess) = session.as_mut() {
@@ -157,6 +168,7 @@ pub async fn run(
                                     o += 4;
                                 }
                                 audio.play_block(&sess.stereo_out[..n * 4]);
+                                played = true;
                             },
                             Ok(_) => {},
                             Err(e) => warn!("opus 解码失败: {}", e),
@@ -176,6 +188,16 @@ pub async fn run(
                     },
                 }
             }
+        }
+
+        // ---- 1.5 等回复超时: 服务器无响应 (空音频/链路问题) 时恢复待机 ----
+        if last_state != Some(sm.state()) {
+            last_state = Some(sm.state());
+            state_since_ms = now_ms;
+        }
+        if sm.state() == DialogState::WaitingReply && now_ms - state_since_ms > 10_000 {
+            warn!("等回复超时 (10s 无服务器消息), 结束会话");
+            dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
         }
 
         // ---- 2. 会话关闭善后 ----
@@ -244,6 +266,14 @@ pub async fn run(
                             });
                             acc_len = 0;
                             dispatch(&mut sm, &mut pending, DialogEvent::SessionReady);
+                            if sm.mode() == ListenMode::Manual && !held {
+                                // 建连期间用户已松开 BOOT: 本次对讲作废
+                                // (否则只会发出 listen start + 静音帧 + listen stop,
+                                //  服务器 ASR 无内容不回复, 设备滞留等回复态)
+                                info!("BOOT 已松开 (建连期间), 本次会话作废");
+                                pending.clear();
+                                dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
+                            }
                         },
                         _ => {
                             error!("opus 编解码器创建失败");
@@ -288,61 +318,71 @@ pub async fn run(
                 error!("采集积压 {}B 超限, 重建采集", avail);
                 return RunOutcome::CaptureFault;
             },
-            Ok(avail) if avail >= BLOCK_BYTES => match cap.pop(&mut pop_buf[..avail]) {
-                Ok(n) => {
-                    let ns = extract_slot(&pop_buf[..(n / 4) * 4], 2, 0, mono_buf);
-                    apply_gain_percent(&mut mono_buf[..ns], GAIN_PERCENT);
-                    match sm.state() {
-                        DialogState::Idle => {
-                            // 唤醒监听 (真实毫秒时钟注入策略层)
-                            if wake.feed(&mono_buf[..ns], now_ms) == WakeEvent::Triggered {
-                                triggered = true;
-                            }
-                        },
-                        DialogState::Listening => {
-                            if let Some(sess) = session.as_mut() {
-                                // 累积 960 样本 → 编码 → 裸 opus 二进制帧
-                                let mut src = &mono_buf[..ns];
-                                while !src.is_empty() {
-                                    let take = usize::min(acc_buf.len() - acc_len, src.len());
-                                    acc_buf[acc_len..acc_len + take].copy_from_slice(&src[..take]);
-                                    acc_len += take;
-                                    src = &src[take..];
-                                    while acc_len >= FRAME_SAMPLES {
-                                        let mut pkt = [0u8; MAX_PACKET_BYTES];
-                                        match sess
-                                            .encoder
-                                            .encode(&acc_buf[..FRAME_SAMPLES], &mut pkt)
-                                        {
-                                            Ok(len) => {
-                                                if sess.ws.send_frame(2, &pkt[..len]).await.is_err()
-                                                {
-                                                    dispatch(
-                                                        &mut sm,
-                                                        &mut pending,
-                                                        DialogEvent::SessionClosed,
-                                                    );
-                                                    break;
-                                                }
-                                            },
-                                            Err(e) => warn!("opus 编码失败: {}", e),
+            Ok(avail) if avail >= BLOCK_BYTES => {
+                // 建连等阻塞期时钟照跑, RX 可能绕回填满: 只取最新 pop_buf 容量,
+                // 其余为被覆盖前的旧数据, 下一轮继续排空 (不可触发重建)
+                let take = usize::min(avail, pop_buf.len());
+                match cap.pop(&mut pop_buf[..take]) {
+                    Ok(n) => {
+                        let ns = extract_slot(&pop_buf[..(n / 4) * 4], 2, 0, mono_buf);
+                        apply_gain_percent(&mut mono_buf[..ns], GAIN_PERCENT);
+                        match sm.state() {
+                            DialogState::Idle => {
+                                // 唤醒监听 (真实毫秒时钟注入策略层)
+                                if wake.feed(&mono_buf[..ns], now_ms) == WakeEvent::Triggered {
+                                    triggered = true;
+                                }
+                            },
+                            DialogState::Listening => {
+                                if let Some(sess) = session.as_mut() {
+                                    // 累积 960 样本 → 编码 → 裸 opus 二进制帧
+                                    let mut src = &mono_buf[..ns];
+                                    while !src.is_empty() {
+                                        let take = usize::min(acc_buf.len() - acc_len, src.len());
+                                        acc_buf[acc_len..acc_len + take]
+                                            .copy_from_slice(&src[..take]);
+                                        acc_len += take;
+                                        src = &src[take..];
+                                        while acc_len >= FRAME_SAMPLES {
+                                            let mut pkt = [0u8; MAX_PACKET_BYTES];
+                                            match sess
+                                                .encoder
+                                                .encode(&acc_buf[..FRAME_SAMPLES], &mut pkt)
+                                            {
+                                                Ok(len) => {
+                                                    if sess
+                                                        .ws
+                                                        .send_frame(2, &pkt[..len])
+                                                        .await
+                                                        .is_err()
+                                                    {
+                                                        dispatch(
+                                                            &mut sm,
+                                                            &mut pending,
+                                                            DialogEvent::SessionClosed,
+                                                        );
+                                                        break;
+                                                    }
+                                                },
+                                                Err(e) => warn!("opus 编码失败: {}", e),
+                                            }
+                                            acc_buf.copy_within(FRAME_SAMPLES..acc_len, 0);
+                                            acc_len -= FRAME_SAMPLES;
                                         }
-                                        acc_buf.copy_within(FRAME_SAMPLES..acc_len, 0);
-                                        acc_len -= FRAME_SAMPLES;
-                                    }
-                                    if sm.state() == DialogState::Idle {
-                                        break; // 会话在发送中被关闭
+                                        if sm.state() == DialogState::Idle {
+                                            break; // 会话在发送中被关闭
+                                        }
                                     }
                                 }
-                            }
-                        },
-                        _ => {}, // Speaking/Connecting/WaitingReply: 排空即弃 (回声/残留)
-                    }
-                },
-                Err(e) => {
-                    warn!("RX pop 失败: {:?} — 重建采集", e);
-                    return RunOutcome::CaptureFault;
-                },
+                            },
+                            _ => {}, // Speaking/Connecting/WaitingReply: 排空即弃 (回声/残留)
+                        }
+                    },
+                    Err(e) => {
+                        warn!("RX pop 失败: {:?} — 重建采集", e);
+                        return RunOutcome::CaptureFault;
+                    },
+                }
             },
             Ok(_) => {},
             Err(e) => {
@@ -356,8 +396,9 @@ pub async fn run(
             dispatch(&mut sm, &mut pending, DialogEvent::WakeTriggered);
         }
 
-        // ---- 7. 时钟维持 (Listening 无下行时补静音窗) ----
-        if sm.state() == DialogState::Listening {
+        // ---- 7. 时钟维持 (全程常开: RX 从机依赖 TX 时钟, 待机唤醒监听
+        // 同样需要采集; TTS 播放的轮次不补, 由下行音频维持) ----
+        if !played {
             audio.play_block(silence_buf);
         }
 
