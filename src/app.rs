@@ -374,6 +374,7 @@ pub async fn run(
         // ---- 4. 状态机动作 → 会话命令 (非阻塞) ----
         for (action, mode) in &pending {
             let cmd = match action {
+                Action::ConnectSession => SessionCommand::Connect,
                 Action::SendListenStart => SessionCommand::SendListenStart(*mode),
                 Action::SendListenStop => SessionCommand::SendListenStop,
                 Action::SendTtsAbort => SessionCommand::SendTtsAbort,
@@ -552,7 +553,7 @@ fn dispatch(
         actions.iter().map(|a| (*a, mode)).collect();
     for (action, mode) in &actions {
         match action {
-            Action::ConnectSession | Action::PlayWakeChime => {},
+            Action::PlayWakeChime => {}, // 提示音在唤醒注入点同步执行
             other => {
                 let _ = pending.push((*other, *mode));
             },
