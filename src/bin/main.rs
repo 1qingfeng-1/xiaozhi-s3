@@ -5,6 +5,11 @@
 //!
 //! 采集常驻运行; RX 饱和故障时在直线路径重建句柄后重进主循环
 //! (async 生成器里条件路径的 drop→重启借用检查过不去, 见 AGENTS.md)。
+//!
+//! panic 时打印回溯栈 (bt: 0x...) 后软复位; 符号化:
+//! ```bash
+//! xtensa-esp32s3-elf-addr2line -pfiaC -e target/xtensa-esp32s3-none-elf/release/xiaozhi-s3 <地址...>
+//! ```
 
 #![no_std]
 #![no_main]
@@ -33,6 +38,12 @@ use xiaozhi_s3::wifi::{self, Mode, store};
 #[panic_handler]
 fn panic(panic_info: &core::panic::PanicInfo) -> ! {
     error!("{}", panic_info);
+    // 回溯栈: 异常/panic 时的调用链 PC (用 addr2line 映射到源码位置,
+    // 命令见 main 文档注释)
+    let bt = esp_backtrace::Backtrace::capture();
+    for frame in bt.frames() {
+        error!("bt: 0x{:x}", frame.program_counter());
+    }
     esp_hal::system::software_reset()
 }
 
