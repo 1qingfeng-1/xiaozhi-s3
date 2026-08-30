@@ -115,8 +115,8 @@ impl WakeWordSource for WakeNetSource {
             let frame: alloc::vec::Vec<i16> = self.buf.drain(..chunk).collect();
             unsafe {
                 let r = ((*self.ctx.iface).detect)(self.ctx.model, frame.as_ptr() as *mut i16);
-                if r == WN_DETECTED || r == WN_NO_DETECT && false {
-                    hit = hit || r == WN_DETECTED;
+                if r == WN_DETECTED {
+                    hit = true;
                 }
             }
         }
