@@ -398,8 +398,14 @@ pub async fn run(
         let mut triggered = false;
         match cap.available() {
             Ok(avail) if avail >= BLOCK_BYTES => {
-                // 长阻塞期 RX 可能绕回填满: 按容量截断, 最旧数据自然流失
-                let take = usize::min(avail, pop_buf.len());
+                // 排空必须按整描述符对齐 (avail 恒为 4092 的倍数): 非对齐的
+                // 部分消费会让 esp-hal 软件计数与 DMA 状态复利式失步, 此后
+                // available() 永远 Late。长阻塞期绕回填满时, 超出容量的最旧
+                // 数据自然流失。
+                let take = usize::min(
+                    avail / BLOCK_BYTES * BLOCK_BYTES,
+                    pop_buf.len() / BLOCK_BYTES * BLOCK_BYTES,
+                );
                 match cap.pop(&mut pop_buf[..take]) {
                     Ok(n) => {
                         let ns = extract_slot(&pop_buf[..(n / 4) * 4], 2, 0, mono_buf);
