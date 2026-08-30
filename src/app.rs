@@ -166,6 +166,7 @@ pub async fn session_task(args: SessionArgs) {
         if want_connect {
             want_connect = false;
             if let Conn::None = conn {
+                info!("会话任务: 开始连接...");
                 match session::connect(stack, server, &mac).await {
                     Ok((ws, _rate, _frame_ms)) => {
                         conn = Conn::Up(ws);
@@ -496,6 +497,8 @@ pub async fn run(
         if !played {
             audio.play_block(silence_buf);
         }
+        // 让出 CPU: 会话任务/网络任务需要被轮询才能推进连接与收发
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(1)).await;
 
         // ---- 9. 灯语 + 显示状态 ----
         let led = match sm.state() {
