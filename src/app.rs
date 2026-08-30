@@ -107,7 +107,7 @@ pub enum SessionEvent {
 /// 任务间通道 (main 装配一次, 静态常驻)
 pub struct Channels {
     /// 音频 → 会话: 编码后的 opus 帧
-    pub uplink: Channel<RawMutex, OpusPacket, 6>,
+    pub uplink: Channel<RawMutex, OpusPacket, 12>,
     /// 会话 → 音频: 下行 opus 帧 (TTS)
     pub downlink: Channel<RawMutex, OpusPacket, 6>,
     /// 音频 → 会话: 命令
