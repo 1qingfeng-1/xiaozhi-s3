@@ -2245,6 +2245,7 @@ dependencies = [
  "defmt 1.1.1",
  "embassy-executor",
  "embassy-net",
+ "embassy-sync 0.6.2",
  "embassy-time",
  "embedded-storage",
  "esp-alloc",

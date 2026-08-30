@@ -1,17 +1,14 @@
-//! 智能音箱主应用 — 对话状态机驱动的编排层
+//! 智能音箱主应用 — 对话状态机驱动的编排层 (双任务架构)
 //!
-//! 单任务事件循环 (对齐 audio-loopback 的时序模型):
-//! 1. 轮询服务器消息 (文本 → 状态机事件; 二进制 → opus 解码播放)
-//! 2. 轮询按键 (BOOT manual 对讲 / VOL± 音量)
-//! 3. 排空采集: Idle 时喂唤醒引擎, Listening 时 opus 上行, 其余丢弃
-//! 4. I2S 时钟维持 (静音窗; RX 从机依赖 TX 时钟)
-//! 5. LED 灯语映射 (待机慢呼吸 / 建连快呼吸 / 聆听中呼吸 / 播报常亮)
+//! - 音频主循环 ([`run`]): 采集排空/唤醒 VAD/编码/解码/播放/灯效/显示,
+//!   每轮 ≤64ms; 所有网络交互经 embassy-sync 通道非阻塞交换
+//!   (单循环长阻塞 await 会让 I2S RX 饱和触发 Late, 见真机回归记录)
+//! - 会话任务 ([`session_task`]): WS 连接/握手/收发, 长阻塞 await 集中于此
 //!
-//! 状态转移全部委托 [`xiaozhi_core::dialog::DialogSm`] (host 单测覆盖)。
-//! 建连时机 = 状态为 Connecting 且尚无会话 (状态即触发器, 不需要额外标记);
-//! listen/abort 类动作由状态机输出后经待发队列发送。
+//! 状态转移委托 [`xiaozhi_core::dialog::DialogSm`] (host 单测覆盖)。
 
 use embassy_net::{Ipv4Address, Stack};
+use embassy_sync::channel::Channel;
 
 use esp_hal::{Blocking, dma::DmaTransferRxCircular, i2s::master::I2sRx};
 
@@ -22,9 +19,19 @@ use xiaozhi_core::audio::wake::{
     VadWakeDetector, WakeEngine, WakeEvent, WakePolicy, WakePolicyConfig,
 };
 use xiaozhi_core::dialog::{Action, DialogEvent, DialogSm, DialogState, ListenMode};
-use xiaozhi_core::mcp;
 
 use crate::audio::opus::{MAX_PACKET_BYTES, OpusDecoder, OpusEncoder};
+
+impl defmt::Format for SessionCommand {
+    fn format(&self, f: defmt::Formatter) {
+        match self {
+            SessionCommand::Connect => defmt::write!(f, "Connect"),
+            SessionCommand::SendListenStart(_) => defmt::write!(f, "ListenStart"),
+            SessionCommand::SendListenStop => defmt::write!(f, "ListenStop"),
+            SessionCommand::SendTtsAbort => defmt::write!(f, "TtsAbort"),
+        }
+    }
+}
 use crate::bsp::components::{
     Audio, Battery, BreathSpeed, Buttons, Display, LedMode, Leds, Power, Rgb565,
 };
@@ -41,34 +48,202 @@ pub const VAD_THRESHOLD: i16 = 800;
 
 /// 乒乓窗口 = 单个 DMA 描述符 (4092B ≈ 64ms): available() 按完整描述符计数
 const BLOCK_BYTES: usize = 4092;
-/// 当前系统毫秒 (主循环用)
-fn now0() -> u64 {
-    esp_hal::time::Instant::now()
-        .duration_since_epoch()
-        .as_millis()
-}
+/// 采集排空缓冲 16KB (4 描述符); 超出部分按容量截断丢弃
+const POP_BUF_SIZE: usize = 16 * 1024;
+/// 帧累积缓冲: 2 帧余量
+const ACC_SAMPLES: usize = FRAME_SAMPLES * 2;
 
-/// 主循环返回原因
+/// opus 包通道项 (单包上限 1276B)
+pub type OpusPacket = heapless::Vec<u8, MAX_PACKET_BYTES>;
+type RawMutex = embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+
+/// 音频主循环返回原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
     /// RX 饱和/故障: esp-hal 的 available 计数已损坏, 需重建采集句柄
     CaptureFault,
 }
 
-/// 会话运行时资源 (WS 传输 + 编解码器 + 解码缓冲)
-struct SessionState {
-    ws: session::WsClient<'static>,
-    encoder: OpusEncoder,
-    decoder: OpusDecoder,
-    /// 解码输出 (frame_ms @ 16kHz) 与立体声交织缓冲
-    pcm_dec: alloc::boxed::Box<[i16]>,
-    stereo_out: alloc::boxed::Box<[u8]>,
+/// 音频主循环 → 会话任务 命令
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCommand {
+    /// 建立会话 (连接 + hello)
+    Connect,
+    /// 发送 listen start
+    SendListenStart(ListenMode),
+    /// 发送 listen stop
+    SendListenStop,
+    /// 打断 TTS
+    SendTtsAbort,
+}
+
+/// 会话任务 → 音频主循环 事件
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEvent {
+    /// 会话就绪 (hello 完成)
+    Ready,
+    /// 服务器开始播报
+    TtsStart,
+    /// 服务器播报结束
+    TtsStop,
+    /// 会话关闭
+    Closed,
+}
+
+/// 任务间通道 (main 装配一次, 静态常驻)
+pub struct Channels {
+    /// 音频 → 会话: 编码后的 opus 帧
+    pub uplink: Channel<RawMutex, OpusPacket, 6>,
+    /// 会话 → 音频: 下行 opus 帧 (TTS)
+    pub downlink: Channel<RawMutex, OpusPacket, 6>,
+    /// 音频 → 会话: 命令
+    pub command: Channel<RawMutex, SessionCommand, 4>,
+    /// 会话 → 音频: 事件
+    pub event: Channel<RawMutex, SessionEvent, 4>,
+}
+
+/// 会话任务依赖 ('static: embassy 任务要求参数永久存活)
+pub struct SessionArgs {
+    pub stack: Stack<'static>,
+    pub server: Ipv4Address,
+    pub mac: heapless::String<32>,
+    pub channels: &'static Channels,
+}
+
+/// 会话任务: 连接/握手/收发 (所有长阻塞 await 集中在此, 不影响音频主循环)
+#[embassy_executor::task]
+pub async fn session_task(args: SessionArgs) {
+    let SessionArgs {
+        stack,
+        server,
+        mac,
+        channels,
+    } = args;
+
+    enum Conn {
+        None,
+        Up(session::WsClient<'static>),
+    }
+    let mut conn = Conn::None;
+    let mut want_connect = false;
+
+    loop {
+        // ---- 命令 ----
+        loop {
+            match channels.command.try_receive() {
+                Ok(SessionCommand::Connect) => want_connect = true,
+                Ok(SessionCommand::SendListenStart(mode)) => {
+                    if let Conn::Up(ws) = &mut conn {
+                        let msg = if mode == ListenMode::Auto {
+                            session::LISTEN_START_AUTO
+                        } else {
+                            session::LISTEN_START_MANUAL
+                        };
+                        if ws.send_text(msg.as_bytes()).await.is_err() {
+                            channels.event.try_send(SessionEvent::Closed).ok();
+                        }
+                    }
+                },
+                Ok(SessionCommand::SendListenStop) => {
+                    if let Conn::Up(ws) = &mut conn {
+                        if ws.send_text(session::LISTEN_STOP.as_bytes()).await.is_err() {
+                            channels.event.try_send(SessionEvent::Closed).ok();
+                        }
+                    }
+                },
+                Ok(SessionCommand::SendTtsAbort) => {
+                    if let Conn::Up(ws) = &mut conn {
+                        if ws.send_text(session::TTS_ABORT.as_bytes()).await.is_err() {
+                            channels.event.try_send(SessionEvent::Closed).ok();
+                        }
+                    }
+                },
+                Err(_) => break,
+            }
+        }
+
+        // ---- 建连 (阻塞仅影响本任务; 音频主循环照常排空采集) ----
+        if want_connect {
+            want_connect = false;
+            if let Conn::None = conn {
+                match session::connect(stack, server, &mac).await {
+                    Ok((ws, _rate, _frame_ms)) => {
+                        conn = Conn::Up(ws);
+                        channels.event.try_send(SessionEvent::Ready).ok();
+                    },
+                    Err(e) => {
+                        warn!("会话连接失败: {}", e);
+                        channels.event.try_send(SessionEvent::Closed).ok();
+                    },
+                }
+            }
+        }
+
+        // ---- 上行: 编码帧 → WS ----
+        while let Ok(pkt) = channels.uplink.try_receive() {
+            if let Conn::Up(ws) = &mut conn {
+                if ws.send_frame(2, &pkt).await.is_err() {
+                    channels.event.try_send(SessionEvent::Closed).ok();
+                }
+            }
+        }
+
+        // ---- 服务器帧: 文本 → 事件; 二进制 → 下行通道 ----
+        if let Conn::Up(ws) = &mut conn {
+            if ws.socket.can_recv() {
+                match ws.recv_frame().await {
+                    Ok((opcode, payload)) => match opcode {
+                        1 => {
+                            let text = core::str::from_utf8(&payload).unwrap_or("");
+                            match (
+                                session::json_str_field(text, "type"),
+                                session::json_str_field(text, "state"),
+                            ) {
+                                (Some("tts"), Some("start")) => {
+                                    info!("服务器: tts start");
+                                    channels.event.try_send(SessionEvent::TtsStart).ok();
+                                },
+                                (Some("tts"), Some("stop")) => {
+                                    info!("服务器: tts stop");
+                                    channels.event.try_send(SessionEvent::TtsStop).ok();
+                                },
+                                _ => info!("服务器: {}", text),
+                            }
+                        },
+                        2 => {
+                            let mut pkt: OpusPacket = heapless::Vec::new();
+                            if pkt.extend_from_slice(&payload).is_ok() {
+                                if channels.downlink.try_send(pkt).is_err() {
+                                    warn!("下行通道满, 丢弃一帧");
+                                }
+                            }
+                        },
+                        8 => {
+                            info!("服务器关闭连接");
+                            conn = Conn::None;
+                            channels.event.try_send(SessionEvent::Closed).ok();
+                        },
+                        9 => {
+                            let _ = ws.send_pong(&payload).await;
+                        },
+                        _ => {},
+                    },
+                    Err(e) => {
+                        warn!("WS 接收错误: {} — 会话关闭", e);
+                        conn = Conn::None;
+                        channels.event.try_send(SessionEvent::Closed).ok();
+                    },
+                }
+            }
+        }
+
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(5)).await;
+    }
 }
 
 /// 应用运行依赖 (借用于 main 的常驻资源)
 ///
 /// `'a`: 各组件的重借用; `'b`: 采集句柄持有的 board.capture 借用
-/// (两个生命周期分离, 否则 cap 无法在主循环直线路径上被 drop 重建)
 pub struct AppArgs<'a, 'b> {
     pub audio: &'a mut Audio,
     pub buttons: &'a mut Buttons,
@@ -77,12 +252,10 @@ pub struct AppArgs<'a, 'b> {
     pub battery: &'a mut Battery,
     pub power: &'a mut Power,
     pub cap: &'a mut DmaTransferRxCircular<'b, I2sRx<'static, Blocking>>,
-    pub stack: Stack<'static>,
-    pub server: Ipv4Address,
-    pub mac: heapless::String<32>,
+    pub channels: &'a Channels,
 }
 
-/// 主事件循环
+/// 主事件循环 (音频侧)
 ///
 /// 返回 [`RunOutcome::CaptureFault`] 时调用方需重建采集句柄后重新进入
 /// (esp-hal RX 饱和后只能整体重建, 且重建必须在直线路径上做, 见 AGENTS.md)。
@@ -99,12 +272,10 @@ pub async fn run(
         buttons,
         leds,
         display,
-        battery,
-        power,
+        battery: _,
+        power: _,
         cap,
-        stack,
-        server,
-        mac,
+        channels,
     } = args;
 
     let mut sm = DialogSm::new();
@@ -112,17 +283,19 @@ pub async fn run(
         VadWakeDetector::new(VAD_THRESHOLD),
         WakePolicy::new(WakePolicyConfig::default()),
     );
-    let mut session: Option<SessionState> = None;
+    let mut encoder: Option<OpusEncoder> = None;
+    let mut decoder: Option<OpusDecoder> = None;
+    let mut pcm_dec: alloc::boxed::Box<[i16]> = alloc::vec![0i16; FRAME_SAMPLES].into_boxed_slice();
+    let mut stereo_out: alloc::boxed::Box<[u8]> =
+        alloc::vec![0u8; FRAME_SAMPLES * 4].into_boxed_slice();
     let mut acc_len = 0usize;
-    let mut uplink_frames: u64 = 0;
     let mut held = false;
     let mut vol_edge = false;
     let mut last_led: Option<LedMode> = None;
     let mut last_state: Option<DialogState> = None;
-    let mut state_since_ms = now0();
-    let mut last_state: Option<DialogState> = None;
-    // 状态机输出的待发网络动作 (listen/abort; Connect/提示音在注入点就地处理)
-    let mut pending: heapless::Vec<Action, 8> = heapless::Vec::new();
+    let mut state_since_ms = 0u64;
+    let mut uplink_frames: u64 = 0;
+    let mut pending: heapless::Vec<(Action, ListenMode), 8> = heapless::Vec::new();
 
     info!("=== 主循环启动: 待机监听 (说话唤醒 / 按住 BOOT 对讲) ===");
 
@@ -132,79 +305,45 @@ pub async fn run(
             .as_millis();
         let mut played = false;
 
-        // ---- 1. 服务器消息 → 状态机事件 / 音频播放 ----
-        if let Some(sess) = session.as_mut() {
-            if sess.ws.socket.can_recv() {
-                match sess.ws.recv_frame().await {
-                    Ok((opcode, payload)) => match opcode {
-                        1 => {
-                            let text = core::str::from_utf8(&payload).unwrap_or("");
-                            match (
-                                session::json_str_field(text, "type"),
-                                session::json_str_field(text, "state"),
-                            ) {
-                                (Some("tts"), Some("start")) => {
-                                    info!("服务器: tts start");
-                                    dispatch(&mut sm, &mut pending, DialogEvent::TtsStart);
-                                },
-                                (Some("tts"), Some("stop")) => {
-                                    info!("服务器: tts stop");
-                                    wake.policy_mut().note_playback_end(now_ms);
-                                    dispatch(&mut sm, &mut pending, DialogEvent::TtsStop);
-                                },
-                                (Some("mcp"), _) => {
-                                    handle_mcp(text, audio, battery, power, &mut sess.ws).await;
-                                },
-                                _ => info!("服务器: {}", text),
-                            }
-                        },
-                        2 => match sess.decoder.decode(&payload, &mut sess.pcm_dec) {
-                            Ok(n) if n > 0 => {
-                                let mut o = 0;
-                                for &s in &sess.pcm_dec[..n] {
-                                    let le = s.to_le_bytes();
-                                    sess.stereo_out[o..o + 2].copy_from_slice(&le);
-                                    sess.stereo_out[o + 2..o + 4].copy_from_slice(&le);
-                                    o += 4;
-                                }
-                                audio.play_block(&sess.stereo_out[..n * 4]);
-                                played = true;
-                            },
-                            Ok(_) => {},
-                            Err(e) => warn!("opus 解码失败: {}", e),
-                        },
-                        8 => {
-                            info!("服务器关闭连接");
-                            dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
-                        },
-                        9 => {
-                            let _ = sess.ws.send_pong(&payload).await;
-                        },
-                        _ => {},
-                    },
-                    Err(e) => {
-                        warn!("WS 接收错误: {} — 会话关闭", e);
-                        dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
-                    },
-                }
+        // ---- 1. 会话事件 ----
+        loop {
+            match channels.event.try_receive() {
+                Ok(SessionEvent::Ready) => {
+                    dispatch(&mut sm, &mut pending, DialogEvent::SessionReady)
+                },
+                Ok(SessionEvent::TtsStart) => {
+                    dispatch(&mut sm, &mut pending, DialogEvent::TtsStart)
+                },
+                Ok(SessionEvent::TtsStop) => {
+                    wake.policy_mut().note_playback_end(now_ms);
+                    dispatch(&mut sm, &mut pending, DialogEvent::TtsStop);
+                },
+                Ok(SessionEvent::Closed) => {
+                    dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed)
+                },
+                Err(_) => break,
             }
         }
 
-        // ---- 1.5 等回复超时: 服务器无响应 (空音频/链路问题) 时恢复待机 ----
-        if last_state != Some(sm.state()) {
-            last_state = Some(sm.state());
-            state_since_ms = now_ms;
-        }
-        if sm.state() == DialogState::WaitingReply && now_ms - state_since_ms > 10_000 {
-            warn!("等回复超时 (10s 无服务器消息), 结束会话");
-            dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
-        }
-
-        // ---- 2. 会话关闭善后 ----
-        if session.is_some() && sm.state() == DialogState::Idle {
-            wake.policy_mut().note_session_end(now_ms);
-            session = None; // 丢弃 → TcpSocket 关闭, 编解码器销毁
-            info!("会话已结束, 回到待机监听");
+        // ---- 2. 会话拆除 / 编解码器生命周期 ----
+        if sm.state() == DialogState::Idle {
+            if encoder.is_some() {
+                wake.policy_mut().note_playback_end(now_ms);
+                encoder = None;
+                decoder = None;
+                info!("会话已结束, 回到待机监听");
+            }
+        } else if encoder.is_none() && sm.state() == DialogState::Listening {
+            match (
+                OpusEncoder::new_voip_mono(SAMPLE_RATE, FRAME_MS),
+                OpusDecoder::new_mono(SAMPLE_RATE),
+            ) {
+                (Ok(enc), Ok(dec)) => {
+                    encoder = Some(enc);
+                    decoder = Some(dec);
+                },
+                _ => error!("opus 编解码器创建失败"),
+            }
         }
 
         // ---- 3. 按键: BOOT 对讲 + 音量 ----
@@ -231,96 +370,35 @@ pub async fn run(
         }
         vol_edge = vol_up || vol_down;
 
-        // ---- 4. 建连 (状态即触发器: Connecting 且尚无会话) ----
-        if sm.state() == DialogState::Connecting && session.is_none() {
-            let mut ok = None;
-            let mut last_err = "";
-            for attempt in 1..=3u8 {
-                match session::connect(stack, server, &mac).await {
-                    Ok(r) => {
-                        ok = Some(r);
-                        break;
-                    },
-                    Err(e) => {
-                        warn!("会话连接 (第 {} 次): {}", attempt, e);
-                        last_err = e;
-                        embassy_time::Timer::after(embassy_time::Duration::from_secs(1)).await;
-                    },
-                }
-            }
-            match ok {
-                Some((ws, rate, frame_ms)) => {
-                    info!("服务器 hello: {}Hz / {}ms", rate, frame_ms);
-                    let dec_samples = frame_ms as usize * SAMPLE_RATE as usize / 1000;
-                    match (
-                        OpusEncoder::new_voip_mono(SAMPLE_RATE, FRAME_MS),
-                        OpusDecoder::new_mono(SAMPLE_RATE),
-                    ) {
-                        (Ok(encoder), Ok(decoder)) => {
-                            session = Some(SessionState {
-                                ws,
-                                encoder,
-                                decoder,
-                                pcm_dec: alloc::vec![0i16; dec_samples].into_boxed_slice(),
-                                stereo_out: alloc::vec![0u8; dec_samples * 4].into_boxed_slice(),
-                            });
-                            acc_len = 0;
-                            dispatch(&mut sm, &mut pending, DialogEvent::SessionReady);
-                            if sm.mode() == ListenMode::Manual && !held {
-                                // 建连期间用户已松开 BOOT: 本次对讲作废
-                                // (否则只会发出 listen start + 静音帧 + listen stop,
-                                //  服务器 ASR 无内容不回复, 设备滞留等回复态)
-                                info!("BOOT 已松开 (建连期间), 本次会话作废");
-                                pending.clear();
-                                dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
-                            }
-                        },
-                        _ => {
-                            error!("opus 编解码器创建失败");
-                            dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
-                        },
-                    }
-                },
-                None => {
-                    error!("会话建立失败: {} — 回到待机", last_err);
-                    dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
-                },
-            }
-        }
-
-        // ---- 5. 执行待发的网络动作 ----
-        for i in 0..pending.len() {
-            let action = pending[i];
-            let Some(sess) = session.as_mut() else {
-                continue;
-            };
-            let msg: &str = match action {
-                Action::SendListenStart => match sm.mode() {
-                    ListenMode::Auto => session::LISTEN_START_AUTO,
-                    ListenMode::Manual => session::LISTEN_START_MANUAL,
-                },
-                Action::SendListenStop => session::LISTEN_STOP,
-                Action::SendTtsAbort => session::TTS_ABORT,
+        // ---- 4. 状态机动作 → 会话命令 (非阻塞) ----
+        for (action, mode) in &pending {
+            let cmd = match action {
+                Action::SendListenStart => SessionCommand::SendListenStart(*mode),
+                Action::SendListenStop => SessionCommand::SendListenStop,
+                Action::SendTtsAbort => SessionCommand::SendTtsAbort,
                 _ => continue,
             };
-            if let Err(e) = sess.ws.send_text(msg.as_bytes()).await {
-                warn!("发送 {} 失败: {}", msg, e);
-                dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
-                break;
+            if channels.command.try_send(cmd).is_err() {
+                warn!("命令通道满, 丢弃 {:?} (罕见)", cmd);
             }
         }
         pending.clear();
 
-        // ---- 6. 采集排空 (每轮必做, 时钟运行期间防饱和) ----
+        // ---- 5. 等回复超时: 10s 无服务器消息恢复待机 ----
+        if last_state != Some(sm.state()) {
+            last_state = Some(sm.state());
+            state_since_ms = now_ms;
+        }
+        if sm.state() == DialogState::WaitingReply && now_ms - state_since_ms > 10_000 {
+            warn!("等回复超时 (10s), 结束会话");
+            dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
+        }
+
+        // ---- 6. 采集排空 (每轮必做, 时钟常开期间防饱和) ----
         let mut triggered = false;
         match cap.available() {
-            Ok(avail) if avail > pop_buf.len() => {
-                error!("采集积压 {}B 超限, 重建采集", avail);
-                return RunOutcome::CaptureFault;
-            },
             Ok(avail) if avail >= BLOCK_BYTES => {
-                // 建连等阻塞期时钟照跑, RX 可能绕回填满: 只取最新 pop_buf 容量,
-                // 其余为被覆盖前的旧数据, 下一轮继续排空 (不可触发重建)
+                // 长阻塞期 RX 可能绕回填满: 按容量截断, 最旧数据自然流失
                 let take = usize::min(avail, pop_buf.len());
                 match cap.pop(&mut pop_buf[..take]) {
                     Ok(n) => {
@@ -328,14 +406,12 @@ pub async fn run(
                         apply_gain_percent(&mut mono_buf[..ns], GAIN_PERCENT);
                         match sm.state() {
                             DialogState::Idle => {
-                                // 唤醒监听 (真实毫秒时钟注入策略层)
                                 if wake.feed(&mono_buf[..ns], now_ms) == WakeEvent::Triggered {
                                     triggered = true;
                                 }
                             },
                             DialogState::Listening => {
-                                if let Some(sess) = session.as_mut() {
-                                    // 累积 960 样本 → 编码 → 裸 opus 二进制帧
+                                if let Some(encoder) = encoder.as_mut() {
                                     let mut src = &mono_buf[..ns];
                                     while !src.is_empty() {
                                         let take = usize::min(acc_buf.len() - acc_len, src.len());
@@ -344,24 +420,20 @@ pub async fn run(
                                         acc_len += take;
                                         src = &src[take..];
                                         while acc_len >= FRAME_SAMPLES {
-                                            let mut pkt = [0u8; MAX_PACKET_BYTES];
-                                            match sess
-                                                .encoder
-                                                .encode(&acc_buf[..FRAME_SAMPLES], &mut pkt)
+                                            let mut raw = [0u8; MAX_PACKET_BYTES];
+                                            match encoder
+                                                .encode(&acc_buf[..FRAME_SAMPLES], &mut raw)
                                             {
                                                 Ok(len) => {
-                                                    if sess
-                                                        .ws
-                                                        .send_frame(2, &pkt[..len])
-                                                        .await
-                                                        .is_err()
+                                                    uplink_frames += 1;
+                                                    if uplink_frames % 100 == 0 {
+                                                        info!("上行心跳: {} 帧", uplink_frames);
+                                                    }
+                                                    let mut pkt: OpusPacket = heapless::Vec::new();
+                                                    if pkt.extend_from_slice(&raw[..len]).is_ok()
+                                                        && channels.uplink.try_send(pkt).is_err()
                                                     {
-                                                        dispatch(
-                                                            &mut sm,
-                                                            &mut pending,
-                                                            DialogEvent::SessionClosed,
-                                                        );
-                                                        break;
+                                                        warn!("上行通道满, 丢弃一帧");
                                                     }
                                                 },
                                                 Err(e) => warn!("opus 编码失败: {}", e),
@@ -369,13 +441,10 @@ pub async fn run(
                                             acc_buf.copy_within(FRAME_SAMPLES..acc_len, 0);
                                             acc_len -= FRAME_SAMPLES;
                                         }
-                                        if sm.state() == DialogState::Idle {
-                                            break; // 会话在发送中被关闭
-                                        }
                                     }
                                 }
                             },
-                            _ => {}, // Speaking/Connecting/WaitingReply: 排空即弃 (回声/残留)
+                            _ => {}, // Speaking/Connecting/WaitingReply: 排空即弃
                         }
                     },
                     Err(e) => {
@@ -391,18 +460,37 @@ pub async fn run(
             },
         }
         if triggered {
-            // 唤醒提示音 (阻塞 ~120ms) → 状态机进入 Connecting
             audio.beep(120);
             dispatch(&mut sm, &mut pending, DialogEvent::WakeTriggered);
         }
 
-        // ---- 7. 时钟维持 (全程常开: RX 从机依赖 TX 时钟, 待机唤醒监听
-        // 同样需要采集; TTS 播放的轮次不补, 由下行音频维持) ----
+        // ---- 7. 下行播放: opus → 解码 → 立体声 ----
+        while let Ok(pkt) = channels.downlink.try_receive() {
+            if let Some(decoder) = decoder.as_mut() {
+                match decoder.decode(&pkt, &mut pcm_dec) {
+                    Ok(n) if n > 0 => {
+                        let mut o = 0;
+                        for &s in &pcm_dec[..n] {
+                            let le = s.to_le_bytes();
+                            stereo_out[o..o + 2].copy_from_slice(&le);
+                            stereo_out[o + 2..o + 4].copy_from_slice(&le);
+                            o += 4;
+                        }
+                        audio.play_block(&stereo_out[..n * 4]);
+                        played = true;
+                    },
+                    Ok(_) => {},
+                    Err(e) => warn!("opus 解码失败: {}", e),
+                }
+            }
+        }
+
+        // ---- 8. 时钟维持 (全程常开; TTS 轮次由下行音频维持) ----
         if !played {
             audio.play_block(silence_buf);
         }
 
-        // ---- 8. 灯语映射 (状态变化时切换) + 呼吸 tick ----
+        // ---- 9. 灯语 + 显示状态 ----
         let led = match sm.state() {
             DialogState::Idle => LedMode::Breathing(BreathSpeed::Slow),
             DialogState::Connecting => LedMode::Breathing(BreathSpeed::Fast),
@@ -415,20 +503,21 @@ pub async fn run(
             last_led = Some(led);
         }
         leds.tick();
-
-        // ---- 9. 显示状态 (状态切换时刷新, 英文点阵字库) ----
         if last_state != Some(sm.state()) {
             last_state = Some(sm.state());
-            let text = state_text(sm.state());
-            let color = match sm.state() {
-                DialogState::Speaking => Rgb565::YELLOW,
-                DialogState::Listening => Rgb565::GREEN,
-                _ => Rgb565::CYAN,
-            };
-            display.draw_status(text, color);
+            display.draw_status(
+                state_text(sm.state()),
+                match sm.state() {
+                    DialogState::Speaking => Rgb565::YELLOW,
+                    DialogState::Listening => Rgb565::GREEN,
+                    _ => Rgb565::CYAN,
+                },
+            );
         }
     }
 }
+
+fn now_label() {}
 
 /// 显示面板状态文本 (3x5 点阵字库仅 ASCII)
 fn state_text(state: DialogState) -> &'static str {
@@ -441,7 +530,27 @@ fn state_text(state: DialogState) -> &'static str {
     }
 }
 
-/// 对话状态标签 (core 类型不依赖 defmt, 日志用文本映射)
+/// 事件注入: 状态转移 + 动作暂存 (Connect 类动作由状态即触发器承担)
+fn dispatch(
+    sm: &mut DialogSm,
+    pending: &mut heapless::Vec<(Action, ListenMode), 8>,
+    ev: DialogEvent,
+) {
+    let mode = sm.mode();
+    let (state, actions) = sm.transition(ev);
+    let actions: heapless::Vec<(Action, ListenMode), 8> =
+        actions.iter().map(|a| (*a, mode)).collect();
+    for (action, mode) in &actions {
+        match action {
+            Action::ConnectSession | Action::PlayWakeChime => {},
+            other => {
+                let _ = pending.push((*other, *mode));
+            },
+        }
+    }
+    info!("状态: {}", state_label(state));
+}
+
 fn state_label(state: DialogState) -> &'static str {
     match state {
         DialogState::Idle => "待机",
@@ -449,67 +558,5 @@ fn state_label(state: DialogState) -> &'static str {
         DialogState::Listening => "聆听",
         DialogState::WaitingReply => "等回复",
         DialogState::Speaking => "播报",
-    }
-}
-
-/// 事件注入: 状态转移 + 动作入队
-///
-/// `ConnectSession` 不入队 (建连由 "Connecting 且无会话" 条件驱动);
-/// `PlayWakeChime` 不入队 (唤醒注入点同步 beep)。其余 (listen/abort) 入队。
-fn dispatch(sm: &mut DialogSm, pending: &mut heapless::Vec<Action, 8>, ev: DialogEvent) {
-    let (state, actions) = sm.transition(ev);
-    for a in actions {
-        match *a {
-            Action::ConnectSession | Action::PlayWakeChime => {},
-            other => {
-                let _ = pending.push(other);
-            },
-        }
-    }
-    info!("状态: {}", state_label(state));
-}
-
-/// MCP 请求处理: 解析 JSON-RPC 并执行工具 (音量/设备状态), 回应答帧
-async fn handle_mcp(
-    text: &str,
-    audio: &mut Audio,
-    battery: &mut Battery,
-    power: &mut Power,
-    ws: &mut session::WsClient<'_>,
-) {
-    let Some(req) = mcp::parse_request(text) else {
-        return; // notifications / 无法解析: 无需回应
-    };
-    const BOARD_NAME: &str = crate::bsp::active::BOARD.name;
-    const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-    let resp: heapless::String<1024> = match req.method {
-        mcp::McpMethod::Initialize => mcp::initialize_response(req.id, BOARD_NAME, APP_VERSION),
-        mcp::McpMethod::ToolsList => mcp::tools_list_response(req.id),
-        mcp::McpMethod::ToolsCall { name, volume } => match (name, volume) {
-            ("self.get_device_status", _) => {
-                let battery_pct = battery.reported_percentage(power.status());
-                let status = mcp::status_json(
-                    audio.volume(),
-                    battery_pct,
-                    power.status() == xiaozhi_core::board::PowerStatus::Charging,
-                );
-                mcp::text_result_response(req.id, status.as_str())
-            },
-            ("self.audio_speaker.set_volume", Some(v)) => {
-                let v = v.clamp(0, 100) as u8;
-                audio.set_volume(v);
-                info!("MCP: 音量设为 {}%", v);
-                mcp::text_result_response(req.id, "true")
-            },
-            ("self.audio_speaker.set_volume", None) => {
-                mcp::error_response(req.id, "Missing argument: volume")
-            },
-            (_other, _) => mcp::error_response(req.id, "Unknown tool"),
-        },
-        mcp::McpMethod::Unknown(_) => mcp::error_response(req.id, "Method not implemented"),
-    };
-    if let Err(e) = ws.send_text(resp.as_bytes()).await {
-        warn!("MCP 响应发送失败: {}", e);
     }
 }

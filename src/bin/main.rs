@@ -20,6 +20,7 @@
 )]
 
 use embassy_executor::Spawner;
+use embassy_sync::channel::Channel;
 use esp_hal::{
     clock::CpuClock, interrupt::software::SoftwareInterruptControl, peripherals::Peripherals,
     timer::timg::TimerGroup,
@@ -29,10 +30,9 @@ use esp_storage::FlashStorage;
 use defmt::{error, info};
 use esp_println as _;
 
-use xiaozhi_s3::app::{self, AppArgs};
+use xiaozhi_s3::app::{self, AppArgs, Channels};
 use xiaozhi_s3::bsp::components::Rgb565;
 use xiaozhi_s3::bsp::create_board;
-use xiaozhi_s3::ota_check;
 use xiaozhi_s3::wifi::{self, Mode, store};
 
 #[panic_handler]
@@ -83,6 +83,17 @@ async fn main(spawner: Spawner) -> ! {
         embassy_time::Timer::after(embassy_time::Duration::from_millis(200)).await;
     }
 
+    // 任务间通道 (静态常驻)
+    let channels = xiaozhi_s3::mk_static!(
+        Channels,
+        Channels {
+            uplink: Channel::new(),
+            downlink: Channel::new(),
+            command: Channel::new(),
+            event: Channel::new(),
+        }
+    );
+
     // WiFi: 有凭据连 STA; 无凭据/连接失败 → 配网模式 (SoftAP 表单, 保存后重启)
     let (stack, server, _controller, mac) = match wifi::boot_mode(flash) {
         Mode::Station(config) => match wifi::connect_station(&spawner, &config, p.WIFI).await {
@@ -123,13 +134,14 @@ async fn main(spawner: Spawner) -> ! {
     board.display.draw_status("XIAOZHI S3", Rgb565::WHITE);
     board.audio.beep(150);
 
-    // OTA 版本检查 (仅上报, 下载烧写待分区表改造)
-    match ota_check::check(stack, server).await {
-        Some(report) if report.update_available => {
-            info!("OTA: 新版本 {} 可升级", report.latest_version.as_str());
-        },
-        _ => {},
-    }
+    // 会话任务 (WS 连接/收发; 长阻塞 await 集中于此)
+    // SpawnToken 丢弃即任务尚未轮询? esp-rtos 语义: spawn 即注册, token 仅标记
+    let _ = app::session_task(app::SessionArgs {
+        stack,
+        server,
+        mac: mac.clone(),
+        channels,
+    });
 
     // 采集常驻 + 主循环 (采集故障 → 直线路径重建 → 重进)
     let mut cap = match board.capture.start() {
@@ -149,9 +161,7 @@ async fn main(spawner: Spawner) -> ! {
                 battery: &mut board.battery,
                 power: &mut board.power,
                 cap: &mut cap,
-                stack,
-                server,
-                mac: mac.clone(),
+                channels,
             },
             &mut pop_buf[..],
             &mut mono_buf[..],
