@@ -38,9 +38,11 @@ use crate::bsp::components::{
 };
 use crate::session;
 
-/// 上行音频参数 (16kHz 单声道 60ms, 对齐 hello.audio_params)
+/// 上行音频参数 (16kHz 单声道; 帧长 20ms — SILK 编码的栈上 VLA 随帧长
+/// 线性增长, 60ms 帧需 ~87KB 任务栈必然溢出, 20ms 实测可控; 服务器按
+/// hello 宣告的 frame_duration 适配上行)
 const SAMPLE_RATE: u32 = 16_000;
-const FRAME_MS: u32 = 60;
+const FRAME_MS: u32 = 20;
 const FRAME_SAMPLES: usize = SAMPLE_RATE as usize / 1000 * FRAME_MS as usize; // 960
 /// 软件增益百分比: 麦克风数字电平 1~5% 满幅, +18dB 后 ASR 可用
 const GAIN_PERCENT: u16 = 800;
