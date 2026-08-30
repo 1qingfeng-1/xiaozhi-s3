@@ -398,14 +398,10 @@ pub async fn run(
         let mut triggered = false;
         match cap.available() {
             Ok(avail) if avail >= BLOCK_BYTES => {
-                // 排空必须按整描述符对齐 (avail 恒为 4092 的倍数): 非对齐的
-                // 部分消费会让 esp-hal 软件计数与 DMA 状态复利式失步, 此后
-                // available() 永远 Late。长阻塞期绕回填满时, 超出容量的最旧
-                // 数据自然流失。
-                let take = usize::min(
-                    avail / BLOCK_BYTES * BLOCK_BYTES,
-                    pop_buf.len() / BLOCK_BYTES * BLOCK_BYTES,
-                );
+                // pop 是全量语义: 缓冲必须 ≥ accumulated (描述符粒度是 4095
+                // 而非 4092, 不能自作对齐)。排空缓冲已扩至整条 RX 链,
+                // take = avail 恒可 pop; 长阻塞期绕回填满时最旧数据自然流失。
+                let take = usize::min(avail, pop_buf.len());
                 match cap.pop(&mut pop_buf[..take]) {
                     Ok(n) => {
                         let ns = extract_slot(&pop_buf[..(n / 4) * 4], 2, 0, mono_buf);
