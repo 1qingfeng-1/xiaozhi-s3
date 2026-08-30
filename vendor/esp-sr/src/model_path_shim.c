@@ -170,12 +170,11 @@ srmodel_list_t *srmodel_load(const void *root) {
     return esp_srmodel_init(NULL);
 }
 
-/* wn5 时代编译入模型的 getter; wn9 走 model_data RAM 指针, 不经此路径 */
+/* wn5 时代编译入模型的 getter; wn9 走 model_data RAM 指针, 不经此路径。
+ * 返回 NULL (而非全零表): 调用方若解引用全零表的函数指针会跳 0 地址 */
 model_coeff_getter_t *srmodel_get_model_coeff(char *model_name) {
     (void)model_name;
-    static model_coeff_getter_t empty_getter;
-    memset(&empty_getter, 0, sizeof(empty_getter));
-    return &empty_getter;
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */

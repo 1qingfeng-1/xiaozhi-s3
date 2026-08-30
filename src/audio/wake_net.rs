@@ -15,6 +15,8 @@
 
 #![allow(dead_code)]
 
+use defmt::info;
+
 use xiaozhi_core::audio::wake::WakeWordSource;
 
 /// 检测模式 (对齐 C++ afe_wake_word.cc: DET_MODE_3CH_95 最激进)
@@ -75,20 +77,25 @@ unsafe extern "C" {
 /// 创建唤醒词检测器 ("你好小智")
 pub fn WakeNetSource_new() -> Result<WakeNetSource, &'static str> {
     unsafe {
+        info!("wakenet: srmodel 注入...");
         shim_srmodel_init(SRMODELS_BIN.as_ptr(), SRMODELS_BIN.len());
+        info!("wakenet: 获取函数表...");
         let iface = esp_wn_handle_from_name(MODEL_NAME.as_ptr());
         if iface.is_null() {
             return Err("wakenet 句柄获取失败");
         }
+        info!("wakenet: create ({}B 内存请求)...", 0);
         let model = ((*iface).create)(MODEL_NAME.as_ptr(), DET_MODE);
         if model.is_null() {
             return Err("wakenet create 失败 (内存不足?)");
         }
         let chunk = ((*iface).get_samp_chunksize)(model) as usize;
+        let rate = ((*iface).get_samp_rate)(model) as usize;
         if chunk == 0 {
             ((*iface).destroy)(model);
             return Err("wakenet chunk size 无效");
         }
+        info!("wakenet: chunk={} rate={}", chunk, rate);
         Ok(WakeNetSource {
             ctx: Ctx {
                 iface,
@@ -96,6 +103,7 @@ pub fn WakeNetSource_new() -> Result<WakeNetSource, &'static str> {
                 chunk,
             },
             buf: alloc::vec::Vec::new(),
+            frames_fed: 0,
         })
     }
 }
@@ -104,6 +112,7 @@ pub fn WakeNetSource_new() -> Result<WakeNetSource, &'static str> {
 pub struct WakeNetSource {
     ctx: Ctx,
     buf: alloc::vec::Vec<i16>,
+    frames_fed: usize,
 }
 
 impl WakeWordSource for WakeNetSource {
@@ -113,6 +122,7 @@ impl WakeWordSource for WakeNetSource {
         let mut hit = false;
         while self.buf.len() >= chunk {
             let frame: alloc::vec::Vec<i16> = self.buf.drain(..chunk).collect();
+            self.frames_fed += 1;
             unsafe {
                 let r = ((*self.ctx.iface).detect)(self.ctx.model, frame.as_ptr() as *mut i16);
                 if r == WN_DETECTED {
@@ -135,9 +145,18 @@ impl Drop for WakeNetSource {
 pub const WN_DETECTED_CONST: i32 = WN_DETECTED;
 
 /// 启动期自检: 创建检测器 → 喂静音帧 → 销毁 (强制链接全部符号)
+///
+/// 每步打日志 + 指针值: 崩溃时最后一条日志即出事的具体 C 调用。
 pub fn wakenet_selftest() -> Result<(), &'static str> {
+    info!("wakenet: 模型包 {}B 注入", SRMODELS_BIN.len());
     let mut src = WakeNetSource_new()?;
+    info!(
+        "wakenet: iface=0x{:x} model=0x{:x} chunk={}",
+        src.ctx.iface as usize, src.ctx.model as usize, src.ctx.chunk
+    );
     let silence = [0i16; 512];
+    info!("wakenet: 首帧检测...");
     let _ = src.detect(&silence);
+    info!("wakenet: 首帧 OK, 共 {} 帧", src.frames_fed);
     Ok(())
 }
