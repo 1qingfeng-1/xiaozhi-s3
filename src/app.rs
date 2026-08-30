@@ -48,8 +48,8 @@ pub const VAD_THRESHOLD: i16 = 800;
 
 /// 乒乓窗口 = 单个 DMA 描述符 (4092B ≈ 64ms): available() 按完整描述符计数
 const BLOCK_BYTES: usize = 4092;
-/// 采集排空缓冲 16KB (4 描述符); 超出部分按容量截断丢弃
-const POP_BUF_SIZE: usize = 16 * 1024;
+/// 采集排空缓冲 = 整条 RX 链 32736B (pop 全量语义, 缓冲必须 ≥ accumulated)
+const POP_BUF_SIZE: usize = 4092 * 8;
 /// 帧累积缓冲: 2 帧余量
 const ACC_SAMPLES: usize = FRAME_SAMPLES * 2;
 
@@ -470,8 +470,13 @@ pub async fn run(
             dispatch(&mut sm, &mut pending, DialogEvent::WakeTriggered);
         }
 
-        // ---- 7. 下行播放: opus → 解码 → 立体声 ----
-        while let Ok(pkt) = channels.downlink.try_receive() {
+        // ---- 7. 下行播放: opus → 解码 → 立体声 (每轮 ≤3 帧 ≈180ms,
+        // 防止连播期间 RX 积压超过排空缓冲) ----
+        for _ in 0..3 {
+            let pkt = match channels.downlink.try_receive() {
+                Ok(p) => p,
+                Err(_) => break,
+            };
             if let Some(decoder) = decoder.as_mut() {
                 match decoder.decode(&pkt, &mut pcm_dec) {
                     Ok(n) if n > 0 => {

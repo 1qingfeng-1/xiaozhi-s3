@@ -196,23 +196,19 @@ impl Audio {
     }
 
     /// 播放提示音 (250Hz 正弦, 指定时长) — 扬声器通路验证
+    ///
+    /// 注意: 阻塞时长 ≈ ms (调用方需保证 ≤ 2 个 RX 描述符 ≈ 128ms,
+    /// 否则采集链会在提示音期间积压触发 Late 重建)
     pub fn beep(&mut self, ms: u32) {
-        let mut remaining = ms;
-        while remaining > 0 {
-            let chunk_ms = remaining.min(250); // 16KB ≈ 250ms
-            Self::fill_sine(self.tx_buf, chunk_ms);
-            match self.i2s_tx.write_dma(&self.tx_buf) {
-                Ok(t) => {
-                    let _ = t.wait();
-                },
-                Err(e) => defmt::error!("I2S DMA 发送失败: {:?}", e),
-            }
-            remaining -= chunk_ms;
-        }
-        // 收尾静音, 防止残余爆音
-        self.tx_buf.fill(0);
-        if let Ok(t) = self.i2s_tx.write_dma(&self.tx_buf) {
-            let _ = t.wait();
+        // 只发送 ms 对应的字节 (64B/ms @16kHz 立体声 16bit), 阻塞 ≈ ms
+        let n = (ms as usize * 64).min(self.tx_buf.len());
+        Self::fill_sine(&mut self.tx_buf[..n], ms);
+        let words: &[u8] = &self.tx_buf[..n];
+        match self.i2s_tx.write_dma(&words) {
+            Ok(t) => {
+                let _ = t.wait();
+            },
+            Err(e) => defmt::error!("I2S DMA 发送失败: {:?}", e),
         }
     }
 

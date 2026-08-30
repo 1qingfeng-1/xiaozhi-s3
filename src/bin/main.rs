@@ -52,8 +52,9 @@ extern crate alloc;
 // This creates a default app-descriptor required by the esp-idf bootloader.
 esp_bootloader_esp_idf::esp_app_desc!();
 
-/// 会话常驻缓冲尺寸
-const POP_BUF_SIZE: usize = 16 * 1024;
+/// 采集排空缓冲 = 整条 RX 链 (8×4092): esp-hal 的 pop 是全量语义
+/// (缓冲必须容纳当前 accumulated 的全部数据, 否则 BufferTooSmall)
+const POP_BUF_SIZE: usize = 4092 * 8;
 /// 单 DMA 描述符字节数 (4092B ≈ 64ms @ 16kHz 立体声)
 const BLOCK_BYTES: usize = 4092;
 
