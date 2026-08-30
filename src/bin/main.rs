@@ -69,6 +69,16 @@ async fn main(spawner: Spawner) -> ! {
     let mut board = create_board(peripherals);
     info!("板子 [{}] 初始化完成", board.name);
 
+    // 电池电量: ADC 只在 WiFi 启动前读一次 (S3 的 WiFi PHY 与 SARADC 共用,
+    // WiFi 激活期间读 ADC1 会干扰 PHY, 曾触发 WiFi blob 崩溃, 见 app.rs)
+    xiaozhi_s3::app::BATTERY_PCT.store(
+        board
+            .battery
+            .reported_percentage(board.power.status())
+            .unwrap_or(0),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+
     // create_board 按值消耗了 Peripherals; 音频不用的 WIFI/FLASH/TIMG0 经 steal 再取
     let p = unsafe { Peripherals::steal() };
     let timg0 = TimerGroup::new(p.TIMG0);
