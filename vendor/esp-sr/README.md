@@ -42,6 +42,27 @@ libwakenet.a (闭源) → libdl_lib.a → libhufzip.a → libc_speech_features.a
 - Cache/ROM: `Cache_Start_DCache_Preload` 等空实现; `esp_aes_*` 透传
 - 兜底解析: `strtof/strtod/strtok/strdup/_ctype_` (避开 newlib ssp/stdio)
 
+## 真机验证结论 (2026-08-30): 预编译库与 esp-hal 内存映射不兼容
+
+自检插桩定位: create 成功 (chunk=512/rate=16000/模型状态在内部堆),
+**首次 detect 即 InstrProhibited (PC=0x1FFE2000)**。
+
+反汇编确认: `model_detect` (0x420dd604) 内 `callx8` 经
+`model->[160] -> [+8]` 的函数指针跳到 0x1FFE2000 — 该地址落在
+**ESP32-S3 MMU cache block 1** (数据 0x1FC00000 / 取指 0x5FC00000,
+栈上返回地址 0x5FFE1FFD 与崩溃 PC 0x1FFE2000 恰为同一物理页的两个
+窗口别名, 差 0x40000000)。
+
+结论: esp-sr v1.9.5 的 wn9 模型加载/推理路径假设 IDF 已将 PSRAM 映射
+进 **cache block 1** (IDF S3 的 PSRAM 专用窗口), 而 esp-hal 只映射了
+block 0 (数据 0x3C090000+, 无 block 1)。这不是垫片可修的符号问题。
+
+可行出路 (均为独立工作量):
+1. 在 esp-hal PSRAM 初始化后自行写 S3 MMU block 1 页表, 把 PSRAM
+   物理页映射到 0x1FC00000/0x5FC00000 窗口 — 需确认库内期望的布局;
+2. 改用 esp-sr 2.x + esp-dl (源码开放, 无预编译假设, 但集成量大);
+3. 持续使用 VAD 声音唤醒 (默认路径, 已验证)。
+
 ## 已知风险 (真机阶段逐项验证)
 
 1. **mfcc 任务**: `xTaskCreatePinnedToCore` 为空转桩 —— 若 wakenet create
