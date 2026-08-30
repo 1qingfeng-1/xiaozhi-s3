@@ -135,13 +135,16 @@ async fn main(spawner: Spawner) -> ! {
     board.audio.beep(150);
 
     // 会话任务 (WS 连接/收发; 长阻塞 await 集中于此)
-    // SpawnToken 丢弃即任务尚未轮询? esp-rtos 语义: spawn 即注册, token 仅标记
-    let _ = app::session_task(app::SessionArgs {
+    // esp-rtos task 宏: 调用即自派生任务 (内部分配任务栈并注册调度器),
+    // 不产生 SpawnToken (勿再交 spawner.spawn, 会因 token 未消费 panic)
+    let token = app::session_task(app::SessionArgs {
         stack,
         server,
         mac: mac.clone(),
         channels,
-    });
+    })
+    .unwrap();
+    spawner.spawn(token);
 
     // 采集常驻 + 主循环 (采集故障 → 直线路径重建 → 重进)
     let mut cap = match board.capture.start() {
