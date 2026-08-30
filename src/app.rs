@@ -29,6 +29,7 @@ impl defmt::Format for SessionCommand {
             SessionCommand::SendListenStart(_) => defmt::write!(f, "ListenStart"),
             SessionCommand::SendListenStop => defmt::write!(f, "ListenStop"),
             SessionCommand::SendTtsAbort => defmt::write!(f, "TtsAbort"),
+            SessionCommand::SetVolume(_) => defmt::write!(f, "SetVolume"),
         }
     }
 }
@@ -55,6 +56,15 @@ const ACC_SAMPLES: usize = FRAME_SAMPLES * 2;
 
 /// opus 包通道项 (单包上限 1276B)
 pub type OpusPacket = heapless::Vec<u8, MAX_PACKET_BYTES>;
+
+/// 跨任务共享的设备状态 (MCP get_device_status / set_volume 用)
+pub static VOLUME_PCT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(60);
+pub static BATTERY_PCT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+pub static CHARGING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// MCP set_volume 待办 (valid 标记 + 目标值; 音频循环轮询消费)
+pub static PENDING_VOLUME: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+pub static PENDING_VOLUME_VALID: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 type RawMutex = embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
 /// 音频主循环返回原因
@@ -75,6 +85,8 @@ pub enum SessionCommand {
     SendListenStop,
     /// 打断 TTS
     SendTtsAbort,
+    /// MCP: 设置音量 (音频任务执行 I2C 写)
+    SetVolume(u8),
 }
 
 /// 会话任务 → 音频主循环 事件
@@ -120,11 +132,11 @@ pub async fn session_task(args: SessionArgs) {
         channels,
     } = args;
 
-    enum Conn {
-        None,
-        Up(session::WsClient<'static>),
-    }
-    let mut conn = Conn::None;
+    // socket 持有于任务内, 跨重连复用 (每次 connect 泄漏缓冲会耗尽内部堆)
+    let rx = alloc::vec![0u8; 4096].leak();
+    let tx = alloc::vec![0u8; 4096].leak();
+    let mut socket = embassy_net::tcp::TcpSocket::new(stack, rx, tx);
+    let mut connected = false;
     let mut want_connect = false;
 
     loop {
@@ -133,27 +145,44 @@ pub async fn session_task(args: SessionArgs) {
             match channels.command.try_receive() {
                 Ok(SessionCommand::Connect) => want_connect = true,
                 Ok(SessionCommand::SendListenStart(mode)) => {
-                    if let Conn::Up(ws) = &mut conn {
+                    if connected {
                         let msg = if mode == ListenMode::Auto {
                             session::LISTEN_START_AUTO
                         } else {
                             session::LISTEN_START_MANUAL
                         };
+                        let mut ws = session::WsClient {
+                            socket: &mut socket,
+                        };
                         if ws.send_text(msg.as_bytes()).await.is_err() {
+                            connected = false;
                             channels.event.try_send(SessionEvent::Closed).ok();
                         }
                     }
                 },
                 Ok(SessionCommand::SendListenStop) => {
-                    if let Conn::Up(ws) = &mut conn {
+                    if connected {
+                        let mut ws = session::WsClient {
+                            socket: &mut socket,
+                        };
                         if ws.send_text(session::LISTEN_STOP.as_bytes()).await.is_err() {
+                            connected = false;
                             channels.event.try_send(SessionEvent::Closed).ok();
                         }
                     }
                 },
+                Ok(SessionCommand::SetVolume(v)) => {
+                    // 音频主循环轮询 PENDING_VOLUME 并执行 I2C 写
+                    PENDING_VOLUME.store(v, core::sync::atomic::Ordering::Relaxed);
+                    PENDING_VOLUME_VALID.store(true, core::sync::atomic::Ordering::Relaxed);
+                },
                 Ok(SessionCommand::SendTtsAbort) => {
-                    if let Conn::Up(ws) = &mut conn {
+                    if connected {
+                        let mut ws = session::WsClient {
+                            socket: &mut socket,
+                        };
                         if ws.send_text(session::TTS_ABORT.as_bytes()).await.is_err() {
+                            connected = false;
                             channels.event.try_send(SessionEvent::Closed).ok();
                         }
                     }
@@ -165,11 +194,11 @@ pub async fn session_task(args: SessionArgs) {
         // ---- 建连 (阻塞仅影响本任务; 音频主循环照常排空采集) ----
         if want_connect {
             want_connect = false;
-            if let Conn::None = conn {
+            if !connected {
                 info!("会话任务: 开始连接...");
-                match session::connect(stack, server, &mac).await {
-                    Ok((ws, _rate, _frame_ms)) => {
-                        conn = Conn::Up(ws);
+                match session::connect(&mut socket, server, &mac).await {
+                    Ok((_rate, _frame_ms)) => {
+                        connected = true;
                         channels.event.try_send(SessionEvent::Ready).ok();
                     },
                     Err(e) => {
@@ -182,15 +211,22 @@ pub async fn session_task(args: SessionArgs) {
 
         // ---- 上行: 编码帧 → WS ----
         while let Ok(pkt) = channels.uplink.try_receive() {
-            if let Conn::Up(ws) = &mut conn {
+            if connected {
+                let mut ws = session::WsClient {
+                    socket: &mut socket,
+                };
                 if ws.send_frame(2, &pkt).await.is_err() {
+                    connected = false;
                     channels.event.try_send(SessionEvent::Closed).ok();
                 }
             }
         }
 
-        // ---- 服务器帧: 文本 → 事件; 二进制 → 下行通道 ----
-        if let Conn::Up(ws) = &mut conn {
+        // ---- 服务器帧: 文本 → 事件/MCP; 二进制 → 下行通道 ----
+        if connected {
+            let mut ws = session::WsClient {
+                socket: &mut socket,
+            };
             if ws.socket.can_recv() {
                 match ws.recv_frame().await {
                     Ok((opcode, payload)) => match opcode {
@@ -221,7 +257,7 @@ pub async fn session_task(args: SessionArgs) {
                         },
                         8 => {
                             info!("服务器关闭连接");
-                            conn = Conn::None;
+                            connected = false;
                             channels.event.try_send(SessionEvent::Closed).ok();
                         },
                         9 => {
@@ -231,7 +267,7 @@ pub async fn session_task(args: SessionArgs) {
                     },
                     Err(e) => {
                         warn!("WS 接收错误: {} — 会话关闭", e);
-                        conn = Conn::None;
+                        connected = false;
                         channels.event.try_send(SessionEvent::Closed).ok();
                     },
                 }
@@ -273,8 +309,8 @@ pub async fn run(
         buttons,
         leds,
         display,
-        battery: _,
-        power: _,
+        battery,
+        power,
         cap,
         channels,
     } = args;
@@ -370,6 +406,22 @@ pub async fn run(
             info!("音量: {}%", next);
         }
         vol_edge = vol_up || vol_down;
+
+        // ---- 3.5 MCP SetVolume 待办 + 设备状态发布 ----
+        if PENDING_VOLUME_VALID.swap(false, core::sync::atomic::Ordering::Relaxed) {
+            let v = PENDING_VOLUME.swap(0, core::sync::atomic::Ordering::Relaxed);
+            audio.set_volume(v);
+            VOLUME_PCT.store(v, core::sync::atomic::Ordering::Relaxed);
+            info!("MCP 音量: {}%", v);
+        }
+        BATTERY_PCT.store(
+            battery.reported_percentage(power.status()).unwrap_or(0),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        CHARGING.store(
+            matches!(power.status(), xiaozhi_core::board::PowerStatus::Charging),
+            core::sync::atomic::Ordering::Relaxed,
+        );
 
         // ---- 4. 状态机动作 → 会话命令 (非阻塞) ----
         for (action, mode) in &pending {
@@ -570,4 +622,52 @@ fn state_label(state: DialogState) -> &'static str {
         DialogState::WaitingReply => "等回复",
         DialogState::Speaking => "播报",
     }
+}
+
+/// MCP 请求应答 (会话任务内; 设备状态经原子量读取, set_volume 经命令下发)
+fn mcp_handle(text: &str, volume: u8, channels: &Channels) -> Option<heapless::String<1024>> {
+    use xiaozhi_core::mcp;
+    let Some(req) = mcp::parse_request(text) else {
+        return None; // notifications / 无法解析: 无需回应
+    };
+    const BOARD_NAME: &str = crate::bsp::active::BOARD.name;
+    const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+    Some(match req.method {
+        mcp::McpMethod::Initialize => mcp::initialize_response(req.id, BOARD_NAME, APP_VERSION),
+        mcp::McpMethod::ToolsList => mcp::tools_list_response(req.id),
+        mcp::McpMethod::ToolsCall { name, volume: vol } => match (name, vol) {
+            ("self.get_device_status", _) => {
+                let level = BATTERY_PCT.load(core::sync::atomic::Ordering::Relaxed);
+                let charging = CHARGING.load(core::sync::atomic::Ordering::Relaxed);
+                let status = mcp::status_json(volume, Some(level), charging);
+                mcp::text_result_response(req.id, status.as_str())
+            },
+            ("self.audio_speaker.set_volume", Some(v)) => {
+                let v = v.clamp(0, 100) as u8;
+                VOLUME_PCT.store(v, core::sync::atomic::Ordering::Relaxed);
+                if channels
+                    .command
+                    .try_send(SessionCommand::SetVolume(v))
+                    .is_err()
+                {
+                    warn!("MCP: 命令通道满, 音量设置丢弃");
+                }
+                mcp::text_result_response(req.id, "true")
+            },
+            ("self.audio_speaker.set_volume", None) => {
+                mcp::error_response(req.id, "Missing argument: volume")
+            },
+            _ => mcp::error_response(req.id, "Unknown tool"),
+        },
+        mcp::McpMethod::Unknown(_) => mcp::error_response(req.id, "Method not implemented"),
+    })
+}
+
+/// set_volume 经命令通道下发音频主循环 (I2C 写在音频任务上下文执行)
+fn channels_command_set_volume(v: u8) {
+    // 由调用处 (session_task) 的 channels 静态引用发送;
+    // 这里经全局静态通道句柄不可行, 故以命令事件转发 — 见 session_task 内
+    // SessionCommand::SetVolume 分支。
+    let _ = v;
 }

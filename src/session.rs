@@ -29,8 +29,11 @@ pub const HELLO: &str = "{\"type\":\"hello\",\"version\":1,\"features\":{\"mcp\"
   \"sample_rate\":16000,\"channels\":1,\"frame_duration\":60}}";
 
 /// 极简 WebSocket 客户端 (客户端帧强制掩码, 服务端帧不掩码)
+///
+/// 借用外部 TcpSocket: 会话任务持有 socket 并跨重连复用, 避免每次
+/// connect 泄漏缓冲耗尽内部堆。
 pub struct WsClient<'a> {
-    pub socket: TcpSocket<'a>,
+    pub socket: &'a mut TcpSocket<'static>,
 }
 
 impl WsClient<'_> {
@@ -149,38 +152,34 @@ async fn write_all(socket: &mut TcpSocket<'_>, mut data: &[u8]) -> Result<(), &'
     Ok(())
 }
 
-/// 建立会话: TCP 连接 → WS 握手 → 发送 hello → 等待服务器 hello
+/// 在既有 socket 上建立会话: TCP 连接 → WS 握手 → 发送 hello → 等待服务器 hello
 ///
-/// 返回 (客户端, 服务器音频参数: 采样率 / 帧长 ms)。
+/// socket 由调用方持有并跨重连复用 (每次 connect 都 leak 缓冲会耗尽内部堆)。
+/// 返回服务器音频参数: 采样率 / 帧长 ms。
 pub async fn connect(
-    stack: embassy_net::Stack<'static>,
+    socket: &mut TcpSocket<'static>,
     server: Ipv4Address,
     mac: &str,
-) -> Result<(WsClient<'static>, u32, u32), &'static str> {
-    // 每次会话分配一对 socket 缓冲: 会话结束随连接一起丢弃 (不可用
-    // mk_static —— 同一调用点二次初始化会 panic; 泄漏仅发生在断线重连,
-    // 量级极小)
-    let rx = alloc::vec![0u8; 4096].leak();
-    let tx = alloc::vec![0u8; 4096].leak();
-    let mut socket = TcpSocket::new(stack, rx, tx);
+) -> Result<(u32, u32), &'static str> {
+    socket.abort();
     socket
         .connect((server, WS_PORT))
         .await
         .map_err(|_| "WS TCP 连接失败")?;
 
-    handshake(&mut socket, mac, server).await?;
+    handshake(socket, mac, server).await?;
+
     let mut ws = WsClient { socket };
     ws.send_text(HELLO.as_bytes()).await?;
-
-    // 等待服务器 hello
     let (opcode, payload) = ws.recv_frame().await.map_err(|_| "服务器 hello 接收失败")?;
     if opcode != 1 {
         return Err("服务器首帧非文本");
     }
     let text = core::str::from_utf8(&payload).map_err(|_| "hello 非 UTF-8")?;
-    let rate = json_num_field(text, "sample_rate").unwrap_or(24_000);
-    let frame_ms = json_num_field(text, "frame_duration").unwrap_or(60);
-    Ok((ws, rate, frame_ms))
+    Ok((
+        json_num_field(text, "sample_rate").unwrap_or(24_000),
+        json_num_field(text, "frame_duration").unwrap_or(60),
+    ))
 }
 
 /// WebSocket 握手 (HTTP Upgrade), 校验 101
