@@ -62,7 +62,7 @@ impl Display {
     /// 组装并初始化 (工厂调用; 引脚接线见 BoardConfig.display)
     pub fn new(
         spi: Spi<'static, Blocking>,
-        mut dc: Output<'static>,
+        dc: Output<'static>,
         mut rst: Output<'static>,
         mut backlight: Output<'static>,
     ) -> Self {
@@ -175,20 +175,25 @@ impl Display {
                     Some(r) => row_pixels(r[row]),
                     None => [false; GLYPH_W],
                 };
-                for col in 0..GLYPH_W {
-                    let on = px[col];
-                    let color = if on { fg } else { bg };
-                    // 放大: scale×scale 实心块
-                    self.fill_rect(
-                        cx + (col as u16) * scale,
-                        y + (row as u16) * scale,
-                        scale,
-                        scale,
-                        color,
-                    );
-                }
+                self.draw_glyph_row(cx, y + (row as u16) * scale, px, fg, bg, scale);
             }
             cx += (GLYPH_W + GLYPH_GAP) as u16 * scale;
+        }
+    }
+
+    /// 绘制字形的一行 (scale×scale 实心块)
+    fn draw_glyph_row(
+        &mut self,
+        cx: u16,
+        y_base: u16,
+        px: [bool; GLYPH_W],
+        fg: Rgb565,
+        bg: Rgb565,
+        scale: u16,
+    ) {
+        for (col, on) in px.into_iter().enumerate() {
+            let color = if on { fg } else { bg };
+            self.fill_rect(cx + (col as u16) * scale, y_base, scale, scale, color);
         }
     }
 

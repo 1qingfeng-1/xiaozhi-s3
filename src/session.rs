@@ -72,13 +72,13 @@ impl WsClient<'_> {
         for (i, b) in payload.iter().enumerate() {
             frame.push(b ^ key[i % 4]).ok();
         }
-        write_all(&mut self.socket, &frame).await
+        write_all(self.socket, &frame).await
     }
 
     /// 接收一帧 (服务端帧不掩码), 返回 (opcode, payload)
     pub async fn recv_frame(&mut self) -> Result<(u8, heapless::Vec<u8, RECV_BUF>), &'static str> {
         let mut hdr = [0u8; 2];
-        read_exact(&mut self.socket, &mut hdr)
+        read_exact(self.socket, &mut hdr)
             .await
             .map_err(|_| "读取帧头失败")?;
         let opcode = hdr[0] & 0x0F;
@@ -87,7 +87,7 @@ impl WsClient<'_> {
         let len = match len0 {
             126 => {
                 let mut ext = [0u8; 2];
-                read_exact(&mut self.socket, &mut ext)
+                read_exact(self.socket, &mut ext)
                     .await
                     .map_err(|_| "读取长度失败")?;
                 u16::from_be_bytes(ext) as usize
@@ -100,20 +100,18 @@ impl WsClient<'_> {
         }
         let mut mask = [0u8; 4];
         if masked {
-            read_exact(&mut self.socket, &mut mask)
+            read_exact(self.socket, &mut mask)
                 .await
                 .map_err(|_| "读取掩码失败")?;
         }
         let mut payload = heapless::Vec::<u8, RECV_BUF>::new();
         payload.resize(len, 0).map_err(|_| "帧过长")?;
         if len > 0 {
-            read_exact(&mut self.socket, &mut payload)
+            read_exact(self.socket, &mut payload)
                 .await
                 .map_err(|_| "读取负载失败")?;
             if masked {
-                for (i, b) in payload.iter_mut().enumerate() {
-                    *b ^= mask[i % 4];
-                }
+                unmask_in_place(&mut payload, &mask);
             }
         }
         Ok((opcode, payload))
@@ -150,6 +148,13 @@ async fn write_all(socket: &mut TcpSocket<'_>, mut data: &[u8]) -> Result<(), &'
         data = &data[n..];
     }
     Ok(())
+}
+
+/// 就地 XOR 掩码 (WebSocket 客户端帧解码)
+fn unmask_in_place(payload: &mut [u8], mask: &[u8; 4]) {
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b ^= mask[i % 4];
+    }
 }
 
 /// 在既有 socket 上建立会话: TCP 连接 → WS 握手 → 发送 hello → 等待服务器 hello
@@ -276,10 +281,11 @@ pub fn json_str_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     let mut rest = json;
     while let Some(i) = rest.find(&pat) {
         let after = rest[i + pat.len()..].trim_start();
-        if let Some(v) = after.strip_prefix('"') {
-            if let Some(end) = v.find('"') {
-                return Some(&v[..end]);
-            }
+        if let Some(v) = after
+            .strip_prefix('"')
+            .and_then(|v| v.split_once('"').map(|(s, _)| s))
+        {
+            return Some(v);
         }
         rest = &rest[i + pat.len()..];
     }

@@ -142,10 +142,10 @@ fn build_wakenet(compiler: &str) {
 /// 按文件头注释的顺序探测 xtensa GCC
 fn find_xtensa_gcc() -> Option<String> {
     for var in ["CC_xtensa_esp32s3_none_elf", "CC"] {
-        if let Ok(cc) = env::var(var) {
-            if !cc.is_empty() {
-                return Some(cc);
-            }
+        if let Ok(cc) = env::var(var)
+            && !cc.is_empty()
+        {
+            return Some(cc);
         }
     }
     if which(XTENSA_GCC).is_some() {

@@ -11,7 +11,6 @@ use embassy_executor::Spawner;
 use esp_hal::{
     clock::CpuClock,
     gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
-    main,
     time::{Duration, Instant},
 };
 

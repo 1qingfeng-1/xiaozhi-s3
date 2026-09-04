@@ -9,6 +9,8 @@ use defmt::{error, info, warn};
 
 use xiaozhi_core::ota;
 
+use crate::mk_static;
+
 /// 检查结果
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateReport {
@@ -20,8 +22,10 @@ pub struct UpdateReport {
 
 /// 向服务器查询固件更新
 pub async fn check(stack: Stack<'static>, server: Ipv4Address) -> Option<UpdateReport> {
-    let rx = alloc::vec![0u8; 1024].leak();
-    let tx = alloc::vec![0u8; 512].leak();
+    // check() 消费一次性 Stack<'static> (调用方 mk_static!), 故 rx/tx 亦用
+    // mk_static! 常驻 (替代原 vec!().leak() 每次泄漏 1536B)
+    let rx = mk_static!([u8; 1024], [0u8; 1024]);
+    let tx = mk_static!([u8; 512], [0u8; 512]);
     let mut socket = TcpSocket::new(stack, rx, tx);
     socket.connect((server, 8003)).await.ok()?;
 
@@ -36,13 +40,7 @@ pub async fn check(stack: Stack<'static>, server: Ipv4Address) -> Option<UpdateR
         let mut buf = [0u8; 256];
         match socket.read(&mut buf).await {
             Ok(0) | Err(_) => break,
-            Ok(n) => {
-                for b in &buf[..n] {
-                    if resp.push(*b as char).is_err() {
-                        break;
-                    }
-                }
-            },
+            Ok(n) => push_bytes(&mut resp, &buf[..n]),
         }
         if resp.len() >= resp.capacity() - 1 {
             break;
@@ -74,6 +72,15 @@ pub async fn check(stack: Stack<'static>, server: Ipv4Address) -> Option<UpdateR
         latest_version: latest,
         update_available,
     })
+}
+
+/// 逐字节 push 进 resp (容量满即停)
+fn push_bytes(resp: &mut heapless::String<1024>, chunk: &[u8]) {
+    for b in chunk {
+        if resp.push(*b as char).is_err() {
+            return;
+        }
+    }
 }
 
 async fn write_all(socket: &mut TcpSocket<'_>, mut data: &[u8]) -> Result<(), ()> {

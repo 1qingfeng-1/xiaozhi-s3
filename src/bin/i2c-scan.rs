@@ -8,7 +8,6 @@ use embassy_executor::Spawner;
 use esp_hal::{
     clock::CpuClock,
     i2c::master::{Config, I2c},
-    main,
     time::Rate,
 };
 
@@ -55,7 +54,7 @@ async fn main(spawner: Spawner) -> ! {
         Ok(i) => i,
         Err(e) => {
             info!("I2C 初始化失败: {:?}", e);
-            loop {}
+            unreachable!("I2C 初始化失败, 无法继续扫描");
         },
     };
     i2c = i2c.with_sda(peripherals.GPIO38);
@@ -67,18 +66,15 @@ async fn main(spawner: Spawner) -> ! {
     let mut found = 0u8;
     for addr in 1u8..=112 {
         // 读 1 字节探测, 器件应答则成功
-        match i2c.read(addr, &mut [0u8]) {
-            Ok(_) => {
-                info!("  [0x{:02X}] 应答!", addr);
-                found += 1;
-                // 按功能角色识别板级 Codec (型号仅展示)
-                if addr == BOARD.codec_ctrl.dac_addr {
-                    info!("    → 播放通道 {} (DAC)", BOARD.codec_ctrl.dac_chip);
-                } else if addr == BOARD.codec_ctrl.adc_addr {
-                    info!("    → 录音通道 {} (ADC)", BOARD.codec_ctrl.adc_chip);
-                }
-            },
-            Err(_) => {},
+        if let Ok(_) = i2c.read(addr, &mut [0u8]) {
+            info!("  [0x{:02X}] 应答!", addr);
+            found += 1;
+            // 按功能角色识别板级 Codec (型号仅展示)
+            if addr == BOARD.codec_ctrl.dac_addr {
+                info!("    → 播放通道 {} (DAC)", BOARD.codec_ctrl.dac_chip);
+            } else if addr == BOARD.codec_ctrl.adc_addr {
+                info!("    → 录音通道 {} (ADC)", BOARD.codec_ctrl.adc_chip);
+            }
         }
     }
 

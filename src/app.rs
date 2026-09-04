@@ -50,10 +50,6 @@ pub const VAD_THRESHOLD: i16 = 800;
 
 /// 乒乓窗口 = 单个 DMA 描述符 (4092B ≈ 64ms): available() 按完整描述符计数
 const BLOCK_BYTES: usize = 4092;
-/// 采集排空缓冲 = 整条 RX 链 32736B (pop 全量语义, 缓冲必须 ≥ accumulated)
-const POP_BUF_SIZE: usize = 4092 * 8;
-/// 帧累积缓冲: 2 帧余量
-const ACC_SAMPLES: usize = FRAME_SAMPLES * 2;
 
 /// opus 包通道项 (单包上限 1276B)
 pub type OpusPacket = heapless::Vec<u8, MAX_PACKET_BYTES>;
@@ -250,10 +246,10 @@ pub async fn session_task(args: SessionArgs) {
                         },
                         2 => {
                             let mut pkt: OpusPacket = heapless::Vec::new();
-                            if pkt.extend_from_slice(&payload).is_ok() {
-                                if channels.downlink.try_send(pkt).is_err() {
-                                    warn!("下行通道满, 丢弃一帧");
-                                }
+                            if pkt.extend_from_slice(&payload).is_ok()
+                                && channels.downlink.try_send(pkt).is_err()
+                            {
+                                warn!("下行通道满, 丢弃一帧");
                             }
                         },
                         8 => {
@@ -332,6 +328,7 @@ pub async fn run(
     let mut last_led: Option<LedMode> = None;
     let mut last_state: Option<DialogState> = None;
     let mut state_since_ms = 0u64;
+    let mut battery_last_read = 0u64;
     let mut uplink_frames: u64 = 0;
     let mut pending: heapless::Vec<(Action, ListenMode), 8> = heapless::Vec::new();
 
@@ -415,14 +412,20 @@ pub async fn run(
             VOLUME_PCT.store(v, core::sync::atomic::Ordering::Relaxed);
             info!("MCP 音量: {}%", v);
         }
-        BATTERY_PCT.store(
-            battery.reported_percentage(power.status()).unwrap_or(0),
-            core::sync::atomic::Ordering::Relaxed,
-        );
+        // 充电状态: GPIO 实时 (不读 ADC, 与 WiFi PHY 无冲突)
         CHARGING.store(
             matches!(power.status(), xiaozhi_core::board::PowerStatus::Charging),
             core::sync::atomic::Ordering::Relaxed,
         );
+        // 电量: 仅 Idle + 10s 限频 (S3 WiFi PHY 与 SARADC 共用 ADC1,
+        // 会话期间频繁读 ADC 干扰射频 — 曾崩 pm_on_beacon_rx)
+        if sm.state() == DialogState::Idle && now_ms - battery_last_read >= 10_000 {
+            battery_last_read = now_ms;
+            BATTERY_PCT.store(
+                battery.reported_percentage(power.status()).unwrap_or(0),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
 
         // ---- 4. 状态机动作 → 会话命令 (非阻塞) ----
         for (action, mode) in &pending {
@@ -451,70 +454,63 @@ pub async fn run(
 
         // ---- 6. 采集排空 (每轮必做, 时钟常开期间防饱和) ----
         let mut triggered = false;
-        match cap.available() {
-            Ok(avail) if avail >= BLOCK_BYTES => {
-                // pop 是全量语义: 缓冲必须 ≥ accumulated (描述符粒度是 4095
-                // 而非 4092, 不能自作对齐)。排空缓冲已扩至整条 RX 链,
-                // take = avail 恒可 pop; 长阻塞期绕回填满时最旧数据自然流失。
-                let take = usize::min(avail, pop_buf.len());
-                match cap.pop(&mut pop_buf[..take]) {
-                    Ok(n) => {
-                        let ns = extract_slot(&pop_buf[..(n / 4) * 4], 2, 0, mono_buf);
-                        apply_gain_percent(&mut mono_buf[..ns], GAIN_PERCENT);
-                        match sm.state() {
-                            DialogState::Idle => {
-                                if wake.feed(&mono_buf[..ns], now_ms) == WakeEvent::Triggered {
-                                    triggered = true;
-                                }
-                            },
-                            DialogState::Listening => {
-                                if let Some(encoder) = encoder.as_mut() {
-                                    let mut src = &mono_buf[..ns];
-                                    while !src.is_empty() {
-                                        let take = usize::min(acc_buf.len() - acc_len, src.len());
-                                        acc_buf[acc_len..acc_len + take]
-                                            .copy_from_slice(&src[..take]);
-                                        acc_len += take;
-                                        src = &src[take..];
-                                        while acc_len >= FRAME_SAMPLES {
-                                            let mut raw = [0u8; MAX_PACKET_BYTES];
-                                            match encoder
-                                                .encode(&acc_buf[..FRAME_SAMPLES], &mut raw)
-                                            {
-                                                Ok(len) => {
-                                                    uplink_frames += 1;
-                                                    if uplink_frames % 100 == 0 {
-                                                        info!("上行心跳: {} 帧", uplink_frames);
-                                                    }
-                                                    let mut pkt: OpusPacket = heapless::Vec::new();
-                                                    if pkt.extend_from_slice(&raw[..len]).is_ok()
-                                                        && channels.uplink.try_send(pkt).is_err()
-                                                    {
-                                                        warn!("上行通道满, 丢弃一帧");
-                                                    }
-                                                },
-                                                Err(e) => warn!("opus 编码失败: {}", e),
-                                            }
-                                            acc_buf.copy_within(FRAME_SAMPLES..acc_len, 0);
-                                            acc_len -= FRAME_SAMPLES;
-                                        }
-                                    }
-                                }
-                            },
-                            _ => {}, // Speaking/Connecting/WaitingReply: 排空即弃
-                        }
-                    },
-                    Err(e) => {
-                        warn!("RX pop 失败: {:?} — 重建采集", e);
-                        return RunOutcome::CaptureFault;
-                    },
-                }
-            },
-            Ok(_) => {},
+        let avail = match cap.available() {
+            Ok(a) => a,
             Err(e) => {
                 warn!("RX available 失败: {:?} — 重建采集", e);
                 return RunOutcome::CaptureFault;
             },
+        };
+        if avail >= BLOCK_BYTES {
+            // pop 内部重读 available (esp-hal 1.1.2), 传全量缓冲
+            // (32736B ≥ max non-Late 28644B) 消除竞态; 长阻塞期
+            // 绕回填满时最旧数据自然流失。
+            let n = match cap.pop(pop_buf) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("RX pop 失败: {:?} — 重建采集", e);
+                    return RunOutcome::CaptureFault;
+                },
+            };
+            let ns = extract_slot(&pop_buf[..(n / 4) * 4], 2, 0, mono_buf);
+            apply_gain_percent(&mut mono_buf[..ns], GAIN_PERCENT);
+            match sm.state() {
+                DialogState::Idle => {
+                    triggered |= wake.feed(&mono_buf[..ns], now_ms) == WakeEvent::Triggered;
+                },
+                DialogState::Listening => {
+                    if let Some(encoder) = encoder.as_mut() {
+                        let mut src = &mono_buf[..ns];
+                        while !src.is_empty() {
+                            let take = usize::min(acc_buf.len() - acc_len, src.len());
+                            acc_buf[acc_len..acc_len + take].copy_from_slice(&src[..take]);
+                            acc_len += take;
+                            src = &src[take..];
+                            while acc_len >= FRAME_SAMPLES {
+                                let mut raw = [0u8; MAX_PACKET_BYTES];
+                                match encoder.encode(&acc_buf[..FRAME_SAMPLES], &mut raw) {
+                                    Ok(len) => {
+                                        uplink_frames += 1;
+                                        if uplink_frames.is_multiple_of(100) {
+                                            info!("上行心跳: {} 帧", uplink_frames);
+                                        }
+                                        let mut pkt: OpusPacket = heapless::Vec::new();
+                                        if pkt.extend_from_slice(&raw[..len]).is_ok()
+                                            && channels.uplink.try_send(pkt).is_err()
+                                        {
+                                            warn!("上行通道满, 丢弃一帧");
+                                        }
+                                    },
+                                    Err(e) => warn!("opus 编码失败: {}", e),
+                                }
+                                acc_buf.copy_within(FRAME_SAMPLES..acc_len, 0);
+                                acc_len -= FRAME_SAMPLES;
+                            }
+                        }
+                    }
+                },
+                _ => {}, // Speaking/Connecting/WaitingReply: 排空即弃
+            }
         }
         if triggered {
             audio.beep(120);
@@ -528,22 +524,18 @@ pub async fn run(
                 Ok(p) => p,
                 Err(_) => break,
             };
-            if let Some(decoder) = decoder.as_mut() {
-                match decoder.decode(&pkt, &mut pcm_dec) {
-                    Ok(n) if n > 0 => {
-                        let mut o = 0;
-                        for &s in &pcm_dec[..n] {
-                            let le = s.to_le_bytes();
-                            stereo_out[o..o + 2].copy_from_slice(&le);
-                            stereo_out[o + 2..o + 4].copy_from_slice(&le);
-                            o += 4;
-                        }
-                        audio.play_block(&stereo_out[..n * 4]);
-                        played = true;
-                    },
-                    Ok(_) => {},
-                    Err(e) => warn!("opus 解码失败: {}", e),
-                }
+            let Some(decoder) = decoder.as_mut() else {
+                continue;
+            };
+            match decoder.decode(&pkt, &mut pcm_dec) {
+                Ok(n) if n > 0 => {
+                    let n = n.min(pcm_dec.len());
+                    let written = mono_to_stereo(&pcm_dec[..n], &mut stereo_out);
+                    audio.play_block(&stereo_out[..written]);
+                    played = true;
+                },
+                Ok(_) => {},
+                Err(e) => warn!("opus 解码失败: {}", e),
             }
         }
 
@@ -581,9 +573,19 @@ pub async fn run(
     }
 }
 
-fn now_label() {}
-
 /// 显示面板状态文本 (3x5 点阵字库仅 ASCII)
+/// 16-bit 单声道 → 立体声 (左右复制) 交错 little-endian 字节; 返回写入字节数
+fn mono_to_stereo(src: &[i16], dst: &mut [u8]) -> usize {
+    let mut o = 0;
+    for &s in src {
+        let le = s.to_le_bytes();
+        dst[o..o + 2].copy_from_slice(&le);
+        dst[o + 2..o + 4].copy_from_slice(&le);
+        o += 4;
+    }
+    o
+}
+
 fn state_text(state: DialogState) -> &'static str {
     match state {
         DialogState::Idle => "IDLE",
@@ -600,15 +602,17 @@ fn dispatch(
     pending: &mut heapless::Vec<(Action, ListenMode), 8>,
     ev: DialogEvent,
 ) {
+    let (state, actions_ref) = sm.transition(ev);
+    // Action 是 Copy: 先复制释放 sm 的 &mut 借用, 再读 post-transition mode
+    // (barge-in 修复: Speaking+ManualListenStart 转移后 mode 变 Manual,
+    //  pre-transition 读会错标为 Auto)
+    let actions: heapless::Vec<Action, 8> = actions_ref.iter().copied().collect();
     let mode = sm.mode();
-    let (state, actions) = sm.transition(ev);
-    let actions: heapless::Vec<(Action, ListenMode), 8> =
-        actions.iter().map(|a| (*a, mode)).collect();
-    for (action, mode) in &actions {
-        match action {
+    for &a in &actions {
+        match a {
             Action::PlayWakeChime => {}, // 提示音在唤醒注入点同步执行
-            other => {
-                let _ = pending.push((*other, *mode));
+            _ => {
+                let _ = pending.push((a, mode));
             },
         }
     }
@@ -626,6 +630,9 @@ fn state_label(state: DialogState) -> &'static str {
 }
 
 /// MCP 请求应答 (会话任务内; 设备状态经原子量读取, set_volume 经命令下发)
+///
+/// MCP 当前未接线 (hello 发 `features:{}`, 见 AGENTS.md): 接通前保留, 显式 allow。
+#[allow(dead_code)]
 fn mcp_handle(text: &str, volume: u8, channels: &Channels) -> Option<heapless::String<1024>> {
     use xiaozhi_core::mcp;
     let Some(req) = mcp::parse_request(text) else {
@@ -666,6 +673,9 @@ fn mcp_handle(text: &str, volume: u8, channels: &Channels) -> Option<heapless::S
 }
 
 /// set_volume 经命令通道下发音频主循环 (I2C 写在音频任务上下文执行)
+///
+/// MCP 未接线, 保留待启用 (见 AGENTS.md)。
+#[allow(dead_code)]
 fn channels_command_set_volume(v: u8) {
     // 由调用处 (session_task) 的 channels 静态引用发送;
     // 这里经全局静态通道句柄不可行, 故以命令事件转发 — 见 session_task 内

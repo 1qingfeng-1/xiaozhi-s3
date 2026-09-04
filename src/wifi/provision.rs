@@ -13,6 +13,8 @@ use alloc::format;
 
 /// 配网 AP 的 IP
 const AP_ADDR: [u8; 4] = [192, 168, 4, 1];
+/// 表单未填服务器 IP 时的默认 xiaozhi 服务器 (局域网)
+const DEFAULT_SERVER: &str = "192.168.123.14";
 
 // 本模块不再重复注册堆: 调用方 (bin) 已注册 (主固件在 create_board 内注册)
 
@@ -178,7 +180,7 @@ async fn serve_bytes(socket: &mut tcp::TcpSocket<'_>, ctype: &str, body: &[u8]) 
         let n = socket
             .write_with(|buf| {
                 let n = usize::min(buf.len(), head_slice.len());
-                buf[..n].copy_from_slice(head_slice[..n].as_bytes());
+                buf[..n].copy_from_slice(&head_slice.as_bytes()[..n]);
                 (n, n)
             })
             .await
@@ -340,7 +342,7 @@ fn parse_query(
         }
     }
     if server.is_empty() {
-        server = heapless::String::try_from("192.168.123.14").unwrap_or_default();
+        server = heapless::String::try_from(DEFAULT_SERVER).unwrap_or_default();
     }
     (ssid, pass, server)
 }

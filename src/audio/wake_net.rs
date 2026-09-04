@@ -75,6 +75,7 @@ unsafe extern "C" {
 }
 
 /// 创建唤醒词检测器 ("你好小智")
+#[allow(non_snake_case)]
 pub fn WakeNetSource_new() -> Result<WakeNetSource, &'static str> {
     unsafe {
         info!("wakenet: srmodel 注入...");

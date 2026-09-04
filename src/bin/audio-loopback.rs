@@ -21,7 +21,6 @@
 use embassy_executor::Spawner;
 use esp_hal::{
     clock::CpuClock,
-    main,
     time::{Duration, Instant},
 };
 
@@ -57,6 +56,7 @@ const VAD_THRESHOLD: i16 = 300;
 const POP_BUF_SIZE: usize = 16 * 1024;
 
 #[esp_rtos::main]
+#[allow(clippy::large_stack_frames)] // 调试 bin: 单任务局部缓冲较大, 可接受 (CI 以 cap-lints 压住)
 async fn main(_spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
@@ -109,23 +109,21 @@ async fn main(_spawner: Spawner) -> ! {
     info!("开始回环, 对着麦克风说话...");
 
     loop {
-        // 等待采集数据 (match 两臂都 break, 1ms 忙等窗已无必要)
-        let avail = loop {
-            match rx.available() {
-                Ok(n) => break n,
-                Err(e) => {
-                    error!("RX available 失败: {:?}, 重启采集", e);
-                    drop(rx); // 先释放旧借用, 再重启采集
-                    rx = match board.capture.start() {
-                        Ok(t) => t,
-                        Err(e) => {
-                            error!("采集重启失败: {:?}", e);
-                            esp_hal::system::software_reset()
-                        },
-                    };
-                    break 0;
-                },
-            }
+        // 等待采集数据 (两臂都返回, 无需 loop)
+        let avail = match rx.available() {
+            Ok(n) => n,
+            Err(e) => {
+                error!("RX available 失败: {:?}, 重启采集", e);
+                drop(rx); // 先释放旧借用, 再重启采集
+                rx = match board.capture.start() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!("采集重启失败: {:?}", e);
+                        esp_hal::system::software_reset()
+                    },
+                };
+                0
+            },
         };
 
         // 积压超过 pop 缓冲: 处理跟不上, 重启采集丢弃积压 (重新对齐)
@@ -148,7 +146,7 @@ async fn main(_spawner: Spawner) -> ! {
                 Ok(n) => {
                     let frames = n / 4;
                     blocks += 1;
-                    if blocks % 50 == 0 {
+                    if blocks.is_multiple_of(50) {
                         info!("心跳: 已处理 {} 块 (约 {}ms)", blocks, blocks * 64);
                     }
                     // 提取 MIC1 (左槽) → 增益
