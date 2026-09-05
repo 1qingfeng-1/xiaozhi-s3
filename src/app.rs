@@ -14,7 +14,7 @@ use esp_hal::{Blocking, dma::DmaTransferRxCircular, i2s::master::I2sRx};
 
 use defmt::{error, info, warn};
 
-use xiaozhi_core::audio::capture::{apply_gain_percent, extract_slot};
+use xiaozhi_core::audio::capture::{apply_gain_percent, extract_slot, level_stats};
 use xiaozhi_core::audio::wake::{
     VadWakeDetector, WakeEngine, WakeEvent, WakePolicy, WakePolicyConfig,
 };
@@ -313,9 +313,14 @@ pub async fn run(
     } = args;
 
     let mut sm = DialogSm::new();
+    // 开机预热 1s: codec/DMA 上电瞬态 (含 DC 漂移) 可能越过 VAD 阈值,
+    // 曾致开机假唤醒 → 卡死 (见 ROADMAP M8); 与 VAD 去 DC 双保险。
     let mut wake = WakeEngine::new(
         VadWakeDetector::new(VAD_THRESHOLD),
-        WakePolicy::new(WakePolicyConfig::default()),
+        WakePolicy::new(WakePolicyConfig {
+            warmup_ms: 1_000,
+            ..Default::default()
+        }),
     );
     let mut encoder: Option<OpusEncoder> = None;
     let mut decoder: Option<OpusDecoder> = None;
@@ -330,6 +335,7 @@ pub async fn run(
     let mut state_since_ms = 0u64;
     let mut battery_last_read = 0u64;
     let mut uplink_frames: u64 = 0;
+    let mut last_level_log_ms: u64 = 0;
     let mut pending: heapless::Vec<(Action, ListenMode), 8> = heapless::Vec::new();
 
     info!("=== 主循环启动: 待机监听 (说话唤醒 / 按住 BOOT 对讲) ===");
@@ -473,12 +479,20 @@ pub async fn run(
                 },
             };
             let ns = extract_slot(&pop_buf[..(n / 4) * 4], 2, 0, mono_buf);
-            apply_gain_percent(&mut mono_buf[..ns], GAIN_PERCENT);
             match sm.state() {
+                // VAD 必须在原始电平域 (硬件增益后、无软件增益, 对齐 C++ 参考):
+                // 若在 800% 增益后跑, 阈值 800 等效原始 ~100, 环境噪声即误触发
                 DialogState::Idle => {
+                    // 1Hz 电平诊断 (原始域): 阈值调参/假唤醒排查
+                    if now_ms.saturating_sub(last_level_log_ms) >= 1_000 {
+                        last_level_log_ms = now_ms;
+                        let (mean, rms) = level_stats(&mono_buf[..ns]);
+                        info!("待机电平: mean={} rms={}", mean, rms);
+                    }
                     triggered |= wake.feed(&mono_buf[..ns], now_ms) == WakeEvent::Triggered;
                 },
                 DialogState::Listening => {
+                    apply_gain_percent(&mut mono_buf[..ns], GAIN_PERCENT);
                     if let Some(encoder) = encoder.as_mut() {
                         let mut src = &mono_buf[..ns];
                         while !src.is_empty() {
@@ -616,7 +630,8 @@ fn dispatch(
             },
         }
     }
-    info!("状态: {}", state_label(state));
+    // 打印触发事件, 便于确认唤醒来源 (VAD 唤醒 vs 按键 vs 会话生命周期)
+    info!("状态: {} (事件: {})", state_label(state), event_label(ev));
 }
 
 fn state_label(state: DialogState) -> &'static str {
@@ -626,6 +641,18 @@ fn state_label(state: DialogState) -> &'static str {
         DialogState::Listening => "聆听",
         DialogState::WaitingReply => "等回复",
         DialogState::Speaking => "播报",
+    }
+}
+
+fn event_label(ev: DialogEvent) -> &'static str {
+    match ev {
+        DialogEvent::WakeTriggered => "唤醒触发",
+        DialogEvent::ManualListenStart => "按住BOOT",
+        DialogEvent::ManualListenStop => "松开BOOT",
+        DialogEvent::SessionReady => "会话就绪",
+        DialogEvent::TtsStart => "播报开始",
+        DialogEvent::TtsStop => "播报结束",
+        DialogEvent::SessionClosed => "会话关闭",
     }
 }
 

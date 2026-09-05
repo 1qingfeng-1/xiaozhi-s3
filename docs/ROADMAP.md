@@ -44,7 +44,7 @@ M1 音频通路 ── M2 WiFi/配网 ── M4.1 WS 协议 ── M4.2 opus 全
 
 | # | 项 | 预期现象 | 类型 |
 |---|---|---|---|
-| 1 | 开机自启 | 上电 → 读 NVS 凭据 → STA 连 WiFi → 连 `:8000` 建 WS 会话 → hello 握手成功 | 自动 |
+| 1 | 开机自启 | 上电 → 读 NVS 凭据 → STA 连 WiFi → 进入待机监听 (Idle)，**不自动连服务器**（WS 会话在唤醒时才建，per-conversation）；VAD 在原始电平域 + 1s 预热期，开机无假唤醒 | 自动 |
 | 2 | 声音唤醒 (VAD) | 待机说话 → beep + 快呼吸灯 → 自动建连 → 进入 Listening | 需说话 |
 | 3 | 对话闭环 | Listening 上行 opus → WaitingReply → TTS 下行播报 (Speaking) → 回 Idle；无应答 10s 超时回 Idle | 需说话 |
 | 4 | 打断 (barge-in) | Speaking 中按 BOOT → `tts abort` → 回 Listening；验证 Manual 模式标记 (post-transition 读) | 需按键+说话 |
