@@ -1,6 +1,9 @@
 //! OTA 检查 (网络层): GET :8003/xiaozhi/ota/ → 清单解析 → 版本比较
 //!
-//! 下载/烧写需要分区表改造 (双 app + otadata), 见 ROADMAP M7;
+//! 开机由 [`check_task`] 后台任务触发一次 (独立任务, 不阻塞会话/主循环启动;
+//! 服务器 :8003 不可达时 connect 自行超时, 不影响其余逻辑)。结果经 defmt 打印
+//! (已是最新 / 有新版本 / 检查失败)。
+//! 下载/烧写需分区表改造 (双 app + otadata), 见 ROADMAP M9;
 //! 本模块当前只做检查与上报 (与 C++ ota.cc 的检查阶段对齐)。
 
 use embassy_net::{Ipv4Address, Stack, tcp::TcpSocket};
@@ -72,6 +75,18 @@ pub async fn check(stack: Stack<'static>, server: Ipv4Address) -> Option<UpdateR
         latest_version: latest,
         update_available,
     })
+}
+
+/// 后台任务: 开机 OTA 检查
+///
+/// `Stack` 是 `Copy` (embassy-net), 传入即复制一份, 与 `session_task` 各持
+/// 一份互不干扰。独立任务跑 connect/读应答: 服务器可达时 <1s 打印版本比较
+/// 结果; 不可达时 connect 自行超时, 不阻塞会话/主循环。
+#[embassy_executor::task]
+pub async fn check_task(stack: Stack<'static>, server: Ipv4Address) {
+    if check(stack, server).await.is_none() {
+        warn!("OTA 检查失败 (服务器 :8003 不可达或响应异常)");
+    }
 }
 
 /// 逐字节 push 进 resp (容量满即停)

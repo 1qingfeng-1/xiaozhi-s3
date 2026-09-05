@@ -128,6 +128,11 @@ async fn main(spawner: Spawner) -> ! {
     };
     info!("设备 ID: {}", mac.as_str());
 
+    // 开机 OTA 检查 (后台任务, 不阻塞会话/主循环; 成功时打印版本比较结果,
+    // Stack 是 Copy, 与 session_task 各持一份)
+    let ota_token = xiaozhi_s3::ota_check::check_task(stack, server).unwrap();
+    spawner.spawn(ota_token);
+
     // 会话常驻缓冲 (帧长/常量与 app.rs 对齐: 960 样本 @16kHz 60ms)
     let pop_buf = xiaozhi_s3::mk_static!([u8; POP_BUF_SIZE], [0u8; POP_BUF_SIZE]);
     let mono_buf = xiaozhi_s3::mk_static!([i16; POP_BUF_SIZE / 4], [0i16; POP_BUF_SIZE / 4]);
