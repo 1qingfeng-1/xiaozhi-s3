@@ -427,9 +427,14 @@ pub async fn run(
         // 会话期间频繁读 ADC 干扰射频 — 曾崩 pm_on_beacon_rx)
         if sm.state() == DialogState::Idle && now_ms - battery_last_read >= 10_000 {
             battery_last_read = now_ms;
-            BATTERY_PCT.store(
-                battery.reported_percentage(power.status()).unwrap_or(0),
-                core::sync::atomic::Ordering::Relaxed,
+            let pct = battery.reported_percentage(power.status()).unwrap_or(0);
+            BATTERY_PCT.store(pct, core::sync::atomic::Ordering::Relaxed);
+            // 10s 一次诊断 (M8 项 9 验收): 电量 + 充电态, 确认不再崩 pm_on_beacon_rx
+            let charging = matches!(power.status(), xiaozhi_core::board::PowerStatus::Charging);
+            info!(
+                "电量: {}% (充电: {})",
+                pct,
+                if charging { "是" } else { "否" }
             );
         }
 
