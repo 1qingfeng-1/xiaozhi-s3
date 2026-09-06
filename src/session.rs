@@ -23,8 +23,9 @@ pub const LISTEN_START_AUTO: &str = "{\"type\":\"listen\",\"state\":\"start\",\"
 pub const LISTEN_STOP: &str = "{\"type\":\"listen\",\"state\":\"stop\"}";
 pub const TTS_ABORT: &str = "{\"type\":\"tts\",\"state\":\"abort\"}";
 
-/// hello 消息 (version 1; audio_params 与上行编码器一致)
-pub const HELLO: &str = "{\"type\":\"hello\",\"version\":1,\"features\":{},\
+/// hello 消息 (version 1; `features.mcp` 宣告 MCP 设备控制, 服务器随后下发
+/// initialize/tools_list 握手; audio_params 与上行编码器一致)
+pub const HELLO: &str = "{\"type\":\"hello\",\"version\":1,\"features\":{\"mcp\":true},\
   \"transport\":\"websocket\",\"audio_params\":{\"format\":\"opus\",\
   \"sample_rate\":16000,\"channels\":1,\"frame_duration\":60}}";
 

@@ -130,7 +130,7 @@ async fn main(spawner: Spawner) -> ! {
 
     // 开机 OTA 检查 (后台任务, 不阻塞会话/主循环; 成功时打印版本比较结果,
     // Stack 是 Copy, 与 session_task 各持一份)
-    let ota_token = xiaozhi_s3::ota_check::check_task(stack, server).unwrap();
+    let ota_token = xiaozhi_s3::ota_check::check_task(stack, server, mac.clone()).unwrap();
     spawner.spawn(ota_token);
 
     // 会话常驻缓冲 (帧长/常量与 app.rs 对齐: 960 样本 @16kHz 60ms)

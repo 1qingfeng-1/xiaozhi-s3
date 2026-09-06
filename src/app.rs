@@ -241,7 +241,22 @@ pub async fn session_task(args: SessionArgs) {
                                     info!("服务器: tts stop");
                                     channels.event.try_send(SessionEvent::TtsStop).ok();
                                 },
-                                _ => info!("服务器: {}", text),
+                                _ => {
+                                    // MCP 帧 (type=mcp): 解析并回送 initialize/tools_list/tools_call 应答
+                                    if session::json_str_field(text, "type") == Some("mcp") {
+                                        let volume =
+                                            VOLUME_PCT.load(core::sync::atomic::Ordering::Relaxed);
+                                        if let Some(resp) = mcp_handle(text, volume, channels) {
+                                            info!("MCP 应答: {}", resp.as_str());
+                                            if ws.send_text(resp.as_bytes()).await.is_err() {
+                                                connected = false;
+                                                channels.event.try_send(SessionEvent::Closed).ok();
+                                            }
+                                        }
+                                    } else {
+                                        info!("服务器: {}", text);
+                                    }
+                                },
                             }
                         },
                         2 => {
@@ -663,8 +678,8 @@ fn event_label(ev: DialogEvent) -> &'static str {
 
 /// MCP 请求应答 (会话任务内; 设备状态经原子量读取, set_volume 经命令下发)
 ///
-/// MCP 当前未接线 (hello 发 `features:{}`, 见 AGENTS.md): 接通前保留, 显式 allow。
-#[allow(dead_code)]
+/// 由 [`session_task`] 在收到服务器 `type=mcp` 文本帧时调用, 回送
+/// initialize/tools_list/tools_call 应答 (见 session.rs HELLO 的 `features.mcp`)。
 fn mcp_handle(text: &str, volume: u8, channels: &Channels) -> Option<heapless::String<1024>> {
     use xiaozhi_core::mcp;
     let Some(req) = mcp::parse_request(text) else {
@@ -702,15 +717,4 @@ fn mcp_handle(text: &str, volume: u8, channels: &Channels) -> Option<heapless::S
         },
         mcp::McpMethod::Unknown(_) => mcp::error_response(req.id, "Method not implemented"),
     })
-}
-
-/// set_volume 经命令通道下发音频主循环 (I2C 写在音频任务上下文执行)
-///
-/// MCP 未接线, 保留待启用 (见 AGENTS.md)。
-#[allow(dead_code)]
-fn channels_command_set_volume(v: u8) {
-    // 由调用处 (session_task) 的 channels 静态引用发送;
-    // 这里经全局静态通道句柄不可行, 故以命令事件转发 — 见 session_task 内
-    // SessionCommand::SetVolume 分支。
-    let _ = v;
 }
