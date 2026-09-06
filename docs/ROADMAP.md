@@ -140,20 +140,30 @@ M1 音频通路 ── M2 WiFi/配网 ── M4.1 WS 协议 ── M4.2 opus 全
 **目标**：把 M7 中「代码就绪但未接线 / 未真机验证」的能力补齐到端到端可用。
 各项独立，可按风险/价值取舍，不阻塞 M8 稳定化。
 
-1. **MCP 设备控制**（hello 宣告 `mcp:true` + JSON-RPC over WS）：接通
-   `app::mcp_handle`。已知阻塞（commit 27359e0）：宣告 `mcp:true` 后服务器等
-   `initialize` 应答期间停读 TCP 流 → WiFi TX 池耗尽（`esp_wifi_internal_tx
-   NO_MEM(257)`）。**对策**：会话任务内异步构造并下发 `initialize`/`tools/list`
-   应答（不阻塞 TCP 读循环）；对齐 C++ `mcp_server.cc`。验收：语音「把音量调到
-   50」→ 设备 set_volume 生效。
-2. **OTA 下载/烧写**（现在只有版本检查）：双 app 分区（ota_0/ota_1）+ otadata
-   改造；下载固件 → 校验 → 写 ota_1 → 切 otadata → 重启。分区表一次性布好。
-   对齐 C++ `ota.cc`。验收：服务器发新版 → 设备自动下载重启到新版。
-3. **AEC 全双工 barge-in（风险最高，需 spike 前置）**：ESP-SR AFE（AEC/NS/AGC）
-   与 ES7210 TDM 参考通道，支持**说话打断 TTS**（真正的 barge-in，非按钮）。
-   风险同 wakenet（AFE 经 FreeRTOS 任务/函数指针，可能撞 MMU block 1）。
-   **spike 先验**：最小 AFE 链路能否在 esp-hal 下跑通。失败则 v1.0 保留按钮
-   打断 + VAD 唤醒，AEC 归入 v1.1。
+**现状（2026-09-06 真机验证）**：MCP 接通并验证；OTA「查询 + 下载 + e9 头校验」
+接通并验证（服务器发新版 → 设备取回并校验通过，880,176B 无损）；AEC 经评估
+**推迟 v1.1**。OTA「写 flash + 切 otadata」需双 app 分区表改造，作为高风险后续
+步骤（M10 稳定性/产品化一并做），未并入本里程碑。
+
+1. **MCP 设备控制（已接通并验证 ✅）**：hello 宣告 `mcp:true`，会话任务内
+   分发 `initialize`/`tools/list`/`tools/call` 到 `app::mcp_handle` 并即时回包。
+   原 NO_MEM 阻塞（commit 27359e0）由「会话内异步应答」规避，且当前 xiaozhi-server
+   用非阻塞 `create_task` 读循环，实测不再复现。真机：服务器日志确认 `mcp=true` +
+   工具数 2（get_device_status / set_volume）。
+2. **OTA 下载/烧写（下载+校验已接通并验证 ✅；写 flash+切 otadata 待分区表）**：
+   `check` 改为 **POST**（`Device-Id`/`Client-Id` 头 + JSON body `board.type`
+   板型 + `application.version` 当前版本；GET 只回健康串拿不到清单）→ 清单解析 →
+   版本比较。有新版时 `download_validate` 流式 GET 固件 url（前 128B 进
+   `validate_image_header` 校验 e9 magic + app_desc magic → 提取版本，其余只计数
+   不落 RAM）。真机：服务器 `data/bin/gezipai_0.2.0.bin` → 设备日志「有新版本
+   0.2.0 → 下载校验通过 880,176B」。写 ota_1 + 切 otadata + 重启需双 app 分区
+   （esp-hal 无 `esp_ota` 助手，需手动 erase/write + otadata），砖片风险、串口可
+   恢复，列 M10。
+3. **AEC 全双工 barge-in（推迟 v1.1）**：需 ESP-SR AFE（AEC/NS/AGC）+ ES7210 TDM
+   参考通道。评估结论：① 当前 `vendor/esp-sr` 子集只有 wakenet，无 AFE；② wakenet
+   spike 已证 ESP-SR NN 推理路径在 esp-hal 下必撞 MMU block 1（`InstrProhibited @
+   0x1FFE2000`，esp-hal 只映射 block 0），AFE 同款推理路径预期同样失败。故 v1.0
+   保留按钮 barge-in + VAD 唤醒，AEC 归 v1.1（需先解 MMU block 1 再引入 AFE）。
 
 ## M10 产品化收尾与 v1.0 发布
 

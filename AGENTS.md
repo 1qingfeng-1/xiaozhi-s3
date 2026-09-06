@@ -98,10 +98,12 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量/时钟/codec 序
 - BOOT 键**开机按住** = 清除 WiFi 凭据重回配网；配网 = SoftAP `xiaozhi-gezipai` +
   表单页 `http://192.168.4.1:8080/`，凭据+服务器 IP 存 NVS 分区末扇区（magic `ZOIX`）。
 - 对话状态机（`xiaozhi_core::dialog`）：`WaitingReply` 10s 无服务器消息 → 结束会话回待机。
-- **MCP 目前刻意未启用**：hello 发 `features:{}`。若宣告 `mcp:true`，服务器会等
-  `initialize` 应答、期间停读 TCP 流 → WiFi TX 缓冲池耗尽（`esp_wifi_internal_tx NO_MEM(257)` 连刷，
-  见 commit 27359e0）。`app::mcp_handle` 是已写好但未接线的应答构造（当前 dead code，
-  故 `clippy -D warnings` 在本工作区会报）；接通前勿删，接通后需真机验证。
+- **MCP 已接通并真机验证**（M9，2026-09-06）：hello 发 `features:{"mcp":true}`，
+  会话任务内分发 `initialize`/`tools/list`/`tools/call` 到 `app::mcp_handle` 并即时回包
+  （工具：`get_device_status`/`set_volume`）。原 NO_MEM 阻塞（commit 27359e0，宣告
+  `mcp:true` 后服务器等 `initialize` 期间停读 TCP 流 → `esp_wifi_internal_tx
+  NO_MEM(257)` 连刷）由「会话内异步应答」规避，且当前 xiaozhi-server 用非阻塞
+  `create_task` 读循环，实测不再复现。
 - 音量：ES8311 REG32 是 **dB 线性映射**（0%= -95.5dB → 100%= +32dB），35% ≈ -51dB 基本不可闻
   （audio-loopback 回放音量压 35% 防啸叫）；麦克风数字电平仅 1~5% 满幅，回放/上行前
   软件增益 800%（+18dB）。
@@ -116,6 +118,10 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量/时钟/codec 序
   block 0，非垫片可修。出路（写 MMU block 1 页表 / 换 esp-sr 2.x+esp-dl / 继续 VAD）
   见 `vendor/esp-sr/README.md`。**VAD 声音唤醒（`VadWakeDetector` + `WakePolicy`）
   是默认且已验证的路径**，两层共用 `WakeWordSource` trait，切换约 5 行。
+- **AEC 全双工 barge-in 推迟 v1.1**：需 ESP-SR AFE（AEC/NS/AGC）+ ES7210 TDM 参考
+  通道，但 ① `vendor/esp-sr` 子集只有 wakenet、无 AFE；② 同款 NN 推理路径预期撞
+  同款 MMU block 1（见上 wakenet 条目）。故 v1.0 保留按钮打断 + VAD 唤醒；做 AEC
+  前先解 MMU block 1（写 block 1 页表 / 换 esp-sr 2.x+esp-dl）再引入 AFE。
 - `vendor/libopus` 是 xiph/opus v1.6.1 裁剪副本（fixed-point，无 float/dnn/x86/ARM），
   `build.rs` 用 xtensa GCC 交叉编译（探测：`CC_xtensa_esp32s3_none_elf`/`CC` → PATH →
   espup 默认目录）；更新以官方 `*_sources.mk` 清单为准。BSD-3（`vendor/libopus/COPYING`）。
