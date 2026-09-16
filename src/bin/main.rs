@@ -128,10 +128,30 @@ async fn main(spawner: Spawner) -> ! {
     };
     info!("设备 ID: {}", mac.as_str());
 
-    // 开机 OTA 检查 (后台任务, 不阻塞会话/主循环; 成功时打印版本比较结果,
-    // Stack 是 Copy, 与 session_task 各持一份)
-    let ota_token = xiaozhi_s3::ota_check::check_task(stack, server, mac.clone()).unwrap();
-    spawner.spawn(ota_token);
+    // 开机 OTA: 检查 → (有新版) 下载 + 扇区级烧写 + 切 otadata → 重启
+    // 在采集启动前完成 (main 直线路径), 无 I2S DMA 冲突
+    if let Some(report) = xiaozhi_s3::ota_check::check(stack, server, &mac).await {
+        if report.update_available {
+            info!(
+                "OTA: 发现新版本 {}, 下载并烧写...",
+                report.latest_version.as_str()
+            );
+            match xiaozhi_s3::ota_check::download_and_flash(
+                stack,
+                server,
+                report.url.as_str(),
+                flash,
+            )
+            .await
+            {
+                Some(v) => {
+                    info!("OTA: 烧写成功 ({}), 重启...", v.as_str());
+                    esp_hal::system::software_reset();
+                },
+                None => error!("OTA: 烧写失败, 继续使用当前版本"),
+            }
+        }
+    }
 
     // 会话常驻缓冲 (帧长/常量与 app.rs 对齐: 960 样本 @16kHz 60ms)
     let pop_buf = xiaozhi_s3::mk_static!([u8; POP_BUF_SIZE], [0u8; POP_BUF_SIZE]);

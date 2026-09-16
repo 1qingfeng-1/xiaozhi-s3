@@ -1,17 +1,17 @@
-//! OTA 检查 + 下载校验 (网络层): POST :8003/xiaozhi/ota/ (Device-Id + JSON body
-//! 板型/版本) → 清单解析 → 版本比较;
-//! 有新版时再 GET 固件 url → 流式读 → e9 头校验 (magic + app_desc) → 上报。
+//! OTA 检查 + 下载 + 烧写 (网络/flash 层)
 //!
-//! 开机由 [`check_task`] 后台任务触发一次 (独立任务, 不阻塞会话/主循环启动;
-//! 服务器不可达时 connect 自行超时, 不影响其余逻辑)。
-//! 本里程碑只做**下载 + 校验** (不写 flash): 验证设备能从服务器取回并校验
-//! 新固件镜像 (对齐 C++ ota.cc 的下载/校验阶段)。烧写 + 切 otadata 需分区表
-//! 改造 (双 app + otadata, esp-hal 无 esp_ota 助手), 见 ROADMAP M9, 属高风险
-//! (可能砖片, 串口可恢复), 作为后续独立步骤。
+//! 开机由 [`check`] 同步调用 (main 直线路径, 采集未启动, 无 DMA 冲突):
+//! POST :8003/xiaozhi/ota/ (Device-Id + JSON body 板型/版本) → 清单解析 →
+//! 版本比较; 有新版时 [`download_and_flash`] GET 固件 → 流式 4KB 扇区
+//! 擦写 → 写 otadata → 重启。对齐 C++ ota.cc 的下载/校验/烧写全流程。
+//!
+//! [`check_task`] 保留为后台任务 (M9 兼容): 独立任务, 不阻塞会话/主循环。
 
 use embassy_net::{Ipv4Address, Stack, tcp::TcpSocket};
+use embedded_storage::{ReadStorage as _, Storage as _};
 
 use defmt::{error, info, warn};
+use esp_storage::FlashStorage;
 
 use xiaozhi_core::ota;
 
@@ -139,6 +139,166 @@ pub async fn download_validate(
     write_all(&mut socket, request.as_bytes()).await.ok()?;
 
     read_and_validate(&mut socket).await
+}
+
+// ===== M10: 下载 + 扇区级烧写 + otadata 切换 =====
+
+/// ota_0 / ota_1 / otadata 分区基址 (与 partitions.csv 一致)
+const OTA_0_BASE: u32 = 0x20_000;
+const OTA_1_BASE: u32 = 0x41_0000;
+const OTADATA_BASE: u32 = 0x10_000;
+const SECTOR: u32 = 4096;
+
+/// 下载固件 → 4KB 扇区擦写目标槽 → 写 otadata → 返回新版本串
+///
+/// 调用时机: `main()` 直线路径 (采集未启动, 无 I2S DMA 冲突)。
+/// 成功时调用方负责 `esp_hal::system::software_reset()`。
+/// 失败 (下载/校验/烧写) 返回 `None`, 设备继续用当前固件。
+pub async fn download_and_flash(
+    stack: Stack<'static>,
+    server: Ipv4Address,
+    url: &str,
+    flash: &mut FlashStorage<'_>,
+) -> Option<heapless::String<32>> {
+    // 1. 读 otadata → 确定目标槽 (乒乓)
+    let mut ota_buf = [0xFFu8; ota::OTADATA_PARTITION_SIZE as usize];
+    flash.read(OTADATA_BASE, &mut ota_buf).ok()?;
+    let entries = ota::read_otadata(&ota_buf);
+    let (new_seq, target_slot) = ota::next_write(&entries, 2);
+    let target_base = if target_slot == 0 {
+        OTA_0_BASE
+    } else {
+        OTA_1_BASE
+    };
+    let target_name = if target_slot == 0 { "ota_0" } else { "ota_1" };
+    info!("OTA: 烧写 → {} (seq {})", target_name, new_seq);
+
+    // 2. HTTP GET
+    let (port, path) = parse_url(url);
+    let rx = mk_static!([u8; 4096], [0u8; 4096]);
+    let tx = mk_static!([u8; 1024], [0u8; 1024]);
+    let mut socket = TcpSocket::new(stack, rx, tx);
+    socket.connect((server, port)).await.ok()?;
+    let req = alloc::format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        path,
+        server
+    );
+    write_all(&mut socket, req.as_bytes()).await.ok()?;
+
+    // 3. 读 HTTP 头
+    let mut head_buf = [0u8; 1024];
+    let mut head_len = 0usize;
+    let mut body_off: Option<usize> = None;
+    loop {
+        let n = match socket.read(&mut head_buf[head_len..]).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => n,
+        };
+        head_len += n;
+        if let Some(pos) = head_buf[..head_len]
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
+            body_off = Some(pos + 4);
+            break;
+        }
+        if head_len >= head_buf.len() {
+            return None;
+        }
+    }
+    let body_off = body_off?;
+    let head_str = core::str::from_utf8(&head_buf[..head_len]).unwrap_or("");
+    let expected = parse_content_length(head_str).unwrap_or(0);
+
+    // 4. 读前 128B (e9 头) 校验
+    let mut img_head = [0u8; 128];
+    let mut n = 0usize;
+    let rem = head_len - body_off;
+    let cp = rem.min(128);
+    img_head[..cp].copy_from_slice(&head_buf[body_off..body_off + cp]);
+    n = cp;
+    while n < 128 {
+        let r = match socket.read(&mut img_head[n..]).await {
+            Ok(0) | Err(_) => return None,
+            Ok(r) => r,
+        };
+        n += r;
+    }
+    let Some(info) = ota::validate_image_header(&img_head) else {
+        warn!("OTA: 镜像头校验失败 (magic/app_desc)");
+        return None;
+    };
+    let mut version = heapless::String::<32>::new();
+    let _ = version.push_str(info.version);
+    info!("OTA: 镜像 {} , 开始烧写...", version.as_str());
+
+    // 5. 流式 4KB 扇区写入
+    let mut sector_buf = [0u8; SECTOR as usize];
+    sector_buf[..128].copy_from_slice(&img_head);
+    let mut fill = 128usize;
+    let mut written = 0u32;
+    let mut total = 128u32;
+    let mut last_log = 0u32;
+
+    loop {
+        if fill < SECTOR as usize {
+            let r = match socket.read(&mut sector_buf[fill..]).await {
+                Ok(0) | Err(_) => break,
+                Ok(r) => r,
+            };
+            fill += r;
+        }
+        while fill >= SECTOR as usize {
+            let abs = target_base + written * SECTOR;
+            if let Err(e) = flash.write(abs, &sector_buf[..SECTOR as usize]) {
+                error!("OTA: 扇区写失败 @0x{:05X}: {:?}", abs, e);
+                return None;
+            }
+            written += 1;
+            total += SECTOR;
+            sector_buf.copy_within(SECTOR as usize..fill, 0);
+            fill -= SECTOR as usize;
+            if total - last_log >= 64 * 1024 {
+                let pct = if expected > 0 {
+                    (total * 100) / expected
+                } else {
+                    0
+                };
+                info!("OTA: {}% ({}/{}KB)", pct, total / 1024, expected / 1024);
+                last_log = total;
+            }
+        }
+    }
+    if fill > 0 {
+        let mut last = [0xFFu8; SECTOR as usize];
+        last[..fill].copy_from_slice(&sector_buf[..fill]);
+        let abs = target_base + written * SECTOR;
+        if let Err(e) = flash.write(abs, &last) {
+            error!("OTA: 末扇区写失败 @0x{:05X}: {:?}", abs, e);
+            return None;
+        }
+        written += 1;
+        total += fill as u32;
+    }
+    socket.abort();
+
+    // 6. 写 otadata 条目
+    let entry = ota::OtaDataEntry::new(new_seq, version.as_str(), ota::OtaImageState::Valid);
+    let entry_bytes = entry.to_bytes();
+    let entry_abs = OTADATA_BASE + ota::otadata_entry_offset(target_slot);
+    if let Err(e) = flash.write(entry_abs, &entry_bytes) {
+        error!("OTA: otadata 写失败 @0x{:05X}: {:?}", entry_abs, e);
+        return None;
+    }
+
+    info!(
+        "OTA: 完成 ({}KB, {} 扇区), 重启进入 {}...",
+        total / 1024,
+        written,
+        target_name
+    );
+    Some(version)
 }
 
 /// 流式读 HTTP 响应: 先读头 (到 `\r\n\r\n`, 取 Content-Length), 再读 body;
