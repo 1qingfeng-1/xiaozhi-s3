@@ -87,6 +87,10 @@ async fn main(spawner: Spawner) -> ! {
 
     let flash = xiaozhi_s3::mk_static!(FlashStorage<'static>, FlashStorage::new(p.FLASH));
 
+    // 音量恢复 (NVS 0xD000; 无记录 → 默认 60)
+    let saved_vol = xiaozhi_s3::wifi::store::load_volume(flash);
+    xiaozhi_s3::app::VOLUME_PCT.store(saved_vol, core::sync::atomic::Ordering::Relaxed);
+
     // BOOT 键开机按住: 清除凭据强制重回配网
     if board.buttons.boot_pressed() {
         info!("BOOT 按下: 清除 WiFi 配置...");
@@ -106,7 +110,7 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     // WiFi: 有凭据连 STA; 无凭据/连接失败 → 配网模式 (SoftAP 表单, 保存后重启)
-    let (stack, server, _controller, mac) = match wifi::boot_mode(flash) {
+    let (stack, server, mut _controller, mac) = match wifi::boot_mode(flash) {
         Mode::Station(config) => match wifi::connect_station(&spawner, &config, p.WIFI).await {
             Ok((stack, controller, mac)) => {
                 let server = match config.server.as_str().parse() {
@@ -126,6 +130,9 @@ async fn main(spawner: Spawner) -> ! {
         },
         Mode::Provision => wifi::provision::run(spawner, p.WIFI, flash).await,
     };
+    // WiFi 射频省电 (beacon 间 modem sleep, 降待机功耗; 不影响 TCP 吞吐)
+    use esp_radio::wifi::PowerSaveMode;
+    let _ = _controller.set_power_saving(PowerSaveMode::Minimum);
     info!("设备 ID: {}", mac.as_str());
 
     // 开机 OTA: 检查 → (有新版) 下载 + 扇区级烧写 + 切 otadata → 重启
@@ -201,6 +208,7 @@ async fn main(spawner: Spawner) -> ! {
                 power: &mut board.power,
                 cap: &mut cap,
                 channels,
+                flash,
             },
             &mut pop_buf[..],
             &mut mono_buf[..],

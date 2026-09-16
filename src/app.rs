@@ -302,6 +302,7 @@ pub struct AppArgs<'a, 'b> {
     pub power: &'a mut Power,
     pub cap: &'a mut DmaTransferRxCircular<'b, I2sRx<'static, Blocking>>,
     pub channels: &'a Channels,
+    pub flash: &'a mut esp_storage::FlashStorage<'static>,
 }
 
 /// 主事件循环 (音频侧)
@@ -325,6 +326,7 @@ pub async fn run(
         power,
         cap,
         channels,
+        flash,
     } = args;
 
     let mut sm = DialogSm::new();
@@ -422,6 +424,8 @@ pub async fn run(
             let cur = audio.volume() as i16;
             let next = (cur + if vol_up { 5 } else { -5 }).clamp(0, 100) as u8;
             audio.set_volume(next);
+            VOLUME_PCT.store(next, core::sync::atomic::Ordering::Relaxed);
+            crate::wifi::store::save_volume(flash, next);
             info!("音量: {}%", next);
         }
         vol_edge = vol_up || vol_down;
@@ -431,6 +435,7 @@ pub async fn run(
             let v = PENDING_VOLUME.swap(0, core::sync::atomic::Ordering::Relaxed);
             audio.set_volume(v);
             VOLUME_PCT.store(v, core::sync::atomic::Ordering::Relaxed);
+            crate::wifi::store::save_volume(flash, v);
             info!("MCP 音量: {}%", v);
         }
         // 充电状态: GPIO 实时 (不读 ADC, 与 WiFi PHY 无冲突)
@@ -451,6 +456,21 @@ pub async fn run(
                 pct,
                 if charging { "是" } else { "否" }
             );
+            // 堆水位诊断 (10s): 内部堆 128KB, >90% 告警 (防 opus/PSRAM 泄漏)
+            let hs = esp_alloc::HEAP.stats();
+            let used_pct = if hs.size > 0 {
+                hs.current_usage * 100 / hs.size
+            } else {
+                0
+            };
+            if used_pct > 90 {
+                warn!(
+                    "堆水位: {}% ({}KB/{}KB) — 接近耗尽",
+                    used_pct,
+                    hs.current_usage / 1024,
+                    hs.size / 1024
+                );
+            }
         }
 
         // ---- 4. 状态机动作 → 会话命令 (非阻塞) ----
@@ -578,7 +598,13 @@ pub async fn run(
             audio.play_block(silence_buf);
         }
         // 让出 CPU: 会话任务/网络任务需要被轮询才能推进连接与收发
-        embassy_time::Timer::after(embassy_time::Duration::from_millis(1)).await;
+        // Idle 时放宽到 10ms (降 CPU 唤醒频率, I2S 缓冲 512ms 容量足够)
+        let wait_ms = if sm.state() == DialogState::Idle {
+            10
+        } else {
+            1
+        };
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(wait_ms)).await;
 
         // ---- 9. 灯语 + 显示状态 ----
         let led = match sm.state() {

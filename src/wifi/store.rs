@@ -82,6 +82,26 @@ pub fn clear(flash: &mut FlashStorage<'_>) -> Result<(), &'static str> {
     NorFlash::erase(flash, SECTOR, SECTOR + SECTOR_SIZE).map_err(|_| "Flash 擦除失败")
 }
 
+/// 音量持久化 — NVS 分区独立扇区 (0xD000, 与凭据 0xE000 分离)
+const VOLUME_SECTOR: u32 = 0xD000;
+
+/// 保存音量 (0~100; 0xFF = 擦除态 → 默认 60)
+pub fn save_volume(flash: &mut FlashStorage<'_>, volume: u8) {
+    let mut buf = [0xFFu8; 4096];
+    buf[0] = volume.min(100);
+    let _ = NorFlash::erase(flash, VOLUME_SECTOR, VOLUME_SECTOR + 4096);
+    let _ = NorFlash::write(flash, VOLUME_SECTOR, &buf);
+}
+
+/// 读取音量 (无记录/擦除态返回默认 60)
+pub fn load_volume(flash: &mut FlashStorage<'_>) -> u8 {
+    let mut buf = [0u8; 1];
+    match flash.read(VOLUME_SECTOR, &mut buf) {
+        Ok(()) if buf[0] != 0xFF => buf[0].min(100),
+        _ => 60,
+    }
+}
+
 /// 启动自检: 写已知模式到备用扇区并读回, 验证存储层工作正常
 pub fn self_test(flash: &mut FlashStorage<'_>) -> bool {
     const TEST_SECTOR: u32 = 0x9000; // NVS 分区首扇区 (未使用)
