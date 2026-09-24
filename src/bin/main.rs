@@ -27,7 +27,7 @@ use esp_hal::{
 };
 use esp_storage::FlashStorage;
 
-use defmt::{error, info, warn};
+use defmt::{error, info};
 use esp_println as _;
 
 use xiaozhi_s3::app::{self, AppArgs, Channels};
@@ -138,49 +138,30 @@ async fn main(spawner: Spawner) -> ! {
     let _ = controller.set_power_saving(PowerSaveMode::Minimum);
     info!("设备 ID: {}", mac.as_str());
 
-    // 开机 OTA: 检查 → (有新版且未连续失败) 下载 + 扇区级烧写 + 切 otadata → 重启
-    // 在采集启动前完成 (main 直线路径), 无 I2S DMA 冲突
-    match xiaozhi_s3::ota_check::check(stack, server, &mac).await {
-        Some(report) if report.update_available => {
-            if xiaozhi_s3::ota_check::should_skip(flash, report.latest_version.as_str()) {
-                // 已在 should_skip 内告警
-            } else {
-                info!(
-                    "OTA: 发现新版本 {}, 下载并烧写...",
-                    report.latest_version.as_str()
-                );
-                match xiaozhi_s3::ota_check::download_and_flash(
-                    stack,
-                    server,
-                    report.url.as_str(),
-                    flash,
-                )
-                .await
-                {
-                    Some(v) => {
-                        info!("OTA: 烧写成功 ({}), 重启...", v.as_str());
-                        esp_hal::system::software_reset();
-                    },
-                    None => {
-                        error!("OTA: 烧写失败, 继续使用当前版本");
-                        xiaozhi_s3::ota_check::record_failure(
-                            flash,
-                            report.latest_version.as_str(),
-                        );
-                    },
-                }
-            }
-        },
-        Some(_) => {}, // 已是最新, check 内已打日志
-        None => warn!("OTA: 检查失败 (服务器不可达/超时/响应异常), 跳过本次升级"),
-    }
-    // controller 持有至 main 结束 (main 为 ! 不返回): 丢弃可能影响射频状态
+    // 开机 OTA: **独立任务** (勿内联 main — main future 膨胀会挤掉 opus 主栈)
+    // 采集未 start; flash 交出后等 done 再用; 成功路径任务内 reset
+    let ota_done = xiaozhi_s3::mk_static!(
+        Channel<embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, (), 1>,
+        Channel::new()
+    );
+    let ota_token = xiaozhi_s3::ota_check::boot_ota_task(
+        stack,
+        server,
+        mac.clone(),
+        xiaozhi_s3::ota_check::FlashPtr(flash as *mut _),
+        ota_done.sender(),
+    )
+    .unwrap();
+    spawner.spawn(ota_token);
+    ota_done.receiver().receive().await;
+    // flash 指针交还: OTA 任务已结束 (或已 reset), main 可继续用
 
     // 会话常驻缓冲 (帧长/常量与 app.rs 对齐: 960 样本 @16kHz 60ms)
-    let pop_buf = xiaozhi_s3::mk_static!([u8; POP_BUF_SIZE], [0u8; POP_BUF_SIZE]);
-    let mono_buf = xiaozhi_s3::mk_static!([i16; POP_BUF_SIZE / 4], [0i16; POP_BUF_SIZE / 4]);
-    let acc_buf = xiaozhi_s3::mk_static!([i16; 1920], [0i16; 1920]);
-    let silence_buf = xiaozhi_s3::mk_static!([u8; BLOCK_BYTES], [0u8; BLOCK_BYTES]);
+    // 堆分配而非 mk_static: 大数组进 bss 会把主栈压到 <87KB (opus SILK)
+    let pop_buf: &'static mut [u8] = alloc::vec![0u8; POP_BUF_SIZE].leak();
+    let mono_buf: &'static mut [i16] = alloc::vec![0i16; POP_BUF_SIZE / 4].leak();
+    let acc_buf: &'static mut [i16] = alloc::vec![0i16; 1920].leak();
+    let silence_buf: &'static mut [u8] = alloc::vec![0u8; BLOCK_BYTES].leak();
 
     // wakenet 自检 (feature `wakenet`): 强制链接 esp-sr 符号闭包
     #[cfg(feature = "wakenet")]

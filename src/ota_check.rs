@@ -1,12 +1,12 @@
 //! OTA 检查 + 下载 + 烧写 (网络/flash 层)
 //!
-//! 开机由 [`check`] 同步调用 (main 直线路径, 采集未启动, 无 DMA 冲突):
-//! POST :8003/xiaozhi/ota/ (Device-Id + JSON body 板型/版本) → 清单解析 →
-//! 版本比较; 有新版时 [`download_and_flash`] GET 固件 → 流式 4KB 扇区
-//! 擦写 → 写 otadata → 重启。对齐 C++ ota.cc 的下载/校验/烧写全流程。
+//! 开机由 [`boot_ota_task`] 独立任务执行 (勿内联 main — 会膨胀 main future
+//! .bss、压缩主栈, opus SILK ~87KB 编码会栈溢出):
+//! POST :8003/xiaozhi/ota/ → 版本比较; 有新版时下载 → 4KB 扇区擦写 →
+//! 写 otadata → 重启。对齐 C++ ota.cc 全流程。
 //!
-//! 防护: 分区大小上界 / HTTP 200 / Content-Length 完整性 / 整体超时 /
-//! 同版本连续失败退避 (NVS 0xC000)。
+//! 防护: 分区上界 / HTTP 200 / Content-Length 完整性 / 45s 超时 /
+//! 同版本失败≥3 次退避 (NVS 0xC000)。
 
 use embassy_net::{Ipv4Address, Stack, tcp::TcpSocket};
 use embassy_time::{Duration, with_timeout};
@@ -16,8 +16,6 @@ use defmt::{error, info, warn};
 use esp_storage::FlashStorage;
 
 use xiaozhi_core::ota;
-
-use crate::mk_static;
 
 /// 检查结果
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +49,52 @@ const OTA_FAIL_MAGIC: u32 = 0x4154_4F58; // 'XOTA' 小端
 /// 同版本连续失败达此次数后跳过 (跨重启生效)
 const OTA_FAIL_LIMIT: u8 = 3;
 
+type RawMutex = embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+
+/// FlashStorage 裸指针 (单核独占: main 交出后等 done 才再用)
+pub struct FlashPtr(pub *mut FlashStorage<'static>);
+// SAFETY: 交接协议 — main spawn 后 await done, 任务结束前 main 不碰 flash
+unsafe impl Send for FlashPtr {}
+
+/// 开机 OTA 独立任务: 检查 → (有新版) 下载烧写 → 成功 reset / 失败通知 main
+///
+/// 状态机在本任务 TaskStorage, **不进 main future** (否则 .bss 挤掉主栈)。
+#[embassy_executor::task]
+pub async fn boot_ota_task(
+    stack: Stack<'static>,
+    server: Ipv4Address,
+    mac: heapless::String<32>,
+    flash_ptr: FlashPtr,
+    done: embassy_sync::channel::Sender<'static, RawMutex, (), 1>,
+) {
+    let flash = unsafe { &mut *flash_ptr.0 };
+    match check(stack, server, &mac).await {
+        Some(report) if report.update_available => {
+            if should_skip(flash, report.latest_version.as_str()) {
+                // should_skip 内已告警
+            } else {
+                info!(
+                    "OTA: 发现新版本 {}, 下载并烧写...",
+                    report.latest_version.as_str()
+                );
+                match download_and_flash(stack, server, report.url.as_str(), flash).await {
+                    Some(v) => {
+                        info!("OTA: 烧写成功 ({}), 重启...", v.as_str());
+                        esp_hal::system::software_reset();
+                    },
+                    None => {
+                        error!("OTA: 烧写失败, 继续使用当前版本");
+                        record_failure(flash, report.latest_version.as_str());
+                    },
+                }
+            }
+        },
+        Some(_) => {}, // 已是最新
+        None => warn!("OTA: 检查失败 (服务器不可达/超时/响应异常), 跳过本次升级"),
+    }
+    let _ = done.try_send(());
+}
+
 /// 向服务器查询固件更新
 ///
 /// 对齐 C++ `ota.cc::CheckVersion`: **POST** 带 `Device-Id` 头 + JSON body。
@@ -65,8 +109,9 @@ async fn check_inner(
     server: Ipv4Address,
     mac: &str,
 ) -> Option<UpdateReport> {
-    let rx = mk_static!([u8; 1024], [0u8; 1024]);
-    let tx = mk_static!([u8; 512], [0u8; 512]);
+    // 大缓冲走堆泄漏: 勿用 mk_static (挤 .bss → 压缩主栈) 勿用栈 (挤 opus)
+    let rx: &'static mut [u8] = alloc::vec![0u8; 1024].leak();
+    let tx: &'static mut [u8] = alloc::vec![0u8; 512].leak();
     let mut socket = TcpSocket::new(stack, rx, tx);
     if socket.connect((server, 8003)).await.is_err() {
         warn!("OTA: TCP 连接失败");
@@ -90,12 +135,13 @@ async fn check_inner(
     );
     write_all(&mut socket, request.as_bytes()).await.ok()?;
 
-    let mut resp = heapless::String::<1024>::new();
+    let resp: &'static mut heapless::String<1024> =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(heapless::String::new()));
+    let mut read_buf = [0u8; 256];
     loop {
-        let mut buf = [0u8; 256];
-        match socket.read(&mut buf).await {
+        match socket.read(&mut read_buf).await {
             Ok(0) | Err(_) => break,
-            Ok(n) => push_bytes(&mut resp, &buf[..n]),
+            Ok(n) => push_bytes(resp, &read_buf[..n]),
         }
         if resp.len() >= resp.capacity() - 1 {
             break;
@@ -162,9 +208,17 @@ async fn download_and_flash_inner(
     flash: &mut FlashStorage<'_>,
 ) -> Option<heapless::String<32>> {
     // 1. 读 otadata → 确定目标槽 (乒乓)
-    let mut ota_buf = [0xFFu8; ota::OTADATA_PARTITION_SIZE as usize];
-    flash.read(OTADATA_BASE, &mut ota_buf).ok()?;
-    let entries = ota::read_otadata(&ota_buf);
+    // 只读两条 32B 条目: 勿用 8KB 静态缓冲 (挤占主任务栈 = RWDATA 剩余)
+    let mut e0 = [0u8; 32];
+    let mut e1 = [0u8; 32];
+    flash.read(OTADATA_BASE, &mut e0).ok()?;
+    flash
+        .read(OTADATA_BASE + ota::otadata_entry_offset(1), &mut e1)
+        .ok()?;
+    let entries = [
+        ota::OtaDataEntry::from_bytes(&e0),
+        ota::OtaDataEntry::from_bytes(&e1),
+    ];
     let (new_seq, target_slot) = ota::next_write(&entries, 2);
     let target_base = if target_slot == 0 {
         OTA_0_BASE
@@ -176,8 +230,8 @@ async fn download_and_flash_inner(
 
     // 2. HTTP GET
     let (port, path) = parse_url(url);
-    let rx = mk_static!([u8; 4096], [0u8; 4096]);
-    let tx = mk_static!([u8; 1024], [0u8; 1024]);
+    let rx: &'static mut [u8] = alloc::vec![0u8; 4096].leak();
+    let tx: &'static mut [u8] = alloc::vec![0u8; 1024].leak();
     let mut socket = TcpSocket::new(stack, rx, tx);
     socket.connect((server, port)).await.ok()?;
     let req = alloc::format!(
@@ -188,7 +242,7 @@ async fn download_and_flash_inner(
     write_all(&mut socket, req.as_bytes()).await.ok()?;
 
     // 3. 读 HTTP 头 + 校验状态码
-    let mut head_buf = [0u8; 1024];
+    let head_buf: &'static mut [u8] = alloc::vec![0u8; 1024].leak();
     let mut head_len = 0usize;
     let body_off;
     loop {
@@ -246,7 +300,7 @@ async fn download_and_flash_inner(
     info!("OTA: 镜像 {}, 开始烧写...", version.as_str());
 
     // 5. 流式 4KB 扇区写入 (硬上界 = APP_PARTITION_SIZE)
-    let mut sector_buf = [0u8; SECTOR as usize];
+    let sector_buf: &'static mut [u8] = alloc::vec![0u8; 4096].leak();
     sector_buf[..128].copy_from_slice(&img_head);
     let mut fill = 128usize;
     let mut written = 0u32;
@@ -254,28 +308,28 @@ async fn download_and_flash_inner(
     let mut last_log = 0u32;
 
     loop {
-        if fill < SECTOR as usize {
+        if fill < 4096 {
             let r = match socket.read(&mut sector_buf[fill..]).await {
                 Ok(0) | Err(_) => break,
                 Ok(r) => r,
             };
             fill += r;
         }
-        while fill >= SECTOR as usize {
+        while fill >= 4096 {
             // 分区上界: 写满前一扇区后下一地址不得越过 APP_PARTITION_SIZE
             if written * SECTOR >= APP_PARTITION_SIZE {
                 error!("OTA: 镜像超出分区 {}B, 拒绝写入", APP_PARTITION_SIZE);
                 return None;
             }
             let abs = target_base + written * SECTOR;
-            if let Err(e) = flash.write(abs, &sector_buf[..SECTOR as usize]) {
+            if let Err(e) = flash.write(abs, &sector_buf[..4096]) {
                 error!("OTA: 扇区写失败 @0x{:05X}: {:?}", abs, e);
                 return None;
             }
             written += 1;
             total += SECTOR;
-            sector_buf.copy_within(SECTOR as usize..fill, 0);
-            fill -= SECTOR as usize;
+            sector_buf.copy_within(4096..fill, 0);
+            fill -= 4096;
             if total - last_log >= 64 * 1024 {
                 let pct = (total * 100) / expected;
                 info!("OTA: {}% ({}/{}KB)", pct, total / 1024, expected / 1024);
@@ -288,10 +342,9 @@ async fn download_and_flash_inner(
             error!("OTA: 镜像超出分区 {}B, 拒绝写入", APP_PARTITION_SIZE);
             return None;
         }
-        let mut last = [0xFFu8; SECTOR as usize];
-        last[..fill].copy_from_slice(&sector_buf[..fill]);
+        // 末扇区: 只写实际字节 (Storage 会整扇区擦写, 无需单独 4KB 缓冲)
         let abs = target_base + written * SECTOR;
-        if let Err(e) = flash.write(abs, &last) {
+        if let Err(e) = flash.write(abs, &sector_buf[..fill]) {
             error!("OTA: 末扇区写失败 @0x{:05X}: {:?}", abs, e);
             return None;
         }
@@ -368,17 +421,14 @@ fn load_fail_record(flash: &mut FlashStorage<'_>) -> Option<(heapless::String<32
 }
 
 fn save_fail_record(flash: &mut FlashStorage<'_>, version: &str, count: u8) {
-    let mut buf = [0xFFu8; 4096];
+    // 只写 40B 记录, 不要 4KB 静态 (主任务栈吃紧)
+    let mut buf = [0xFFu8; 40];
     buf[0..4].copy_from_slice(&OTA_FAIL_MAGIC.to_le_bytes());
     let n = version.len().min(31);
     buf[4..4 + n].copy_from_slice(&version.as_bytes()[..n]);
     buf[36] = count;
-    let _ = embedded_storage::nor_flash::NorFlash::erase(
-        flash,
-        OTA_FAIL_SECTOR,
-        OTA_FAIL_SECTOR + 4096,
-    );
-    if let Err(e) = embedded_storage::nor_flash::NorFlash::write(flash, OTA_FAIL_SECTOR, &buf) {
+    // Storage::write 对非扇区对齐会整扇区 RMW, 40B 足够
+    if let Err(e) = flash.write(OTA_FAIL_SECTOR, &buf) {
         error!("OTA: 失败计数写入失败: {:?}", e);
     }
 }

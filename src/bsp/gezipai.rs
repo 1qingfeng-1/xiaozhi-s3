@@ -107,10 +107,10 @@ use alloc::boxed::Box;
 pub fn create_board(peripherals: Peripherals) -> Board {
     // 内部堆必须先于任何分配注册 (所有 bin 共用本工厂):
     // 音频 DMA 缓冲必须落内部 RAM (S3 GDMA 访问不了 PSRAM)。
-    // 尺寸 128KB: 主任务栈 = RWDATA 剩余空间, opus 编码实测需 ~87KB
-    // (SILK NSQ 栈上数组按 MAX 帧长定容), 缩堆即扩栈; opus 大状态块
-    // 与会话 socket 缓冲为纯 CPU 访问, 自动落 PSRAM。
-    esp_alloc::heap_allocator!(size: 128_000);
+    // 110KB: 需容纳 DMA ~48KB + 会话/OTA socket 泄漏 + 格式化临时;
+    // 主栈 = DRAM 剩余, opus 编码需 ~87KB。音频大数组也在堆 (勿 mk_static
+    // 挤 bss)。128KB 堆曾把栈压到 40KB → silk_Encode 溢出。
+    esp_alloc::heap_allocator!(size: 110_000);
 
     // 编译期校验: 硬接线与所选板子的 BSP 配置一致 (换板时改错立即报错)
     const _: () = assert!(

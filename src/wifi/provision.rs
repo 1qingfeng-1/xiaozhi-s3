@@ -28,11 +28,16 @@ pub async fn run(
         esp_radio::wifi::ap::AccessPointConfig::default().with_ssid("xiaozhi-gezipai"),
     );
     let interface = esp_radio::wifi::Interface::access_point();
-    let _controller = esp_radio::wifi::WifiController::new(
+    let _controller = match esp_radio::wifi::WifiController::new(
         wifi_peri,
         esp_radio::wifi::ControllerConfig::default().with_initial_config(ap_config),
-    )
-    .unwrap();
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("配网: WiFi 控制器初始化失败 {:?} — 重启重试", e);
+            esp_hal::system::software_reset();
+        },
+    };
 
     let static_cfg = embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
         address: Ipv4Cidr::new(Ipv4Address::from(AP_ADDR), 24),

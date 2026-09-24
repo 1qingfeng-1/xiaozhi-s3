@@ -87,13 +87,13 @@ const VOLUME_SECTOR: u32 = 0xD000;
 
 /// 保存音量 (0~100; 0xFF = 擦除态 → 默认 60)
 pub fn save_volume(flash: &mut FlashStorage<'_>, volume: u8) {
-    let mut buf = [0xFFu8; 4096];
-    buf[0] = volume.min(100);
+    // 只写首字节, 避免 4KB 栈缓冲 (调用点在音频主循环, 编码栈已 ~87KB)
+    let word = [volume.min(100), 0xFF, 0xFF, 0xFF];
     if let Err(e) = NorFlash::erase(flash, VOLUME_SECTOR, VOLUME_SECTOR + 4096) {
         defmt::error!("音量保存: 擦除失败 {:?}", e);
         return;
     }
-    if let Err(e) = NorFlash::write(flash, VOLUME_SECTOR, &buf) {
+    if let Err(e) = NorFlash::write(flash, VOLUME_SECTOR, &word) {
         defmt::error!("音量保存: 写入失败 {:?}", e);
     }
 }
