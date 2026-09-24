@@ -27,7 +27,7 @@ use esp_hal::{
 };
 use esp_storage::FlashStorage;
 
-use defmt::{error, info};
+use defmt::{error, info, warn};
 use esp_println as _;
 
 use xiaozhi_s3::app::{self, AppArgs, Channels};
@@ -140,32 +140,39 @@ async fn main(spawner: Spawner) -> ! {
 
     // 开机 OTA: 检查 → (有新版且未连续失败) 下载 + 扇区级烧写 + 切 otadata → 重启
     // 在采集启动前完成 (main 直线路径), 无 I2S DMA 冲突
-    if let Some(report) = xiaozhi_s3::ota_check::check(stack, server, &mac).await {
-        if report.update_available
-            && !xiaozhi_s3::ota_check::should_skip(flash, report.latest_version.as_str())
-        {
-            info!(
-                "OTA: 发现新版本 {}, 下载并烧写...",
-                report.latest_version.as_str()
-            );
-            match xiaozhi_s3::ota_check::download_and_flash(
-                stack,
-                server,
-                report.url.as_str(),
-                flash,
-            )
-            .await
-            {
-                Some(v) => {
-                    info!("OTA: 烧写成功 ({}), 重启...", v.as_str());
-                    esp_hal::system::software_reset();
-                },
-                None => {
-                    error!("OTA: 烧写失败, 继续使用当前版本");
-                    xiaozhi_s3::ota_check::record_failure(flash, report.latest_version.as_str());
-                },
+    match xiaozhi_s3::ota_check::check(stack, server, &mac).await {
+        Some(report) if report.update_available => {
+            if xiaozhi_s3::ota_check::should_skip(flash, report.latest_version.as_str()) {
+                // 已在 should_skip 内告警
+            } else {
+                info!(
+                    "OTA: 发现新版本 {}, 下载并烧写...",
+                    report.latest_version.as_str()
+                );
+                match xiaozhi_s3::ota_check::download_and_flash(
+                    stack,
+                    server,
+                    report.url.as_str(),
+                    flash,
+                )
+                .await
+                {
+                    Some(v) => {
+                        info!("OTA: 烧写成功 ({}), 重启...", v.as_str());
+                        esp_hal::system::software_reset();
+                    },
+                    None => {
+                        error!("OTA: 烧写失败, 继续使用当前版本");
+                        xiaozhi_s3::ota_check::record_failure(
+                            flash,
+                            report.latest_version.as_str(),
+                        );
+                    },
+                }
             }
-        }
+        },
+        Some(_) => {}, // 已是最新, check 内已打日志
+        None => warn!("OTA: 检查失败 (服务器不可达/超时/响应异常), 跳过本次升级"),
     }
     // controller 持有至 main 结束 (main 为 ! 不返回): 丢弃可能影响射频状态
 

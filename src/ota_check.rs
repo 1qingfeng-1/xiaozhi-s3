@@ -68,7 +68,10 @@ async fn check_inner(
     let rx = mk_static!([u8; 1024], [0u8; 1024]);
     let tx = mk_static!([u8; 512], [0u8; 512]);
     let mut socket = TcpSocket::new(stack, rx, tx);
-    socket.connect((server, 8003)).await.ok()?;
+    if socket.connect((server, 8003)).await.is_err() {
+        warn!("OTA: TCP 连接失败");
+        return None;
+    }
 
     let current = env!("CARGO_PKG_VERSION");
     let body = alloc::format!(
@@ -100,12 +103,19 @@ async fn check_inner(
     }
     socket.abort();
 
+    if resp.is_empty() {
+        warn!("OTA: 检查响应为空 (服务器关闭连接)");
+        return None;
+    }
     let (status, body) = split_http_response(resp.as_str())?;
     if status != 200 {
         warn!("OTA: 检查响应非 200 ({})", status);
         return None;
     }
-    let manifest = ota::parse_manifest(body)?;
+    let Some(manifest) = ota::parse_manifest(body) else {
+        warn!("OTA: 清单解析失败 (body 前 80B)");
+        return None;
+    };
     let current = env!("CARGO_PKG_VERSION");
     let update_available =
         ota::compare_versions(manifest.version, current) == core::cmp::Ordering::Greater;
@@ -180,7 +190,7 @@ async fn download_and_flash_inner(
     // 3. 读 HTTP 头 + 校验状态码
     let mut head_buf = [0u8; 1024];
     let mut head_len = 0usize;
-    let mut body_off: Option<usize> = None;
+    let body_off;
     loop {
         let n = match socket.read(&mut head_buf[head_len..]).await {
             Ok(0) | Err(_) => return None,
@@ -191,14 +201,13 @@ async fn download_and_flash_inner(
             .windows(4)
             .position(|w| w == b"\r\n\r\n")
         {
-            body_off = Some(pos + 4);
+            body_off = pos + 4;
             break;
         }
         if head_len >= head_buf.len() {
             return None;
         }
     }
-    let body_off = body_off?;
     let head_str = core::str::from_utf8(&head_buf[..head_len]).unwrap_or("");
     let status = parse_http_status(head_str)?;
     if status != 200 {
@@ -217,11 +226,10 @@ async fn download_and_flash_inner(
 
     // 4. 读前 128B (e9 头) 校验
     let mut img_head = [0u8; 128];
-    let mut n = 0usize;
     let rem = head_len - body_off;
     let cp = rem.min(128);
     img_head[..cp].copy_from_slice(&head_buf[body_off..body_off + cp]);
-    n = cp;
+    let mut n = cp;
     while n < 128 {
         let r = match socket.read(&mut img_head[n..]).await {
             Ok(0) | Err(_) => return None,
