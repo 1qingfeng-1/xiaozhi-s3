@@ -87,9 +87,10 @@ async fn main(spawner: Spawner) -> ! {
 
     let flash = xiaozhi_s3::mk_static!(FlashStorage<'static>, FlashStorage::new(p.FLASH));
 
-    // 音量恢复 (NVS 0xD000; 无记录 → 默认 60)
+    // 音量恢复 (NVS 0xD000; 无记录 → 默认 60): 原子量 + ES8311 硬件同步
     let saved_vol = xiaozhi_s3::wifi::store::load_volume(flash);
     xiaozhi_s3::app::VOLUME_PCT.store(saved_vol, core::sync::atomic::Ordering::Relaxed);
+    board.audio.set_volume(saved_vol);
 
     // BOOT 键开机按住: 清除凭据强制重回配网
     if board.buttons.boot_pressed() {
@@ -110,7 +111,8 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     // WiFi: 有凭据连 STA; 无凭据/连接失败 → 配网模式 (SoftAP 表单, 保存后重启)
-    let (stack, server, mut _controller, mac) = match wifi::boot_mode(flash) {
+    // controller 必须活到 main 结束 (保活射频状态), 勿提前 drop
+    let (stack, server, controller, mac) = match wifi::boot_mode(flash) {
         Mode::Station(config) => match wifi::connect_station(&spawner, &config, p.WIFI).await {
             Ok((stack, controller, mac)) => {
                 let server = match config.server.as_str().parse() {
@@ -132,13 +134,16 @@ async fn main(spawner: Spawner) -> ! {
     };
     // WiFi 射频省电 (beacon 间 modem sleep, 降待机功耗; 不影响 TCP 吞吐)
     use esp_radio::wifi::PowerSaveMode;
-    let _ = _controller.set_power_saving(PowerSaveMode::Minimum);
+    let mut controller = controller;
+    let _ = controller.set_power_saving(PowerSaveMode::Minimum);
     info!("设备 ID: {}", mac.as_str());
 
-    // 开机 OTA: 检查 → (有新版) 下载 + 扇区级烧写 + 切 otadata → 重启
+    // 开机 OTA: 检查 → (有新版且未连续失败) 下载 + 扇区级烧写 + 切 otadata → 重启
     // 在采集启动前完成 (main 直线路径), 无 I2S DMA 冲突
     if let Some(report) = xiaozhi_s3::ota_check::check(stack, server, &mac).await {
-        if report.update_available {
+        if report.update_available
+            && !xiaozhi_s3::ota_check::should_skip(flash, report.latest_version.as_str())
+        {
             info!(
                 "OTA: 发现新版本 {}, 下载并烧写...",
                 report.latest_version.as_str()
@@ -155,10 +160,14 @@ async fn main(spawner: Spawner) -> ! {
                     info!("OTA: 烧写成功 ({}), 重启...", v.as_str());
                     esp_hal::system::software_reset();
                 },
-                None => error!("OTA: 烧写失败, 继续使用当前版本"),
+                None => {
+                    error!("OTA: 烧写失败, 继续使用当前版本");
+                    xiaozhi_s3::ota_check::record_failure(flash, report.latest_version.as_str());
+                },
             }
         }
     }
+    // controller 持有至 main 结束 (main 为 ! 不返回): 丢弃可能影响射频状态
 
     // 会话常驻缓冲 (帧长/常量与 app.rs 对齐: 960 样本 @16kHz 60ms)
     let pop_buf = xiaozhi_s3::mk_static!([u8; POP_BUF_SIZE], [0u8; POP_BUF_SIZE]);

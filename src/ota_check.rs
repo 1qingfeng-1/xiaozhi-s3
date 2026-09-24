@@ -5,9 +5,11 @@
 //! 版本比较; 有新版时 [`download_and_flash`] GET 固件 → 流式 4KB 扇区
 //! 擦写 → 写 otadata → 重启。对齐 C++ ota.cc 的下载/校验/烧写全流程。
 //!
-//! [`check_task`] 保留为后台任务 (M9 兼容): 独立任务, 不阻塞会话/主循环。
+//! 防护: 分区大小上界 / HTTP 200 / Content-Length 完整性 / 整体超时 /
+//! 同版本连续失败退避 (NVS 0xC000)。
 
 use embassy_net::{Ipv4Address, Stack, tcp::TcpSocket};
+use embassy_time::{Duration, with_timeout};
 use embedded_storage::{ReadStorage as _, Storage as _};
 
 use defmt::{error, info, warn};
@@ -24,34 +26,45 @@ pub struct UpdateReport {
     pub latest_version: heapless::String<32>,
     /// 是否比当前固件新
     pub update_available: bool,
-    /// 固件下载 url (清单 firmware.url; 供 [`download_validate`])
+    /// 固件下载 url (清单 firmware.url)
     pub url: heapless::String<64>,
-}
-
-/// 固件下载 + 校验结果 (不写 flash)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageReport {
-    /// 新镜像里 app_desc 的版本串 (如 "0.2.0")
-    pub version: heapless::String<32>,
-    /// 实际读到的 body 字节数
-    pub bytes: u32,
-    /// 响应 Content-Length (0 = 未提供)
-    pub expected: u32,
 }
 
 /// 板型标识 (服务器按 `board.type` 匹配 `data/bin/<type>_<version>.bin`;
 /// 对齐 C++ `BOARD_TYPE` / config.json `name`)
 const OTA_BOARD_TYPE: &str = "gezipai";
 
+/// ota_0 / ota_1 / otadata 分区基址与大小 (与 partitions.csv 一致)
+const OTA_0_BASE: u32 = 0x20_000;
+const OTA_1_BASE: u32 = 0x41_0000;
+const OTADATA_BASE: u32 = 0x10_000;
+/// 单 app 分区大小 (0x3F0000): 烧写硬上界, 防写穿相邻分区
+const APP_PARTITION_SIZE: u32 = 0x3F_0000;
+const SECTOR: u32 = 4096;
+
+/// 网络阶段整体超时 (检查/下载); 防半开连接卡死启动路径
+const NET_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// OTA 失败记录扇区 (NVS 分区内空闲扇区, 与凭据 0xE000 / 音量 0xD000 分离)
+const OTA_FAIL_SECTOR: u32 = 0xC000;
+const OTA_FAIL_MAGIC: u32 = 0x4154_4F58; // 'XOTA' 小端
+/// 同版本连续失败达此次数后跳过 (跨重启生效)
+const OTA_FAIL_LIMIT: u8 = 3;
+
 /// 向服务器查询固件更新
 ///
-/// 对齐 C++ `ota.cc::CheckVersion`: **POST** 带 `Device-Id` 头 + JSON body
-/// (`board.type` 板型 + `application.version` 当前版本); 服务器据此返回
-/// `{firmware:{version,url}, ...}` 清单。GET 只回健康串、拿不到清单 (实测)。
-/// `mac` 供 `Device-Id`/`Client-Id` 头 (服务器白名单/追踪用)。
+/// 对齐 C++ `ota.cc::CheckVersion`: **POST** 带 `Device-Id` 头 + JSON body。
 pub async fn check(stack: Stack<'static>, server: Ipv4Address, mac: &str) -> Option<UpdateReport> {
-    // check() 消费一次性 Stack<'static> (调用方 mk_static!), 故 rx/tx 亦用
-    // mk_static! 常驻 (替代原 vec!().leak() 每次泄漏 1536B)
+    with_timeout(NET_TIMEOUT, check_inner(stack, server, mac))
+        .await
+        .ok()?
+}
+
+async fn check_inner(
+    stack: Stack<'static>,
+    server: Ipv4Address,
+    mac: &str,
+) -> Option<UpdateReport> {
     let rx = mk_static!([u8; 1024], [0u8; 1024]);
     let tx = mk_static!([u8; 512], [0u8; 512]);
     let mut socket = TcpSocket::new(stack, rx, tx);
@@ -87,14 +100,11 @@ pub async fn check(stack: Stack<'static>, server: Ipv4Address, mac: &str) -> Opt
     }
     socket.abort();
 
-    // 跳过 HTTP 头取 body
-    let body = match resp.find("\r\n\r\n") {
-        Some(i) => &resp[i + 4..],
-        None => {
-            warn!("OTA: 响应无 body");
-            return None;
-        },
-    };
+    let (status, body) = split_http_response(resp.as_str())?;
+    if status != 200 {
+        warn!("OTA: 检查响应非 200 ({})", status);
+        return None;
+    }
     let manifest = ota::parse_manifest(body)?;
     let current = env!("CARGO_PKG_VERSION");
     let update_available =
@@ -115,46 +125,27 @@ pub async fn check(stack: Stack<'static>, server: Ipv4Address, mac: &str) -> Opt
     })
 }
 
-/// 下载固件并校验 e9 头 (下载 → 校验 → 计数; **不写 flash**)
+/// 下载固件 → 4KB 扇区擦写目标槽 → 写 otadata → 返回新版本串
 ///
-/// `url` = 清单里的 firmware.url; 连接用已知 `server` (端口取 url, 缺省 8003),
-/// path 取 url `//` 之后的部分。`None` = 下载失败 / 镜像头校验失败 (magic 或
-/// app_desc 不符, 即取回的坏固件, 拒绝)。
-pub async fn download_validate(
+/// 防护: HTTP 200 / Content-Length 完整性 / 分区大小上界 / 整体超时。
+/// 调用时机: `main()` 直线路径 (采集未启动, 无 I2S DMA 冲突)。
+/// 成功时调用方负责 `esp_hal::system::software_reset()`。
+/// 失败返回 `None`, 设备继续用当前固件; 失败计数由调用方 [`record_failure`]。
+pub async fn download_and_flash(
     stack: Stack<'static>,
     server: Ipv4Address,
     url: &str,
-) -> Option<ImageReport> {
-    let (port, path) = parse_url(url);
-    let rx = mk_static!([u8; 1024], [0u8; 1024]);
-    let tx = mk_static!([u8; 1024], [0u8; 1024]);
-    let mut socket = TcpSocket::new(stack, rx, tx);
-    socket.connect((server, port)).await.ok()?;
-
-    let request = alloc::format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        path,
-        server
-    );
-    write_all(&mut socket, request.as_bytes()).await.ok()?;
-
-    read_and_validate(&mut socket).await
+    flash: &mut FlashStorage<'_>,
+) -> Option<heapless::String<32>> {
+    with_timeout(
+        NET_TIMEOUT,
+        download_and_flash_inner(stack, server, url, flash),
+    )
+    .await
+    .ok()?
 }
 
-// ===== M10: 下载 + 扇区级烧写 + otadata 切换 =====
-
-/// ota_0 / ota_1 / otadata 分区基址 (与 partitions.csv 一致)
-const OTA_0_BASE: u32 = 0x20_000;
-const OTA_1_BASE: u32 = 0x41_0000;
-const OTADATA_BASE: u32 = 0x10_000;
-const SECTOR: u32 = 4096;
-
-/// 下载固件 → 4KB 扇区擦写目标槽 → 写 otadata → 返回新版本串
-///
-/// 调用时机: `main()` 直线路径 (采集未启动, 无 I2S DMA 冲突)。
-/// 成功时调用方负责 `esp_hal::system::software_reset()`。
-/// 失败 (下载/校验/烧写) 返回 `None`, 设备继续用当前固件。
-pub async fn download_and_flash(
+async fn download_and_flash_inner(
     stack: Stack<'static>,
     server: Ipv4Address,
     url: &str,
@@ -186,7 +177,7 @@ pub async fn download_and_flash(
     );
     write_all(&mut socket, req.as_bytes()).await.ok()?;
 
-    // 3. 读 HTTP 头
+    // 3. 读 HTTP 头 + 校验状态码
     let mut head_buf = [0u8; 1024];
     let mut head_len = 0usize;
     let mut body_off: Option<usize> = None;
@@ -209,7 +200,20 @@ pub async fn download_and_flash(
     }
     let body_off = body_off?;
     let head_str = core::str::from_utf8(&head_buf[..head_len]).unwrap_or("");
-    let expected = parse_content_length(head_str).unwrap_or(0);
+    let status = parse_http_status(head_str)?;
+    if status != 200 {
+        warn!("OTA: 下载响应非 200 ({})", status);
+        return None;
+    }
+    // Content-Length 必填: 完整性依赖它 (缺失无法证明镜像完整)
+    let expected = parse_content_length(head_str)?;
+    if expected == 0 || expected > APP_PARTITION_SIZE {
+        warn!(
+            "OTA: Content-Length 非法 ({} > 分区 {} 或为 0)",
+            expected, APP_PARTITION_SIZE
+        );
+        return None;
+    }
 
     // 4. 读前 128B (e9 头) 校验
     let mut img_head = [0u8; 128];
@@ -231,9 +235,9 @@ pub async fn download_and_flash(
     };
     let mut version = heapless::String::<32>::new();
     let _ = version.push_str(info.version);
-    info!("OTA: 镜像 {} , 开始烧写...", version.as_str());
+    info!("OTA: 镜像 {}, 开始烧写...", version.as_str());
 
-    // 5. 流式 4KB 扇区写入
+    // 5. 流式 4KB 扇区写入 (硬上界 = APP_PARTITION_SIZE)
     let mut sector_buf = [0u8; SECTOR as usize];
     sector_buf[..128].copy_from_slice(&img_head);
     let mut fill = 128usize;
@@ -250,6 +254,11 @@ pub async fn download_and_flash(
             fill += r;
         }
         while fill >= SECTOR as usize {
+            // 分区上界: 写满前一扇区后下一地址不得越过 APP_PARTITION_SIZE
+            if written * SECTOR >= APP_PARTITION_SIZE {
+                error!("OTA: 镜像超出分区 {}B, 拒绝写入", APP_PARTITION_SIZE);
+                return None;
+            }
             let abs = target_base + written * SECTOR;
             if let Err(e) = flash.write(abs, &sector_buf[..SECTOR as usize]) {
                 error!("OTA: 扇区写失败 @0x{:05X}: {:?}", abs, e);
@@ -260,17 +269,17 @@ pub async fn download_and_flash(
             sector_buf.copy_within(SECTOR as usize..fill, 0);
             fill -= SECTOR as usize;
             if total - last_log >= 64 * 1024 {
-                let pct = if expected > 0 {
-                    (total * 100) / expected
-                } else {
-                    0
-                };
+                let pct = (total * 100) / expected;
                 info!("OTA: {}% ({}/{}KB)", pct, total / 1024, expected / 1024);
                 last_log = total;
             }
         }
     }
     if fill > 0 {
+        if written * SECTOR >= APP_PARTITION_SIZE {
+            error!("OTA: 镜像超出分区 {}B, 拒绝写入", APP_PARTITION_SIZE);
+            return None;
+        }
         let mut last = [0xFFu8; SECTOR as usize];
         last[..fill].copy_from_slice(&sector_buf[..fill]);
         let abs = target_base + written * SECTOR;
@@ -283,7 +292,16 @@ pub async fn download_and_flash(
     }
     socket.abort();
 
-    // 6. 写 otadata 条目
+    // 完整性: 实收必须等于 Content-Length (截断/超长均拒绝, 防半截镜像被 VALID)
+    if total != expected {
+        warn!(
+            "OTA: 镜像不完整 (收到 {}B != Content-Length {}B), 拒绝切槽",
+            total, expected
+        );
+        return None;
+    }
+
+    // 6. 写 otadata 条目 (镜像已完整校验, 才允许切换)
     let entry = ota::OtaDataEntry::new(new_seq, version.as_str(), ota::OtaImageState::Valid);
     let entry_bytes = entry.to_bytes();
     let entry_abs = OTADATA_BASE + ota::otadata_entry_offset(target_slot);
@@ -301,77 +319,79 @@ pub async fn download_and_flash(
     Some(version)
 }
 
-/// 流式读 HTTP 响应: 先读头 (到 `\r\n\r\n`, 取 Content-Length), 再读 body;
-/// 前 128B body 用于 e9 头校验 (magic + app_desc → 版本, 需 ≥112B 覆盖
-/// name@80..112), 其余只计数 (不落 RAM, 880KB 镜像不能整块进 128KB 堆)。
-/// 校验通过返回 [`ImageReport`], 否则 `None`。
-async fn read_and_validate(socket: &mut TcpSocket<'_>) -> Option<ImageReport> {
-    let mut head = heapless::String::<1024>::new();
-    let mut in_body = false;
-    let mut img_head = [0u8; 128];
-    let mut img_head_n = 0usize;
-    let mut validated = false;
-    let mut version = heapless::String::<32>::new();
-    let mut total: u32 = 0;
-    let mut expected: u32 = 0;
-
-    loop {
-        let mut buf = [0u8; 512];
-        match socket.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                let mut i = 0usize;
-                while i < n {
-                    if !in_body {
-                        if head.len() < head.capacity() {
-                            let _ = head.push(buf[i] as char);
-                        }
-                        if head.ends_with("\r\n\r\n") {
-                            in_body = true;
-                            expected = parse_content_length(&head).unwrap_or(0);
-                            // buf[i] 是 \r\n\r\n 的最后一个 \n, body 从 i+1 起
-                            i += 1;
-                            if i >= n {
-                                break;
-                            }
-                            // fall through: 处理 buf[i..n] 为 body
-                        } else {
-                            i += 1;
-                            continue;
-                        }
-                    }
-                    if img_head_n < 128 {
-                        img_head[img_head_n] = buf[i];
-                        img_head_n += 1;
-                        if img_head_n == 128 {
-                            if let Some(info) = ota::validate_image_header(&img_head[..img_head_n])
-                            {
-                                validated = true;
-                                version.clear();
-                                let _ = version.push_str(info.version);
-                            }
-                        }
-                    }
-                    total += 1;
-                    i += 1;
-                }
-            },
-        }
+/// 是否应跳过该版本的 OTA 尝试 (同版本连续失败 ≥ [`OTA_FAIL_LIMIT`] 次)
+pub fn should_skip(flash: &mut FlashStorage<'_>, version: &str) -> bool {
+    match load_fail_record(flash) {
+        Some((v, count)) if count >= OTA_FAIL_LIMIT && v == version => {
+            warn!("OTA: 版本 {} 已连续失败 {} 次, 本次跳过", version, count);
+            true
+        },
+        _ => false,
     }
+}
 
-    if !in_body {
-        warn!("OTA 下载: 响应无 body");
+/// 记录一次该版本的烧写失败 (跨重启累计; 成功路径会复位, 无需清零)
+pub fn record_failure(flash: &mut FlashStorage<'_>, version: &str) {
+    let (prev_ver, prev_count) = load_fail_record(flash).unwrap_or((heapless::String::new(), 0));
+    let count = if prev_ver.as_str() == version {
+        prev_count.saturating_add(1)
+    } else {
+        1
+    };
+    save_fail_record(flash, version, count);
+}
+
+fn load_fail_record(flash: &mut FlashStorage<'_>) -> Option<(heapless::String<32>, u8)> {
+    let mut buf = [0u8; 40];
+    flash.read(OTA_FAIL_SECTOR, &mut buf).ok()?;
+    let magic = u32::from_le_bytes(buf[0..4].try_into().ok()?);
+    if magic != OTA_FAIL_MAGIC {
         return None;
     }
-    if !validated {
-        warn!("OTA 下载: 镜像头校验失败 (magic/app_desc 不符, 拒绝坏固件)");
+    let count = buf[36];
+    if count == 0 || count == 0xFF {
         return None;
     }
-    Some(ImageReport {
-        version,
-        bytes: total,
-        expected,
-    })
+    let ver = core::str::from_utf8(&buf[4..36]).ok()?;
+    let end = ver.find('\0').unwrap_or(ver.len());
+    let mut s = heapless::String::<32>::new();
+    s.push_str(&ver[..end]).ok()?;
+    Some((s, count))
+}
+
+fn save_fail_record(flash: &mut FlashStorage<'_>, version: &str, count: u8) {
+    let mut buf = [0xFFu8; 4096];
+    buf[0..4].copy_from_slice(&OTA_FAIL_MAGIC.to_le_bytes());
+    let n = version.len().min(31);
+    buf[4..4 + n].copy_from_slice(&version.as_bytes()[..n]);
+    buf[36] = count;
+    let _ = embedded_storage::nor_flash::NorFlash::erase(
+        flash,
+        OTA_FAIL_SECTOR,
+        OTA_FAIL_SECTOR + 4096,
+    );
+    if let Err(e) = embedded_storage::nor_flash::NorFlash::write(flash, OTA_FAIL_SECTOR, &buf) {
+        error!("OTA: 失败计数写入失败: {:?}", e);
+    }
+}
+
+/// 拆分 HTTP 响应为 (状态码, body); 无头/非 HTTP 返回 None
+fn split_http_response(resp: &str) -> Option<(u16, &str)> {
+    let header_end = resp.find("\r\n\r\n")?;
+    let status = parse_http_status(&resp[..header_end + 4])?;
+    Some((status, &resp[header_end + 4..]))
+}
+
+/// 从 HTTP 状态行取状态码 (`HTTP/1.x 200 ...`)
+fn parse_http_status(head: &str) -> Option<u16> {
+    let line_end = head.find("\r\n").unwrap_or(head.len());
+    let line = &head[..line_end];
+    let mut parts = line.split_whitespace();
+    let proto = parts.next()?;
+    if !proto.starts_with("HTTP/") {
+        return None;
+    }
+    parts.next()?.parse().ok()
 }
 
 /// 从 url 取 (端口, 路径): 端口取 host:port (缺省 8003), 路径为 `//` 后到末尾
@@ -389,7 +409,7 @@ fn parse_url(url: &str) -> (u16, &str) {
     (port, path)
 }
 
-/// 从 HTTP 头取 Content-Length (大小写不敏感, 无拷贝; 缺省 `None`)
+/// 从 HTTP 头取 Content-Length (大小写不敏感; 缺省 `None`)
 fn parse_content_length(head: &str) -> Option<u32> {
     let hl = head.as_bytes();
     let key = b"content-length:";
@@ -414,34 +434,6 @@ fn parse_content_length(head: &str) -> Option<u32> {
     let v = head[at..].trim_start();
     let end = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
     v[..end].parse().ok()
-}
-
-/// 后台任务: 开机 OTA 检查 (+ 有新版时下载校验)
-///
-/// `Stack` 是 `Copy` (embassy-net), 传入即复制一份, 与 `session_task` 各持
-/// 一份互不干扰。独立任务跑 connect/读应答: 服务器可达时打印版本比较, 有新版
-/// 时下载 + 校验 e9 头; 不可达时 connect 自行超时, 不阻塞会话/主循环。
-#[embassy_executor::task]
-pub async fn check_task(stack: Stack<'static>, server: Ipv4Address, mac: heapless::String<32>) {
-    // 任务参数需 'static: 收 owned heapless::String (调用方 .clone()), 内部再借用
-    match check(stack, server, &mac).await {
-        Some(report) => {
-            if !report.update_available {
-                return;
-            }
-            info!("OTA: 下载校验固件 {} …", report.url.as_str());
-            match download_validate(stack, server, report.url.as_str()).await {
-                Some(img) => info!(
-                    "OTA 下载校验通过: 镜像版本 {} 大小 {}B (Content-Length {})",
-                    img.version.as_str(),
-                    img.bytes,
-                    img.expected
-                ),
-                None => warn!("OTA 下载校验失败 (无固件 / 镜像损坏 / 不可达)"),
-            }
-        },
-        None => warn!("OTA 检查失败 (服务器 :8003 不可达或响应异常)"),
-    }
 }
 
 /// 逐字节 push 进 resp (容量满即停)

@@ -89,8 +89,13 @@ const VOLUME_SECTOR: u32 = 0xD000;
 pub fn save_volume(flash: &mut FlashStorage<'_>, volume: u8) {
     let mut buf = [0xFFu8; 4096];
     buf[0] = volume.min(100);
-    let _ = NorFlash::erase(flash, VOLUME_SECTOR, VOLUME_SECTOR + 4096);
-    let _ = NorFlash::write(flash, VOLUME_SECTOR, &buf);
+    if let Err(e) = NorFlash::erase(flash, VOLUME_SECTOR, VOLUME_SECTOR + 4096) {
+        defmt::error!("音量保存: 擦除失败 {:?}", e);
+        return;
+    }
+    if let Err(e) = NorFlash::write(flash, VOLUME_SECTOR, &buf) {
+        defmt::error!("音量保存: 写入失败 {:?}", e);
+    }
 }
 
 /// 读取音量 (无记录/擦除态返回默认 60)

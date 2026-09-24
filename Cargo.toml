@@ -3,7 +3,7 @@ edition      = "2024"
 license      = "MIT"
 name         = "xiaozhi-s3"
 rust-version = "1.88"
-version      = "0.1.0"
+version = "1.0.0"
 
 [[bin]]
 name = "xiaozhi-s3"

@@ -4,7 +4,7 @@
 ESP32-S3 智能音箱固件（Rust `no_std` + esp-hal v1.1 + esp-rtos 0.3/embassy-net）。
 开发板 gezipai：ES8311 (DAC) + ES7210 (麦克风) + ST7789 (显示)，ESP32-S3R8 / 16MB Flash / 8MB Octal PSRAM。
 全语音链路已接通：VAD 唤醒 → WebSocket 会话（xiaozhi 协议 v1，二进制帧 = 裸 opus）→ TTS 播放/打断，
-另含配网、MCP、OTA 检查、显示、电池。
+另含配网、MCP、OTA 下载烧写（双 app 乒乓切槽）、显示、电池。
 
 ## 常用命令
 
@@ -16,11 +16,18 @@ cargo build --release                        # 固件 (target xtensa-esp32s3-non
 cargo run --release --bin xiaozhi-s3         # 烧录+监视 (espflash, defmt)
 cargo run --release --bin audio-loopback     # 其他调试 bin: wifi-test / gpio-test / i2c-scan
 cargo fmt --all -- --check
-cargo clippy --all-features -- -D warnings --cap-lints allow   # 与 CI 一致
+cargo clippy --all-features -- -D warnings --cap-lints allow   # 与 CI/pre-commit 一致
 cargo check --all
 
-cd xiaozhi-core && cargo +stable nextest run  # 核心层 77 个 host 单测（或 cargo +stable test）
+# 核心层 93 个 host 单测 — 必须在 xiaozhi-core/ 目录内跑
+cd xiaozhi-core && cargo +stable nextest run
+# 单测过滤: cargo +stable nextest run ota_crc
+# 或 cargo +stable test
 ```
+
+**为何必须 `cd xiaozhi-core`**：父仓库 `.cargo/config.toml` 把 `[build] target` 锁到
+xtensa；从根目录跑 `cargo +stable nextest run -p xiaozhi-core` 会拿父配置编 host 依赖
+（E0463: can't find crate for `core`）。CI 同样 `working-directory: xiaozhi-core` + `cargo nextest run`（不带 `-p`）。
 
 - 仓库共 **5 个 bin**：`xiaozhi-s3`（产品固件）与 `wifi-test` 在 Cargo.toml 声明，
   `gpio-test`/`i2c-scan`/`audio-loopback` 靠 `src/bin/` 自动发现；`cargo run` 必须 `--bin` 指定。
@@ -32,35 +39,62 @@ cd xiaozhi-core && cargo +stable nextest run  # 核心层 77 个 host 单测（�
 - **不要在仓库根目录跑 `cargo test`**（作用于 xtensa target，必失败）；
 - xiaozhi-core 是独立 workspace 根（空 `[workspace]` + 自带 `.cargo/config.toml` 覆盖回 host target），
   不继承父目录的 esp target/-nostartfiles；
-- 只有 xiaozhi-core 有单测，且只能在 host 上跑。
+- 只有 xiaozhi-core 有单测，且只能在 host 上跑（93 个，当前全绿）。
 
 ## 架构与分层
 
 ```text
 xiaozhi-s3/          固件 crate (no_std, esp-rtos 双任务)
 ├── src/bin/         main.rs 产品固件 + wifi-test / gpio-test / i2c-scan / audio-loopback 调试 bin
-├── src/app.rs       双任务编排: 音频主循环 (非阻塞, 每轮 ≤64ms) + 会话任务 (WS 长阻塞 await 集中于此)
-├── src/session.rs   WS 传输层 (embassy-net TCP 上手写帧编解码, :8000 /xiaozhi/v1/, 含 ping/pong)
-├── src/ota_check.rs OTA 检查 (GET :8003/xiaozhi/ota/ → 版本比较; 下载烧写待分区表, ROADMAP M7)
-├── src/wifi/        STA 连接 + SoftAP 配网 + Flash 凭据存取 (esp-storage)
+├── src/app.rs       双任务编排: 音频主循环 (非阻塞, 每轮 Idle 10ms/活跃 1ms)
+│                    + 会话任务 (WS 长阻塞 await 集中于此)
+├── src/session.rs   WS 传输层 (embassy-net TCP 上写手帧编解码, :8000 /xiaozhi/v1/, 含 ping/pong)
+├── src/ota_check.rs OTA: main() 直线路径 POST :8003 检查 → download_and_flash
+│                    (HTTP200/完整性/分区上界/超时/失败退避 → 4KB 擦写 → otadata → 复位)
+├── src/wifi/        STA 连接 + SoftAP 配网 + Flash 凭据/音量存取 (esp-storage)
 ├── src/audio/       opus FFI 安全封装 + wake_net (esp-sr, feature `wakenet`)
 ├── src/bsp/         板级支持 (board.rs 契约 / components/ 组件 / gezipai.rs 工厂)
 ├── src/macros.rs    mk_static! (StaticCell 常驻分配, 各 bin 共用)
+├── partitions.csv   双 app 分区表 (见下); espflash.toml 声明其路径
 ├── vendor/          libopus (v1.6.1 裁剪) / esp-sr / esp-dsp 子集 / cjson (均 build.rs 编译或链接)
 xiaozhi-core/        git submodule, 纯逻辑层: audio (音量/时钟/codec 序列/状态机/唤醒 VAD) +
-                     dialog (对话状态机) + mcp (JSON-RPC 解析) + ota (清单/版本) + display + board 规则;
-                     host 可单测 (77 个), #![deny(unsafe_code)]
+                     dialog (对话状态机) + mcp (JSON-RPC 解析) + ota (清单/版本/e9 头/otadata 条目) +
+                     display + board 规则; host 可单测 (93 个), #![deny(unsafe_code)]
 ```
 
 分层规则（改代码前必读）：
 
-- **xiaozhi-core 保持纯逻辑**：禁止引入 esp-hal 等硬件依赖；I2S/I2C 寄存器读写、DMA 等
-  硬件代码放固件 crate。可分类/可计算的逻辑（状态机、协议解析、版本比较）放 core 以便 host 单测。
+- **xiaozhi-core 保持纯逻辑**：禁止引入 esp-hal 等硬件依赖；I2S/I2C 寄存器读写、DMA、
+  Flash 读写等硬件代码放固件 crate。可分类/可计算的逻辑（状态机、协议解析、版本比较、
+  otadata 编解码/CRC）放 core 以便 host 单测。
 - **禁止硬编码 GPIO/I2C 地址**：驱动与应用只能读 `bsp::active::BOARD` 与 `Board` 组件 API；
   引脚唯一事实来源 `src/bsp/gezipai.rs`；硬件接线 `const _: () = assert!` 只允许在板子工厂内。
 - **组合优先于继承**：`BoardConfig` 编译期常量，Codec 地址按角色命名（`dac_addr`/`adc_addr`）。
 - **新增板子**：复制 `src/bsp/<board>.rs` → 填 `BOARD` + 实现 `create_board()` →
   `src/bsp/mod.rs` 注册两行 → Cargo.toml 加 `board-<name>` feature（选板 `compile_error!` 守卫在 mod.rs，勿删）。
+
+## 分区表与 OTA（M10）
+
+- `partitions.csv`（espflash 从 cwd 发现 `espflash.toml` → 读该表；改表后 `cargo run` 即生效）：
+
+  | 分区 | offset | size | 备注 |
+  | --- | --- | --- | --- |
+  | nvs | 0x9000 | 0x6000 | WiFi 凭据末扇区 0xE000；音量 0xD000 |
+  | phy_init | 0xF000 | 0x1000 | |
+  | otadata | 0x10000 | 0x2000 | 两扇区: entry0@+0 / entry1@+0x1000 |
+  | ota_0 | 0x20000 | 0x3F0000 | 首刷目标 (`target_app_partition`) |
+  | ota_1 | 0x410000 | 0x3F0000 | |
+
+- **无 factory 分区**：otadata 全 0xFF 时二级 bootloader 自愈 → 启 ota_0 并写 seq=1。
+  新 seq = active+1，目标槽 = `(seq-1)%2`；烧写顺序 = 镜像 → otadata 条目（VALID 直写，
+  不走 PENDING_VERIFY）→ `software_reset()`。
+- **otadata 两条各占一扇区（4KB 间距），不是相邻 32B**——对齐 IDF `bootloader_common_read_otadata`；
+  CRC = reflected CRC-32（init 0, xorout 0xFFFFFFFF）对 `ota_seq` 4B LE；
+  纯逻辑在 `xiaozhi_core::ota`（`read_otadata`/`next_write`/`otadata_entry_offset`）。
+- **OTA 只在 main() 直线路径做**（采集未 start、会话任务未 spawn）：避免 flash 擦写停顿期间
+  I2S RX DMA 溢出（`DmaError::Late`）。勿把 flash 写塞进 `app::run` 循环或 `session_task`。
+- Flash 读写走 `esp-storage` `FlashStorage`（ROM 驱动；`features` 含 `defmt` 才能 `{:?}` 打印
+  `FlashStorageError`）。同一 `FlashStorage` 实例跨 NVS/OTA 共用（`mk_static!` 单例）。
 
 ## 坑与约束
 
@@ -73,6 +107,7 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量/时钟/codec 序
 - 内部堆 **128KB**（`create_board` 第一行注册，先于任何分配，各 bin 共用）；
   主任务栈 = RWDATA 剩余（~107KB）。**opus 编码 60ms 帧需 ~87KB 栈**（SILK VLA 随帧长线性，
   `VAR_ARRAYS` 走任务栈）——缩堆或加长帧前必须重估，否则栈溢出。
+  主循环 Idle+10s 读 `esp_alloc::HEAP.stats()`，`current_usage/size > 90%` 打警告。
 - 音频 DMA 缓冲必须在**内部 RAM**；8MB PSRAM 为 Octal SPI，`psram_allocator!` 必须在
   DMA 缓冲分配**之后**注册（`create_board` 末尾），否则 I2S 缓冲落 PSRAM 报
   `DmaError(UnsupportedMemoryRegion)`。opus 大状态块/socket 缓冲是纯 CPU 访问，可落 PSRAM。
@@ -91,12 +126,17 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量/时钟/codec 序
   曾崩 WiFi blob 信标路径（`pm_on_beacon_rx` LoadProhibited）；故电量 ADC 只在 **Idle 且
   10s 限频**时读一次（会话/播报期绝不读，见 `app.rs` 主循环），充电态用 GPIO
   （CHARGING=41/DONE=42）实时。排查 WiFi 崩溃先确认电池 ADC 未在活跃期被读。
-- **embassy-net `StackResources<8>`**（DHCP 1 + TCP 7）：超出容量时 `TcpSocket::new` panic
-  → 重启循环。socket 跨重连复用（`session_task` 内持有），勿每次 connect 新建（泄漏耗尽内部堆）。
+- WiFi STA 连接后设 `PowerSaveMode::Minimum`（beacon 间 modem sleep）；deep-sleep 唤醒
+  **v1.0 不做**：BOOT/VOL± 是 GPIO1/18/2，S3 上非 RTC-capable，无法做按键唤醒。
+- embassy-net `StackResources` 容量按**每张表**计（`TcpSocket::new` 超容 panic → 重启循环）：
+  STA 栈 `StackResources<4>`（wifi/mod.rs，DHCP+会话+OTA 共用）；SoftAP 配网表
+  `StackResources<8>`（provision.rs）；wifi-test `StackResources<3>`。
+  socket 跨重连复用（`session_task` 内持有），勿每次 connect 新建（泄漏耗尽内部堆）。
 - `session_task` 是 embassy 任务：参数必须 `'static`（Channels 经 `mk_static!` 常驻），
   返回的 SpawnToken 必须 `spawner.spawn`（丢弃即 panic）。
 - BOOT 键**开机按住** = 清除 WiFi 凭据重回配网；配网 = SoftAP `xiaozhi-gezipai` +
-  表单页 `http://192.168.4.1:8080/`，凭据+服务器 IP 存 NVS 分区末扇区（magic `ZOIX`）。
+  表单页 `http://192.168.4.1:8080/`；凭据+服务器 IP 存 NVS `0xE000` 扇区（magic `ZOIX`），
+  音量存同分区 `0xD000` 扇区（首字节 0~100，0xFF→默认 60，与凭据分离勿混写）。
 - 对话状态机（`xiaozhi_core::dialog`）：`WaitingReply` 10s 无服务器消息 → 结束会话回待机。
 - **MCP 已接通并真机验证**（M9，2026-09-06）：hello 发 `features:{"mcp":true}`，
   会话任务内分发 `initialize`/`tools/list`/`tools/call` 到 `app::mcp_handle` 并即时回包
@@ -104,6 +144,7 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量/时钟/codec 序
   `mcp:true` 后服务器等 `initialize` 期间停读 TCP 流 → `esp_wifi_internal_tx
   NO_MEM(257)` 连刷）由「会话内异步应答」规避，且当前 xiaozhi-server 用非阻塞
   `create_task` 读循环，实测不再复现。
+- OTA 检查是 **POST** `:8003/xiaozhi/ota/`（Device-Id 头 + JSON body）；GET 只回健康串拿不到清单（实测）。
 - 音量：ES8311 REG32 是 **dB 线性映射**（0%= -95.5dB → 100%= +32dB），35% ≈ -51dB 基本不可闻
   （audio-loopback 回放音量压 35% 防啸叫）；麦克风数字电平仅 1~5% 满幅，回放/上行前
   软件增益 800%（+18dB）。
@@ -141,17 +182,19 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量/时钟/codec 序
 - `main/boards/<board>/config.h`（`esp32s3-korvo2-v3` 同为 ES8311+ES7210，最接近 gezipai）
 - `main/audio/audio_service.cc`（数据通路）、`main/audio/audio_codec.cc`（esp_codec_dev）
 - `main/protocols/`（MQTT/WS 协议）、`main/application.cc`（状态机）、`main/display/`、`main/led/`
-- `ota.cc`、`mcp_server.cc`
+- `ota.cc`、`mcp_server.cc`、`partitions/v2/*.csv`（双 ota 无 factory 的参考布局）
 
 注意：它是 ESP-IDF + esp_codec_dev 栈；移植到 esp-hal 时 Codec 寄存器层以
 `xiaozhi-core` 序列为准（勿照抄调用方式，勿漏上电段，见 codec.rs 注释与单测）。
 
 ## 约定与文档
 
+- **对话回复一律用中文**（用户要求，重要：向用户输出的解释、总结、提问均用中文）。
 - 注释、文档、commit message 均为中文；Conventional Commits；changelog 用 git-cliff（`cliff.toml`）。
 - **Release 流程**：推 `v[0-9]+.*` tag 触发 `release.yml`（构建 + git-cliff changelog + GitHub Release）。
 - pre-commit（`.pre-commit-config.yaml`）：fmt / clippy / check / cargo-deny / typos / markdownlint；
   `vendor/` 整体排除（三方资产保持上游原样）。
 - 格式化 `rustfmt.toml`（max_width 100）；clippy 阈值 `clippy.toml`（栈 1024B）。
+- 门禁顺序：`fmt --check` → `clippy -D warnings` → `check --all` → core 单测（cd 进子目录）。
 - 开发流程 `docs/DEVELOPMENT.md`、`docs/QUICK_START.md`；阶段计划与**真机验证清单**
   `docs/ROADMAP.md`（下一步上机验证项以此为准）；引脚表见 README「引脚映射」。
