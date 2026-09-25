@@ -107,10 +107,10 @@ use alloc::boxed::Box;
 pub fn create_board(peripherals: Peripherals) -> Board {
     // 内部堆必须先于任何分配注册 (所有 bin 共用本工厂):
     // 音频 DMA 缓冲必须落内部 RAM (S3 GDMA 访问不了 PSRAM)。
-    // 110KB: 需容纳 DMA ~48KB + 会话/OTA socket 泄漏 + 格式化临时;
-    // 主栈 = DRAM 剩余, opus 编码需 ~87KB。音频大数组也在堆 (勿 mk_static
-    // 挤 bss)。128KB 堆曾把栈压到 40KB → silk_Encode 溢出。
-    esp_alloc::heap_allocator!(size: 110_000);
+    // 128KB = DMA ~48KB + 音频大数组 ~56KB (main 泄漏, 勿 mk_static 挤 bss)
+    //        + WiFi/socket ~15KB + 余量。主栈 = DRAM 剩余, opus 需 ~87KB。
+    // 110KB 曾致 WiFi 协议栈堆不足 (配网 SoftAP 手机连不上)。
+    esp_alloc::heap_allocator!(size: 128_000);
 
     // 编译期校验: 硬接线与所选板子的 BSP 配置一致 (换板时改错立即报错)
     const _: () = assert!(
