@@ -10,7 +10,7 @@ mod display;
 mod leds;
 mod power;
 
-pub use audio::{Audio, Capture};
+pub use audio::{Audio, Capture, TX_RING_BYTES};
 pub use battery::Battery;
 pub use buttons::Buttons;
 pub use display::{Display, Rgb565, make_spi};

@@ -29,6 +29,7 @@ use esp_println as _;
 
 use xiaozhi_core::audio::capture::{apply_gain_percent, extract_slot, is_voice_active};
 
+use xiaozhi_s3::bsp::components::TX_RING_BYTES;
 use xiaozhi_s3::bsp::create_board;
 
 #[panic_handler]
@@ -178,9 +179,8 @@ async fn main(_spawner: Spawner) -> ! {
                 Err(e) => error!("RX pop 失败: {:?}", e),
             }
         } else {
-            // 时钟维持: 补播一段静音 (每次一次性 TX 重启约有 28B 采集损耗,
-            // 由下次补播自然补回, 不影响回环正确性)
-            board.audio.play_block(silence_buf);
+            // 时钟维持: 环形常流补静音 (队列到目标即停), 再等下一窗采集
+            board.audio.maintain_silence(silence_buf, TX_RING_BYTES);
             let t0 = Instant::now();
             while t0.elapsed() < Duration::from_millis(60) {}
         }

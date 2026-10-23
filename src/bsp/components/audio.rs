@@ -11,7 +11,7 @@
 
 use esp_hal::{
     Blocking,
-    dma::{DmaChannelFor, DmaDescriptor, DmaTransferRxCircular},
+    dma::{DmaChannelFor, DmaDescriptor, DmaTransferRxCircular, DmaTransferTxCircular},
     i2c::master::I2c,
     i2s::{
         AnyI2s,
@@ -27,10 +27,17 @@ use xiaozhi_core::audio::codec::{
     self as codec_mod, RegWrite, es7210_init_sequence, es8311_init_sequence, es8311_volume_write,
 };
 
-/// TX DMA 描述符数量 (每个最大管理 ~4092B; 一次性播放路径不做链回溯, 余量即可)
-const TX_DESCRIPTOR_COUNT: usize = 64;
-/// 发送缓冲 16KB ≈ 0.25s @ 16kHz 立体声 16bit
-const TX_BUF_SIZE: usize = 16 * 1024;
+/// TX DMA 描述符数量 (每个最大管理 4092B; 环形模式按需切分即可)
+const TX_DESCRIPTOR_COUNT: usize = 8;
+/// 发送环形缓冲 ≈0.13s @ 16kHz 立体声 16bit
+///
+/// 环形 DMA 会**循环播放缓冲内容**: 必须始终把缓冲填满 (空闲补静音),
+/// 否则 DMA 追到写指针后会读到上一圈的旧数据 (提示音/TTS 残片 → 周期爆音)。
+const TX_BUF_SIZE: usize = DMA_CHUNK_SIZE * 2;
+/// 公共只读: 环形缓冲总字节数 (调用方按需换算低水位)
+pub const TX_RING_BYTES: usize = TX_BUF_SIZE;
+/// beep 生成分块缓冲 (一整个 DMA 描述符)
+const BEEP_CHUNK_SIZE: usize = DMA_CHUNK_SIZE;
 /// 单个 DMA 描述符管理的最大字节数
 const DMA_CHUNK_SIZE: usize = 4092;
 /// RX 循环缓冲 = 8 个整描述符 ≈ 0.25s @ 16kHz 立体声 16bit。
@@ -39,12 +46,22 @@ const DMA_CHUNK_SIZE: usize = 4092;
 const RX_BUF_SIZE: usize = DMA_CHUNK_SIZE * 8;
 const RX_DESCRIPTOR_COUNT: usize = 8;
 
-/// 音频播放子系统 (I2S TX + Codec 控制 + PA)
+/// 音频播放子系统 (I2S TX **环形**常流 + Codec 控制 + PA)
+///
+/// ⚠️ 播放必须走环形 DMA 常流: 早期一次性 `write_dma` 每块停/启一次,
+/// 使 BCLK/WS 周期性停摆 —— 播放端表现为「滴滴答答」爆音, 且 RX 从机
+/// (ES7210) 随共享时钟停摆导致上行数据损坏 (真机 2026-09-26 定位)。
 pub struct Audio {
     i2c: I2c<'static, Blocking>,
-    i2s_tx: I2sTx<'static, Blocking>,
+    /// 启动环形传输前持有的 I2S TX 外设 ('static: 环形句柄借用它, 泄漏保活)
+    i2s_tx: Option<&'static mut I2sTx<'static, Blocking>>,
+    /// 常流句柄 (首次播放/提示音时惰性启动, 避开启动期 OTA 长阻塞)
+    tx: Option<DmaTransferTxCircular<'static, I2sTx<'static, Blocking>>>,
+    /// TX 环形缓冲 (**必须在 PSRAM 注册前分配**, 否则落 PSRAM 触发 DmaError)
+    tx_buf: Option<&'static mut [u8]>,
+    /// beep 分块生成缓冲 (堆分配, 避免大栈帧)
+    beep_buf: &'static mut [u8],
     _pa: esp_hal::gpio::Output<'static>,
-    tx_buf: &'static mut [u8],
     volume: u8,
 }
 
@@ -96,7 +113,6 @@ impl Audio {
             .with_mclk(mclk);
         let tx_descriptors: &'static mut [DmaDescriptor] =
             Box::leak(vec![DmaDescriptor::EMPTY; TX_DESCRIPTOR_COUNT].into_boxed_slice());
-        let tx_buf: &'static mut [u8] = Box::leak(vec![0u8; TX_BUF_SIZE].into_boxed_slice());
         let i2s_tx = i2s
             .i2s_tx
             .with_bclk(bclk)
@@ -110,17 +126,43 @@ impl Audio {
         let rx_buf: &'static mut [u8] = Box::leak(vec![0u8; RX_BUF_SIZE].into_boxed_slice());
         let i2s_rx = i2s.i2s_rx.with_din(din).build(rx_descriptors);
 
+        // (保持两槽 I2S: ES8311/ES7210 共用 32bit/帧; 早期尝试 4 槽因 esp-hal
+        //  apply_config 不触发 tx_update/rx_update 实际未生效, 已回退)
+
         // 3. 组装 (PA 默认关, init 完成后统一拉高)
         //    ES7210 立体声 (非 TDM): 与 2 槽位线格式匹配, AEC 阶段切 TDM
+        //    TX 外设泄漏保活: 环形句柄需 'static 借用 (板上常驻, 全生命周期一个)
         let mut audio = Self {
             i2c,
-            i2s_tx,
+            i2s_tx: Some(Box::leak(Box::new(i2s_tx))),
+            tx: None,
+            tx_buf: Some(Box::leak(vec![0u8; TX_BUF_SIZE].into_boxed_slice())),
+            beep_buf: Box::leak(vec![0u8; BEEP_CHUNK_SIZE].into_boxed_slice()),
             _pa: pa,
-            tx_buf,
             volume: 60,
         };
         audio.write_seq_logged("ES8311", &es8311_seq[1..]);
-        audio.write_seq_logged("ES7210", es7210_init_sequence(false));
+        // ES7210: 先复位, 再读回 REG08 默认值 (绝不能整字节写 0x00: 会清掉
+        // bit4 → ADC 只有 fs/8 采样点, 真机 2026-10-22 定位), 最后只改 bit0。
+        let es7210_seq = es7210_init_sequence(false);
+        audio.write_seq_logged("ES7210 复位", &es7210_seq[..2]);
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(5) {}
+        let r08_default = audio.read_reg_at(codec_mod::CodecAddr::Es7210.value(), 0x08);
+        defmt::info!("ES7210 REG08 复位默认=0x{:02X}", r08_default);
+        audio.write_seq_logged("ES7210", &es7210_seq[2..]);
+        let r08 = audio.read_reg_at(codec_mod::CodecAddr::Es7210.value(), 0x08);
+        defmt::info!("ES7210 REG08 序列后=0x{:02X}", r08);
+        // slave 模式: 只清 bit0; 保留 bit4 (ADC/MCLK 使能) 及其它默认位
+        let fixed = (r08 & !0x01) | 0x10;
+        audio.write_seq_logged(
+            "ES7210 REG08",
+            &[RegWrite::new(codec_mod::CodecAddr::Es7210, 0x08, fixed)],
+        );
+        defmt::info!(
+            "ES7210 REG08 修正=0x{:02X}",
+            audio.read_reg_at(codec_mod::CodecAddr::Es7210.value(), 0x08)
+        );
         audio.write_seq_logged("音量", &es8311_volume_write(60));
         // 功放使能 (高电平)
         audio._pa.set_high();
@@ -173,15 +215,56 @@ impl Audio {
 
     /// 读取单个 ES8311 寄存器 (失败返回 0xFF)
     fn read_reg(&mut self, reg: u8) -> u8 {
+        self.read_reg_at(codec_mod::CodecAddr::Es8311.value(), reg)
+    }
+
+    /// 读取任意 Codec 寄存器 (失败返回 0xFF)
+    fn read_reg_at(&mut self, addr: u8, reg: u8) -> u8 {
         let mut v = [0u8; 1];
-        if self
-            .i2c
-            .write_read(codec_mod::CodecAddr::Es8311.value(), &[reg], &mut v)
-            .is_err()
-        {
+        if self.i2c.write_read(addr, &[reg], &mut v).is_err() {
             return 0xFF;
         }
         v[0]
+    }
+
+    /// 回读 I2S0 关键寄存器 (排查 TDM 槽数/位宽/帧长, 仅调试用)
+    ///
+    /// 直接读 S3 I2S0 寄存器窗口 (0x6000_F000), 避免依赖 esp-hal 私有 API。
+    pub fn i2s_debug_regs() -> [(u8, u32); 7] {
+        const BASE: usize = 0x6000_f000;
+        let mut out = [(0u8, 0u32); 7];
+        for (i, off) in [0x20u8, 0x24, 0x28, 0x2c, 0x50, 0x54, 0x64]
+            .into_iter()
+            .enumerate()
+        {
+            // SAFETY: I2S0 寄存器窗口固定映射, 读操作无副作用
+            let v = unsafe { core::ptr::read_volatile((BASE + off as usize) as *const u32) };
+            out[i] = (off, v);
+        }
+        out
+    }
+
+    /// 写单个 ES7210 寄存器 (临时诊断/扫描用)
+    pub fn es7210_write_reg(&mut self, reg: u8, val: u8) {
+        let _ = Self::write_seq(
+            &mut self.i2c,
+            &[RegWrite::new(codec_mod::CodecAddr::Es7210, reg, val)],
+        );
+    }
+
+    /// 回读 ES7210 关键寄存器 (排查槽位/字长/麦克风供电是否与预期一致)
+    pub fn es7210_debug_regs(&mut self) -> [(u8, u8); 12] {
+        const ADDR: u8 = 0x40;
+        let mut out = [(0u8, 0u8); 12];
+        for (i, reg) in [
+            0x11u8, 0x12, 0x02, 0x07, 0x01, 0x40, 0x43, 0x44, 0x47, 0x4B, 0x4C, 0x08,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out[i] = (reg, self.read_reg_at(ADDR, reg));
+        }
+        out
     }
 
     /// 设置音量 (0~100), 0 为数字静音
@@ -195,49 +278,118 @@ impl Audio {
         self.volume
     }
 
-    /// 播放提示音 (250Hz 正弦, 指定时长) — 扬声器通路验证
-    ///
-    /// 注意: 阻塞时长 ≈ ms (调用方需保证 ≤ 2 个 RX 描述符 ≈ 128ms,
-    /// 否则采集链会在提示音期间积压触发 Late 重建)
-    pub fn beep(&mut self, ms: u32) {
-        // 只发送 ms 对应的字节 (64B/ms @16kHz 立体声 16bit), 阻塞 ≈ ms
-        let n = (ms as usize * 64).min(self.tx_buf.len());
-        Self::fill_sine(&mut self.tx_buf[..n], ms);
-        let words: &[u8] = &self.tx_buf[..n];
-        match self.i2s_tx.write_dma(&words) {
+    /// 惰性启动 TX 环形常流 (首次播放/提示音时; 避开启动期 OTA 长阻塞)
+    fn ensure_tx(&mut self) {
+        if self.tx.is_some() {
+            return;
+        }
+        let Some(i2s_tx) = self.i2s_tx.take() else {
+            return;
+        };
+        let Some(buf) = self.tx_buf.take() else {
+            return;
+        };
+        let shared: &'static [u8] = buf;
+        // write_dma_circular 形参为 &'t impl ReadBuffer: ReadBuffer 实现在 &[u8] 上,
+        // 需传 &'static &[u8] (泄漏 8B 引用以满足 'static 句柄)
+        let words: &'static &'static [u8] = Box::leak(Box::new(shared));
+        match i2s_tx.write_dma_circular(words) {
             Ok(t) => {
-                let _ = t.wait();
+                self.tx = Some(t);
+                defmt::info!("I2S TX 环形常流已启动 ({}B)", TX_BUF_SIZE);
             },
-            Err(e) => defmt::error!("I2S DMA 发送失败: {:?}", e),
+            Err(e) => {
+                // 启动失败无法重试 (外设借用已移出): 记录后静默, 由调用方现象暴露
+                defmt::error!("I2S TX 环形启动失败: {:?}", e);
+            },
         }
     }
 
-    /// 播放一块原始立体声 i16-LE 数据 (阻塞)
-    ///
-    /// `data` 长度应与采集块匹配 (2ch × i16); 超过内部缓冲截断。
-    pub fn play_block(&mut self, data: &[u8]) {
-        let n = data.len().min(self.tx_buf.len());
-        self.tx_buf[..n].copy_from_slice(&data[..n]);
-        self.tx_buf[n..].fill(0);
-        // write_dma 形参为 &'t impl ReadBuffer (T 需 Sized): 传切片的引用
-        let words: &[u8] = &self.tx_buf[..n];
-        match self.i2s_tx.write_dma(&words) {
-            Ok(t) => {
-                let _ = t.wait();
-            },
-            Err(e) => defmt::error!("I2S DMA 发送失败: {:?}", e),
+    /// 推入数据直到全部写入环形 DMA (空间不足时自旋等 DMA 消费, 即节流)
+    fn push_all(
+        tx: &mut Option<DmaTransferTxCircular<'static, I2sTx<'static, Blocking>>>,
+        data: &[u8],
+    ) {
+        let Some(t) = tx.as_mut() else {
+            return;
+        };
+        let mut off = 0;
+        while off < data.len() {
+            match t.push(&data[off..]) {
+                // push 是全量语义: 空间不足返回 Overflow, 等消费后重试
+                Ok(n) => off += n,
+                Err(esp_hal::dma::DmaError::Overflow) => core::hint::spin_loop(),
+                Err(e) => {
+                    defmt::warn!("I2S TX push 失败: {:?} — 丢弃本块", e);
+                    return;
+                },
+            }
         }
+    }
+
+    /// 填满环形缓冲到指定**待播字节数** (空闲补静音): 时钟常开 + 杜绝旧数据回放
+    ///
+    /// - `target_queued = TX_RING_BYTES`: 填满 (待机/聆听; 只播静音也无所谓)
+    /// - `target_queued` 较小 (如 20ms): TTS 播报期用低水位。只在队列快见底时补静音,
+    ///   既不把静音插进 TTS 帧之间 (一卡一卡), 也不让 DMA 绕回重放旧数据 (嘟嘟嘟)。
+    pub fn maintain_silence(&mut self, silence: &[u8], target_queued: usize) {
+        self.ensure_tx();
+        let target = target_queued.min(TX_BUF_SIZE);
+        loop {
+            let Some(t) = self.tx.as_mut() else {
+                return;
+            };
+            let free = match t.available() {
+                Ok(v) => v,
+                Err(e) => {
+                    defmt::warn!("I2S TX available 失败: {:?}", e);
+                    return;
+                },
+            };
+            let queued = TX_BUF_SIZE - free.min(TX_BUF_SIZE);
+            if queued >= target {
+                return;
+            }
+            let n = (target - queued).min(silence.len());
+            Self::push_all(&mut self.tx, &silence[..n]);
+        }
+    }
+
+    /// 播放提示音 (250Hz 正弦, 指定时长; 环形常流追加, 延迟 ≤ 目标队列)
+    pub fn beep(&mut self, ms: u32) {
+        self.ensure_tx();
+        // 64B/ms @16kHz 立体声 16bit; 分块生成, 保持相位连续
+        let total = ms as usize * 64;
+        let mut done = 0;
+        let mut phase = 0usize;
+        while done < total {
+            let n = (total - done).min(self.beep_buf.len());
+            let Self { beep_buf, tx, .. } = self;
+            Self::fill_sine(&mut beep_buf[..n], phase);
+            phase = (phase + n / 4) % 64;
+            Self::push_all(tx, &beep_buf[..n]);
+            done += n;
+        }
+    }
+
+    /// 播放一块原始立体声 i16-LE 数据 (推入环形常流)
+    pub fn play_block(&mut self, data: &[u8]) {
+        self.ensure_tx();
+        Self::push_all(&mut self.tx, data);
     }
 
     /// 填充正弦波 (250Hz @16kHz: 64 采样/周期, 立体声 16bit)
-    fn fill_sine(buf: &mut [u8], ms: u32) {
+    ///
+    /// `phase` 为起始采样相位 (0..64), 分块生成时保持连续。
+    fn fill_sine(buf: &mut [u8], mut phase: usize) {
         const TAB: [i16; 64] = build_sine_table();
-        let samples = (ms as usize * 16).min(buf.len() / 4); // 16 采样/ms @16kHz
+        let samples = buf.len() / 4;
         for i in 0..samples {
-            let v = TAB[i % 64].to_le_bytes();
+            let v = TAB[phase % 64].to_le_bytes();
             let o = i * 4;
             buf[o..o + 2].copy_from_slice(&v); // 左
             buf[o + 2..o + 4].copy_from_slice(&v); // 右
+            phase += 1;
         }
     }
 
@@ -265,7 +417,17 @@ impl Capture {
     /// 返回的句柄存活期间 DMA 持续运行, 周期性 `available()` / `pop()`
     /// 取走数据; 句柄丢弃即停止采集。
     pub fn start(&mut self) -> Result<DmaTransferRxCircular<'_, I2sRx<'static, Blocking>>, Error> {
-        self.i2s_rx.read_dma_circular(&mut self.rx_buf)
+        let transfer = self.i2s_rx.read_dma_circular(&mut self.rx_buf)?;
+        // esp-hal 1.1.2 把 `rx_eof_num` 写成整条环字节数-1 (32735), 但 S3 该字段
+        // 只有 12 位 → 截断成 4063; 与描述符边界 (4092B) 错位, 真机表现为
+        // 每 64B 仅 8B 有效 (其余全 0) → ASR 只能听到"嗯/。"。按 IDF 语义
+        // 重写为单个描述符字节数。
+        const I2S0_RXEOF_NUM: usize = 0x6000_f064;
+        // SAFETY: I2S0 寄存器窗口固定映射; 采集刚启动, 写阈值无副作用
+        unsafe {
+            core::ptr::write_volatile(I2S0_RXEOF_NUM as *mut u32, DMA_CHUNK_SIZE as u32);
+        }
+        Ok(transfer)
     }
 }
 

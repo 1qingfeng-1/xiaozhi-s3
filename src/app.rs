@@ -14,7 +14,9 @@ use esp_hal::{Blocking, dma::DmaTransferRxCircular, i2s::master::I2sRx};
 
 use defmt::{error, info, warn};
 
-use xiaozhi_core::audio::capture::{apply_gain_percent, extract_slot, level_stats};
+use xiaozhi_core::audio::capture::{
+    apply_gain_percent, extract_slot, is_voice_active, level_stats, limit_peak,
+};
 use xiaozhi_core::audio::wake::{
     VadWakeDetector, WakeEngine, WakeEvent, WakePolicy, WakePolicyConfig,
 };
@@ -34,7 +36,7 @@ impl defmt::Format for SessionCommand {
     }
 }
 use crate::bsp::components::{
-    Audio, Battery, BreathSpeed, Buttons, Display, LedMode, Leds, Power, Rgb565,
+    Audio, Battery, BreathSpeed, Buttons, Display, LedMode, Leds, Power, Rgb565, TX_RING_BYTES,
 };
 use crate::session;
 
@@ -43,10 +45,29 @@ use crate::session;
 const SAMPLE_RATE: u32 = 16_000;
 const FRAME_MS: u32 = 60;
 const FRAME_SAMPLES: usize = SAMPLE_RATE as usize / 1000 * FRAME_MS as usize; // 960
-/// 软件增益百分比: 麦克风数字电平 1~5% 满幅, +18dB 后 ASR 可用
-const GAIN_PERCENT: u16 = 800;
-/// 唤醒 VAD 阈值 (均方幅度, 原始采集电平域; 环境噪声几十 / 正常说话 >1k)
-pub const VAD_THRESHOLD: i16 = 800;
+/// 软件增益百分比: 麦克风数字电平偏低, 上行前放大 (原始域 ×4 ≈ +12dB)
+///
+/// 真机实测 (2026-09-26): 采集时钟修复 (环形 TX 常流) 后原始人声峰值达
+/// 2000~5000, 旧的 800% 会把样本打到 ±32767 (削顶) → ASR 失效。
+/// 400% 后上行 rms 约 2000~4000, 与参考样本 (test_query.raw) 电平一致。
+const GAIN_PERCENT: u16 = 600;
+/// 上行限幅门限: 留 ~1.4dB 余量, 防 i16 饱和削顶 (削顶会毁掉 ASR)
+const UPLINK_CEILING: i16 = 28_000;
+/// TTS 播报期的 TX 低水位 (20ms): 队列快见底才补静音。
+///
+/// 播报期每轮都填满会在 TTS 帧之间插静音 (一卡一卡); 完全不补则 DMA 绕环
+/// 重放旧数据 (真机 2026-09-26: 提示音/尾音反复 → 「嘟嘟嘟」)。取低水位兼得。
+const TTS_TX_LOW_WATER: usize = 16_000 / 1000 * 20 * 4; // 20ms 立体声 16bit
+/// 唤醒 VAD 阈值 (均方幅度, 原始采集电平域)
+///
+/// 真机实测 (2026-09-26): 本机麦克风数字电平偏低 — 环境噪声 rms 15~85,
+/// 正常说话峰值仅 200~750 (未达旧阈值 800 → 完全无法唤醒)。取 300:
+/// 约 3.5x 噪声余量, 且低于说话峰值; 去抖 2 帧 (128ms) 滤瞬态。
+/// audio-loopback 亦取 300。
+pub const VAD_THRESHOLD: i16 = 300;
+/// 回合结束用 VAD 阈值: 比唤醒阈值低 (原始人声多数帧 rms 200~400);
+/// 误判 "说过话" 只影响收尾时机, 不会误唤醒, 故取低值保证不丢话。
+const LISTEN_VAD_THRESHOLD: i16 = 180;
 
 /// 乒乓窗口 = 单个 DMA 描述符 (4092B ≈ 64ms): available() 按完整描述符计数
 const BLOCK_BYTES: usize = 4092;
@@ -191,15 +212,36 @@ pub async fn session_task(args: SessionArgs) {
         // ---- 建连 (阻塞仅影响本任务; 音频主循环照常排空采集) ----
         if want_connect {
             want_connect = false;
-            if !connected {
+            if connected {
+                // 已连接: 补发就绪。上一轮"按下 BOOT→建连中松开→回 Idle"时,
+                // 迟到的 Ready 被状态机忽略, 但会话仍活着; 若不补发,
+                // 下次按键会一直停在 Connecting (永远等不到就绪) — 真机复现。
+                channels.event.try_send(SessionEvent::Ready).ok();
+            } else {
                 info!("会话任务: 开始连接...");
-                match session::connect(&mut socket, server, &mac).await {
-                    Ok((_rate, _frame_ms)) => {
+                let started = esp_hal::time::Instant::now().duration_since_epoch();
+                match embassy_time::with_timeout(
+                    embassy_time::Duration::from_secs(8),
+                    session::connect(&mut socket, server, &mac),
+                )
+                .await
+                {
+                    Ok(Ok((_rate, _frame_ms))) => {
                         connected = true;
+                        let elapsed = esp_hal::time::Instant::now()
+                            .duration_since_epoch()
+                            .saturating_sub(started)
+                            .as_millis();
+                        info!("会话连接完成: {}ms", elapsed);
                         channels.event.try_send(SessionEvent::Ready).ok();
                     },
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         warn!("会话连接失败: {}", e);
+                        channels.event.try_send(SessionEvent::Closed).ok();
+                    },
+                    Err(_) => {
+                        warn!("会话连接超时 (8s) — 中止");
+                        socket.abort();
                         channels.event.try_send(SessionEvent::Closed).ok();
                     },
                 }
@@ -353,7 +395,22 @@ pub async fn run(
     let mut battery_last_read = 0u64;
     let mut uplink_frames: u64 = 0;
     let mut last_level_log_ms: u64 = 0;
+    let mut idle_peak_rms: i32 = 0;
+    let mut listen_peak_rms: i32 = 0;
+    // 上行回合检测 (auto 模式): 说完 → 本地 VAD 静音 → 主动 listen stop
+    let mut listen_heard = false;
+    let mut listen_silence_ms: u64 = 0;
+    let mut listen_total_ms: u64 = 0;
+    let mut was_listening = false;
+    let mut raw_dumped = false;
     let mut pending: heapless::Vec<(Action, ListenMode), 8> = heapless::Vec::new();
+
+    for (reg, val) in audio.es7210_debug_regs() {
+        info!("ES7210 0x{:02X}=0x{:02X}", reg, val);
+    }
+    for (off, val) in Audio::i2s_debug_regs() {
+        info!("I2S0 0x{:02X}=0x{:08X}", off, val);
+    }
 
     info!("=== 主循环启动: 待机监听 (说话唤醒 / 按住 BOOT 对讲) ===");
 
@@ -361,12 +418,12 @@ pub async fn run(
         let now_ms = esp_hal::time::Instant::now()
             .duration_since_epoch()
             .as_millis();
-        let mut played = false;
-
         // ---- 1. 会话事件 ----
         loop {
             match channels.event.try_receive() {
                 Ok(SessionEvent::Ready) => {
+                    // 就绪提示音: 告知用户连接完成、此刻可开口 (手动/语音两种入口)
+                    audio.beep(150);
                     dispatch(&mut sm, &mut pending, DialogEvent::SessionReady)
                 },
                 Ok(SessionEvent::TtsStart) => {
@@ -499,6 +556,15 @@ pub async fn run(
         }
 
         // ---- 6. 采集排空 (每轮必做, 时钟常开期间防饱和) ----
+        // auto 回合检测: 进入 Listening 时重置
+        let is_listening = sm.state() == DialogState::Listening;
+        if is_listening && !was_listening {
+            listen_heard = false;
+            listen_silence_ms = 0;
+            listen_total_ms = 0;
+        }
+        was_listening = is_listening;
+
         let mut triggered = false;
         let avail = match cap.available() {
             Ok(a) => a,
@@ -521,18 +587,75 @@ pub async fn run(
             let ns = extract_slot(&pop_buf[..(n / 4) * 4], 2, 0, mono_buf);
             match sm.state() {
                 // VAD 必须在原始电平域 (硬件增益后、无软件增益, 对齐 C++ 参考):
-                // 若在 800% 增益后跑, 阈值 800 等效原始 ~100, 环境噪声即误触发
+                // 若在软件增益后跑, 阈值等效原始值被放大, 环境噪声即误触发
                 DialogState::Idle => {
                     // 1Hz 电平诊断 (原始域): 阈值调参/假唤醒排查
+                    // peak = 自上次打印以来的最大块 rms (说话峰值可能落在采样点之间)
+                    let (mean, rms) = level_stats(&mono_buf[..ns]);
+                    idle_peak_rms = idle_peak_rms.max(rms);
                     if now_ms.saturating_sub(last_level_log_ms) >= 1_000 {
                         last_level_log_ms = now_ms;
-                        let (mean, rms) = level_stats(&mono_buf[..ns]);
-                        info!("待机电平: mean={} rms={}", mean, rms);
+                        let regs = audio.es7210_debug_regs();
+                        let rd = |reg: u8| {
+                            regs.iter()
+                                .find(|(r, _)| *r == reg)
+                                .map(|(_, v)| *v)
+                                .unwrap_or(0xFF)
+                        };
+                        info!(
+                            "待机电平: mean={} rms={} peak={} (阈值 {}) ES7210 01={:02X} 08={:02X} 02={:02X}",
+                            mean,
+                            rms,
+                            idle_peak_rms,
+                            VAD_THRESHOLD,
+                            rd(0x01),
+                            rd(0x08),
+                            rd(0x02)
+                        );
+                        idle_peak_rms = 0;
                     }
                     triggered |= wake.feed(&mono_buf[..ns], now_ms) == WakeEvent::Triggered;
                 },
                 DialogState::Listening => {
+                    // 回合结束判定 (auto 模式): 本地能量 VAD 找静音收尾点。
+                    // ⚠️ 不做噪声门: 原始人声 rms 仅 200~400, 与噪声 (30~90) 差距小,
+                    // 门限稍高就会把说话帧也清零 (真机实测: 服务端只收到 0.6s 零值)。
+                    let frame_ms = ns as u64 * 1000 / SAMPLE_RATE as u64;
+                    listen_total_ms += frame_ms;
+                    let warmup = listen_total_ms <= 600;
+                    let voiced = !warmup && is_voice_active(&mono_buf[..ns], LISTEN_VAD_THRESHOLD);
+                    // 一次性原始 I2S 转储 (排查字节序/槽位): 首个有声帧的前 512 帧
+                    if !raw_dumped && voiced {
+                        raw_dumped = true;
+                        let frames = (n / 4).min(512);
+                        for k in 0..frames {
+                            let o = k * 4;
+                            let l = i16::from_le_bytes([pop_buf[o], pop_buf[o + 1]]);
+                            let r = i16::from_le_bytes([pop_buf[o + 2], pop_buf[o + 3]]);
+                            info!("RAW {} L={} R={}", k, l, r);
+                        }
+                    }
+                    if voiced {
+                        listen_heard = true;
+                        listen_silence_ms = 0;
+                    } else {
+                        if listen_heard {
+                            listen_silence_ms += frame_ms;
+                        }
+                    }
                     apply_gain_percent(&mut mono_buf[..ns], GAIN_PERCENT);
+                    let limited = limit_peak(&mut mono_buf[..ns], UPLINK_CEILING);
+                    // 1Hz 上行电平诊断 (增益后): 调增益/查削顶
+                    let (lmean, lrms) = level_stats(&mono_buf[..ns]);
+                    listen_peak_rms = listen_peak_rms.max(lrms);
+                    if now_ms.saturating_sub(last_level_log_ms) >= 1_000 {
+                        last_level_log_ms = now_ms;
+                        info!(
+                            "聆听电平(增益后): mean={} rms={} peak={} voiced={} lim={}",
+                            lmean, lrms, listen_peak_rms, voiced, limited
+                        );
+                        listen_peak_rms = 0;
+                    }
                     if let Some(encoder) = encoder.as_mut() {
                         let mut src = &mono_buf[..ns];
                         while !src.is_empty() {
@@ -571,6 +694,19 @@ pub async fn run(
             dispatch(&mut sm, &mut pending, DialogEvent::WakeTriggered);
         }
 
+        // auto 模式本地收尾: 说完静音 700ms, 或 8s 无人声 → listen stop
+        if sm.state() == DialogState::Listening && sm.mode() == ListenMode::Auto {
+            let done = (listen_heard && listen_silence_ms >= 500)
+                || (!listen_heard && listen_total_ms >= 8_000);
+            if done {
+                info!(
+                    "本地收尾: heard={} 静音={}ms 总时长={}ms",
+                    listen_heard, listen_silence_ms, listen_total_ms
+                );
+                dispatch(&mut sm, &mut pending, DialogEvent::AutoListenStop);
+            }
+        }
+
         // ---- 7. 下行播放: opus → 解码 → 立体声 (每轮 ≤3 帧 ≈180ms,
         // 防止连播期间 RX 积压超过排空缓冲) ----
         for _ in 0..3 {
@@ -586,17 +722,21 @@ pub async fn run(
                     let n = n.min(pcm_dec.len());
                     let written = mono_to_stereo(&pcm_dec[..n], &mut stereo_out);
                     audio.play_block(&stereo_out[..written]);
-                    played = true;
                 },
                 Ok(_) => {},
                 Err(e) => warn!("opus 解码失败: {}", e),
             }
         }
 
-        // ---- 8. 时钟维持 (全程常开; TTS 轮次由下行音频维持) ----
-        if !played {
-            audio.play_block(silence_buf);
-        }
+        // ---- 8. 时钟维持 (环形常流; 空闲补静音保 BCLK/WS 不停) ----
+        // 播报期用低水位: 只在队列快见底时补静音, 既不在 TTS 帧之间插静音,
+        // 也不让 DMA 绕环重放旧数据 (真机 2026-09-26: 嘟嘟嘟/一卡一卡)。
+        let tx_target = if sm.state() == DialogState::Speaking {
+            TTS_TX_LOW_WATER
+        } else {
+            TX_RING_BYTES
+        };
+        audio.maintain_silence(silence_buf, tx_target);
         // 让出 CPU: 会话任务/网络任务需要被轮询才能推进连接与收发
         // Idle 时放宽到 10ms (降 CPU 唤醒频率, I2S 缓冲 512ms 容量足够)
         let wait_ms = if sm.state() == DialogState::Idle {
@@ -695,6 +835,7 @@ fn event_label(ev: DialogEvent) -> &'static str {
         DialogEvent::WakeTriggered => "唤醒触发",
         DialogEvent::ManualListenStart => "按住BOOT",
         DialogEvent::ManualListenStop => "松开BOOT",
+        DialogEvent::AutoListenStop => "本地静音收尾",
         DialogEvent::SessionReady => "会话就绪",
         DialogEvent::TtsStart => "播报开始",
         DialogEvent::TtsStop => "播报结束",
