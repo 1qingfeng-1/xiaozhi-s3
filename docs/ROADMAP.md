@@ -9,7 +9,7 @@
 > **状态 (2026-10-23)**：M1–M4.2 已上机验证；M5–M10 代码完成，其中
 > M8/M10 的真机验收清单尚待逐项勾销。
 > wakenet 特性链接闭环但真机运行时失败（MMU block 1），VAD 声音唤醒为默认路径。
-> AEC barge-in 推迟 v1.1。host 单测 95/95，全 bin 编译/clippy/fmt 全绿；代码已推送 origin。
+> AEC barge-in 推迟 v1.1。host 单测 103/103，全 bin 编译/clippy/fmt 全绿；代码已推送 origin。
 > **当前阶段 = M10 真机验证 + v1.0 发布**。
 
 ```text

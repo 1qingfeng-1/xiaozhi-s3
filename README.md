@@ -137,7 +137,7 @@ espflash flash --chip esp32s3 --baud 460800 target/riscv32imc-esp-espidf/release
 
 ```bash
 cd xiaozhi-core
-cargo +stable nextest run     # 推荐 (并行, 95 个测试)
+cargo +stable nextest run     # 推荐 (并行, 103 个测试)
 # 或
 cargo +stable test
 ```

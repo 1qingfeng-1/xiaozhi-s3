@@ -414,6 +414,7 @@ pub async fn run(
         alloc::vec![0u8; FRAME_SAMPLES * 4].into_boxed_slice();
     // 播报播放管线: 软件 PCM 队列 + DMA 泵送 + 预缓冲/排空门控
     let mut playback = Playback::new();
+    let mut barge_in_active = false;
     let mut tx_rate_bytes: u64 = 0;
     let mut tx_rate_ms: u64 = 0;
     let mut acc_len = 0usize;
@@ -462,6 +463,8 @@ pub async fn run(
                     dispatch(&mut sm, &mut pending, DialogEvent::SessionReady)
                 },
                 Ok(SessionEvent::TtsStart) => {
+                    dec_pkts = 0;
+                    dec_samples = 0;
                     playback.on_tts_start();
                     dispatch(&mut sm, &mut pending, DialogEvent::TtsStart)
                 },
@@ -503,18 +506,24 @@ pub async fn run(
         if pressed != held {
             held = pressed;
             if held && sm.state() == DialogState::Speaking {
-                // 按键打断: 立即丢弃未播完的 TTS
+                // 播报中按键: 立即丢弃未播完的 TTS, 转入 auto 聆听
                 playback.reset();
+                barge_in_active = true;
+                dispatch(&mut sm, &mut pending, DialogEvent::BargeIn);
+            } else if !held && barge_in_active {
+                // 打断后的松键不结束自动聆听
+                barge_in_active = false;
+            } else {
+                dispatch(
+                    &mut sm,
+                    &mut pending,
+                    if held {
+                        DialogEvent::ManualListenStart
+                    } else {
+                        DialogEvent::ManualListenStop
+                    },
+                );
             }
-            dispatch(
-                &mut sm,
-                &mut pending,
-                if held {
-                    DialogEvent::ManualListenStart
-                } else {
-                    DialogEvent::ManualListenStop
-                },
-            );
         }
         let vol_up = buttons.volume_up_pressed();
         let vol_down = buttons.volume_down_pressed();
@@ -592,7 +601,7 @@ pub async fn run(
             state_since_ms = now_ms;
         }
         if sm.state() == DialogState::WaitingReply && now_ms - state_since_ms > 20_000 {
-            warn!("等回复超时 (10s), 结束会话");
+            warn!("等回复超时 (20s), 结束会话");
             dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
         }
 
@@ -762,6 +771,12 @@ pub async fn run(
         // 队列空间不足时停止取包: 包留在通道里 → 会话任务阻塞 → TCP 反压服务器,
         // 而不是丢帧 (丢帧 = 漏字)。
         for _ in 0..3 {
+            // 非播报态丢弃下行音频: 按键打断后服务器可能仍在发剩余包,
+            // 若继续解码播放, 听感上就是"按了没停"
+            if sm.state() != DialogState::Speaking {
+                while channels.downlink.try_receive().is_ok() {}
+                break;
+            }
             if !playback.has_space() {
                 break;
             }
@@ -794,8 +809,8 @@ pub async fn run(
         }
 
         // ---- 8. 时钟维持: 软件队列 → DMA 环形, 没数据时补静音 ----
-        let (underran, _) = playback.pump(audio, silence_buf);
-        if underran && playback.underruns() % 20 == 1 {
+        let (underran, _) = playback.pump(audio, silence_buf, sm.state() == DialogState::Speaking);
+        if underran && playback.underruns() % 100 == 1 {
             info!("播报欠载 #{} (PCM 队列空, 补静音)", playback.underruns());
         }
         if playback.take_prebuffer_done() {
@@ -922,6 +937,7 @@ fn event_label(ev: DialogEvent) -> &'static str {
         DialogEvent::ManualListenStart => "按住BOOT",
         DialogEvent::ManualListenStop => "松开BOOT",
         DialogEvent::AutoListenStop => "本地静音收尾",
+        DialogEvent::BargeIn => "按键打断",
         DialogEvent::SessionReady => "会话就绪",
         DialogEvent::TtsStart => "播报开始",
         DialogEvent::TtsStop => "播报结束",

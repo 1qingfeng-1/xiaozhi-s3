@@ -395,7 +395,13 @@ impl Audio {
     pub fn tx_free(&mut self) -> usize {
         self.ensure_tx();
         match self.tx.as_mut() {
-            Some(t) => t.available().unwrap_or(0),
+            Some(t) => match t.available() {
+                Ok(v) => v,
+                Err(e) => {
+                    defmt::warn!("I2S TX available 失败 (可能欠载): {:?}", e);
+                    0
+                },
+            },
             None => 0,
         }
     }

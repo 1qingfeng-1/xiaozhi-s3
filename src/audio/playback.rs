@@ -55,7 +55,7 @@ impl Playback {
     }
 
     /// 泵入 DMA 环形；返回 (是否欠载, 写入字节数)
-    pub fn pump(&mut self, audio: &mut Audio, silence: &[u8]) -> (bool, usize) {
+    pub fn pump(&mut self, audio: &mut Audio, silence: &[u8], active: bool) -> (bool, usize) {
         let allow = self.flow.allow_audio(self.q.len());
         let mut underran = false;
         let mut total = 0usize;
@@ -64,16 +64,17 @@ impl Playback {
             if free == 0 {
                 break;
             }
-            if allow && self.q.is_empty() {
+            if active && allow && self.q.is_empty() && !self.flow.pending_stop() {
                 underran = true;
             }
             let pushed = if !allow || self.q.is_empty() {
                 audio.push_avail(&silence[..free.min(silence.len())])
             } else {
-                self.q.make_contiguous();
-                let (contig, _) = self.q.as_slices();
-                let n = free.min(contig.len());
-                let w = audio.push_avail(&contig[..n]);
+                // 不调用 make_contiguous: 直接取队首连续分片, 避免 192KB 搬移
+                let (front, back) = self.q.as_slices();
+                let src = if front.is_empty() { back } else { front };
+                let n = free.min(src.len());
+                let w = audio.push_avail(&src[..n]);
                 self.q.drain(..w);
                 w
             };
