@@ -36,6 +36,7 @@ impl defmt::Format for SessionCommand {
         }
     }
 }
+use crate::audio::playback::Playback;
 use crate::bsp::components::{
     Audio, Battery, BreathSpeed, Buttons, Display, LedMode, Leds, Power, Rgb565,
 };
@@ -54,16 +55,6 @@ const FRAME_SAMPLES: usize = SAMPLE_RATE as usize / 1000 * FRAME_MS as usize; //
 const GAIN_PERCENT: u16 = 600;
 /// 上行限幅门限: 留 ~1.4dB 余量, 防 i16 饱和削顶 (削顶会毁掉 ASR)
 const UPLINK_CEILING: i16 = 28_000;
-/// 软件 PCM 队列上限 (立体声 16bit): 32KB ≈ 0.5s
-///
-/// 下行 opus 帧突发到达时先入队, 由主循环按 I2S 空闲空间泵入 DMA。
-/// DMA 环形因此始终填满 (没数据时补静音), 不会因欠载回放上一圈旧音频
-/// (真机 2026-10-23: 「我我我听听听到了」= 环形旧数据重放)。
-const PCM_QUEUE_MAX: usize = 192 * 1024;
-/// 播报预缓冲: 攒够 300ms 立体声 PCM 再开播, 吸收服务器帧抖动
-const PCM_PREBUFFER: usize = 16_000 / 1000 * 1000 * 4;
-/// 单帧最大 PCM 字节数 (60ms 立体声 16bit)
-const PCM_FRAME_MAX: usize = 960 * 4;
 /// 唤醒 VAD 阈值 (均方幅度, 原始采集电平域)
 ///
 /// 真机实测 (2026-10-23): 采集时钟修复后本机电平上升 — 安静时 rms 150~300
@@ -421,16 +412,8 @@ pub async fn run(
     let mut pcm_dec: alloc::boxed::Box<[i16]> = alloc::vec![0i16; FRAME_SAMPLES].into_boxed_slice();
     let mut stereo_out: alloc::boxed::Box<[u8]> =
         alloc::vec![0u8; FRAME_SAMPLES * 4].into_boxed_slice();
-    // 软件 PCM 队列: 吸收 TTS 帧突发, 保证 DMA 环形永不为空
-    let mut pcm_q: alloc::collections::VecDeque<u8> =
-        alloc::collections::VecDeque::with_capacity(PCM_QUEUE_MAX);
-    // 播报预缓冲 (TtsStart 置位, 攒够 PCM_PREBUFFER 或 TtsStop 后放行)
-    let mut prebuffer = false;
-    // TtsStop 延迟到播放排空后再交给状态机, 避免设备听到自己的 TTS 尾巴 (回声循环)
-    let mut tts_stop_pending = false;
-    let mut drain_done_at = 0u64;
-    let mut underruns: u32 = 0;
-    let mut tx_bytes: u64 = 0;
+    // 播报播放管线: 软件 PCM 队列 + DMA 泵送 + 预缓冲/排空门控
+    let mut playback = Playback::new();
     let mut tx_rate_bytes: u64 = 0;
     let mut tx_rate_ms: u64 = 0;
     let mut acc_len = 0usize;
@@ -479,17 +462,12 @@ pub async fn run(
                     dispatch(&mut sm, &mut pending, DialogEvent::SessionReady)
                 },
                 Ok(SessionEvent::TtsStart) => {
-                    // 新回复: 队列里若还有上一条的尾音则保留 (清空会"少字"),
-                    // 只在队列不足时重新预缓冲
-                    prebuffer = pcm_q.len() < PCM_PREBUFFER;
+                    playback.on_tts_start();
                     dispatch(&mut sm, &mut pending, DialogEvent::TtsStart)
                 },
                 Ok(SessionEvent::TtsStop) => {
-                    // 服务器发送完毕: 等软件队列 + DMA 排空再通知状态机,
-                    // 否则立刻转入 Listening 会把 TTS 尾音当成用户说话 (回声循环)
-                    prebuffer = false;
-                    tts_stop_pending = true;
-                    drain_done_at = 0;
+                    // 等软件队列 + DMA 排空后由 poll_stop 派发, 防回声循环
+                    playback.on_tts_stop();
                 },
                 Ok(SessionEvent::Closed) => {
                     dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed)
@@ -504,10 +482,7 @@ pub async fn run(
                 wake.policy_mut().note_playback_end(now_ms);
                 encoder = None;
                 decoder = None;
-                pcm_q.clear();
-                prebuffer = false;
-                tts_stop_pending = false;
-                drain_done_at = 0;
+                playback.reset();
                 info!("会话已结束, 回到待机监听");
             }
         } else if encoder.is_none() && sm.state() == DialogState::Listening {
@@ -529,10 +504,7 @@ pub async fn run(
             held = pressed;
             if held && sm.state() == DialogState::Speaking {
                 // 按键打断: 立即丢弃未播完的 TTS
-                pcm_q.clear();
-                prebuffer = false;
-                tts_stop_pending = false;
-                drain_done_at = 0;
+                playback.reset();
             }
             dispatch(
                 &mut sm,
@@ -790,7 +762,7 @@ pub async fn run(
         // 队列空间不足时停止取包: 包留在通道里 → 会话任务阻塞 → TCP 反压服务器,
         // 而不是丢帧 (丢帧 = 漏字)。
         for _ in 0..3 {
-            if pcm_q.len() + PCM_FRAME_MAX > PCM_QUEUE_MAX {
+            if !playback.has_space() {
                 break;
             }
             let pkt = match channels.downlink.try_receive() {
@@ -814,8 +786,7 @@ pub async fn run(
                         );
                     }
                     let written = mono_to_stereo(&pcm_dec[..n], &mut stereo_out);
-                    // 先入软件队列, 由 pump_audio 按 DMA 空闲空间泵入
-                    pcm_q.extend(stereo_out[..written].iter().copied());
+                    playback.push(&stereo_out[..written]);
                 },
                 Ok(_) => {},
                 Err(e) => warn!("opus 解码失败: {}", e),
@@ -823,46 +794,29 @@ pub async fn run(
         }
 
         // ---- 8. 时钟维持: 软件队列 → DMA 环形, 没数据时补静音 ----
-        // 环形缓冲始终填满, DMA 不会追到写指针后回放上一圈旧音频。
-        if prebuffer && pcm_q.len() >= PCM_PREBUFFER {
-            prebuffer = false;
-            info!("预缓冲完成: {}B", pcm_q.len());
+        let (underran, _) = playback.pump(audio, silence_buf);
+        if underran && playback.underruns() % 20 == 1 {
+            info!("播报欠载 #{} (PCM 队列空, 补静音)", playback.underruns());
         }
-        let (underran, tx_pushed) = pump_audio(audio, &mut pcm_q, silence_buf, !prebuffer);
-        if underran {
-            underruns += 1;
-            if underruns % 20 == 1 {
-                info!("播报欠载 #{} (PCM 队列空, 补静音)", underruns);
-            }
+        if playback.take_prebuffer_done() {
+            info!("预缓冲完成: {}B", playback.queue_len());
         }
-        tx_bytes += tx_pushed as u64;
         if sm.state() == DialogState::Speaking && now_ms.saturating_sub(tx_rate_ms) >= 1_000 {
+            let tx_bytes = playback.tx_bytes();
             info!(
                 "TX 推送速率: {}B/s (队列 {}B, 欠载累计 {})",
                 (tx_bytes - tx_rate_bytes) * 1000 / now_ms.saturating_sub(tx_rate_ms).max(1),
-                pcm_q.len(),
-                underruns
+                playback.queue_len(),
+                playback.underruns()
             );
             tx_rate_ms = now_ms;
             tx_rate_bytes = tx_bytes;
         }
 
-        // TtsStop 延迟派发: PCM 队列空后再等 150ms 让 DMA 环形播完,
-        // 确认扬声器彻底安静后才回到 Listening (防回声再次触发对话)
-        if tts_stop_pending {
-            if pcm_q.is_empty() {
-                if drain_done_at == 0 {
-                    drain_done_at = now_ms + 150;
-                }
-                if now_ms >= drain_done_at {
-                    tts_stop_pending = false;
-                    drain_done_at = 0;
-                    wake.policy_mut().note_playback_end(now_ms);
-                    dispatch(&mut sm, &mut pending, DialogEvent::TtsStop);
-                }
-            } else {
-                drain_done_at = 0;
-            }
+        // TtsStop 延迟派发: 队列空 + DMA 播完后才回到 Listening (防回声)
+        if playback.poll_stop(now_ms) {
+            wake.policy_mut().note_playback_end(now_ms);
+            dispatch(&mut sm, &mut pending, DialogEvent::TtsStop);
         }
         // 让出 CPU: 会话任务/网络任务需要被轮询才能推进连接与收发
         // Idle 时放宽到 10ms (降 CPU 唤醒频率, I2S 缓冲 512ms 容量足够)
@@ -907,41 +861,6 @@ pub async fn run(
 /// 关键: DMA 环形永远保持满载。有真实音频就写真实音频, 没有就写静音,
 /// 杜绝环形欠载时 DMA 绕回重放旧数据 (听感为逐字重复/杂音)。
 /// 返回是否发生「播报中队列空、只能补静音」的欠载
-/// 返回 (是否发生欠载, 本次实际写入 DMA 的字节数)
-fn pump_audio(
-    audio: &mut Audio,
-    q: &mut alloc::collections::VecDeque<u8>,
-    silence: &[u8],
-    allow_audio: bool,
-) -> (bool, usize) {
-    let mut underran = false;
-    let mut total = 0usize;
-    loop {
-        let free = audio.tx_free();
-        if free == 0 {
-            break;
-        }
-        if q.is_empty() && allow_audio {
-            underran = true;
-        }
-        let pushed = if !allow_audio || q.is_empty() {
-            audio.push_avail(&silence[..free.min(silence.len())])
-        } else {
-            q.make_contiguous();
-            let (contig, _) = q.as_slices();
-            let n = free.min(contig.len());
-            let w = audio.push_avail(&contig[..n]);
-            q.drain(..w);
-            w
-        };
-        if pushed == 0 {
-            break;
-        }
-        total += pushed;
-    }
-    (underran, total)
-}
-
 fn mono_to_stereo(src: &[i16], dst: &mut [u8]) -> usize {
     let mut o = 0;
     for &s in src {
