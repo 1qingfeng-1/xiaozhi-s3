@@ -18,7 +18,8 @@ use xiaozhi_core::audio::capture::{
     apply_gain_percent, extract_slot, is_voice_active, level_stats, limit_peak,
 };
 use xiaozhi_core::audio::wake::{
-    VadWakeDetector, WakeEngine, WakeEvent, WakePolicy, WakePolicyConfig,
+    VadWakeDetector, WakeEngine, WakeEvent, WakePolicy, WakePolicyConfig, adaptive_threshold,
+    update_noise_floor,
 };
 use xiaozhi_core::dialog::{Action, DialogEvent, DialogSm, DialogState, ListenMode};
 
@@ -665,14 +666,8 @@ pub async fn run(
                     // 环境噪声自适应: 慢速 EMA 估计噪声底, 阈值 = 2x 噪声 + 150,
                     // 限制在 [VAD_THRESHOLD, 1200], 避免吵环境里持续误唤醒 (周期性"嘟")
                     // 快降慢升: 迅速跟随安静底噪, 忽略说话/瞬态抬升
-                    noise_ema = if noise_ema == 0 {
-                        rms
-                    } else if rms < noise_ema {
-                        noise_ema - (noise_ema - rms) / 8
-                    } else {
-                        noise_ema + (rms - noise_ema) / 64
-                    };
-                    let wake_threshold = (noise_ema * 2 + 150).clamp(VAD_THRESHOLD as i32, 800);
+                    noise_ema = update_noise_floor(noise_ema, rms);
+                    let wake_threshold = adaptive_threshold(noise_ema, VAD_THRESHOLD, 800);
                     wake.source_mut().set_threshold(wake_threshold as i16);
                     if now_ms.saturating_sub(last_level_log_ms) >= 1_000 {
                         last_level_log_ms = now_ms;
