@@ -1,5 +1,11 @@
 # 小智音箱 - 快速开始
 
+<!-- markdownlint-disable-file -->
+
+> **⚠️ 本文档为早期阶段（2026-08）快照，部分引脚/功能描述已过时。**
+> 当前引脚以 [README](../README.md) 与 `src/bsp/gezipai.rs` 为准；
+> 构建/烧录/测试命令见 [AGENTS.md](../AGENTS.md)。
+
 ## 环境检查
 
 ```bash

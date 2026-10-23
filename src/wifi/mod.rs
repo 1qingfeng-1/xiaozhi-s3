@@ -126,6 +126,39 @@ pub async fn connect_station(
     Err(())
 }
 
+/// 运行期断线重连任务
+///
+/// 持有 [`esp_radio::wifi::WifiController`] 保活射频 (原先由 main 持有)。
+/// 已连接时阻塞等待断线事件; 断线后每 3s 重试 `connect_async` 直到重新关联。
+/// DHCP/链路状态由 embassy-net runner 自动处理; 会话任务通过
+/// [`embassy_net::Stack::is_link_up`] 感知掉线并关闭当前 WS 会话。
+#[embassy_executor::task]
+pub async fn reconnect_task(mut controller: esp_radio::wifi::WifiController<'static>) {
+    loop {
+        if !controller.is_connected() {
+            match controller.connect_async().await {
+                Ok(_) => info!("WiFi 重连成功"),
+                Err(e) => {
+                    error!("WiFi 重连失败: {:?} — 3s 后重试", e);
+                    embassy_time::Timer::after(embassy_time::Duration::from_secs(3)).await;
+                    continue;
+                },
+            }
+        }
+
+        // 已连接: 阻塞等断线事件, 不轮询
+        match controller.wait_for_disconnect_async().await {
+            Ok(info) => info!("WiFi 已断开: reason={:?} rssi={}", info.reason, info.rssi),
+            Err(_) => {
+                // 与 is_connected() 存在竞争: 稍等避免忙等
+                embassy_time::Timer::after(embassy_time::Duration::from_millis(500)).await;
+            },
+        }
+        // 给驱动/协议栈处理链路状态的时间, 再进入重连
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(500)).await;
+    }
+}
+
 #[embassy_executor::task]
 pub async fn net_task(mut runner: embassy_net::Runner<'static, esp_radio::wifi::Interface>) {
     runner.run().await

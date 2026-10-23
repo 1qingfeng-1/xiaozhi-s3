@@ -1,5 +1,11 @@
 # 小智音箱 - ESP32-S3 智能音箱
 
+<!-- markdownlint-disable-file -->
+
+> **⚠️ 本文档为早期阶段（2026-08）快照，部分内容已过时。**
+> 当前实现、引脚与进度以 [README](../README.md)、[AGENTS.md](../AGENTS.md)、
+> [ROADMAP](ROADMAP.md) 和 `src/bsp/gezipai.rs` 为准。
+
 ## 📋 项目概述
 
 基于 ESP32-S3-AI-2 模组的智能音箱，使用 Rust 开发。支持语音识别、语音合成和大语言模型对话。

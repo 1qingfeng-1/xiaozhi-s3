@@ -1,5 +1,11 @@
 # 小智音箱 - 项目完成总结
 
+<!-- markdownlint-disable-file -->
+
+> **⚠️ 本文档为早期阶段（2026-08）快照，仅保留历史记录。**
+> 当前实现与进度以 [README](../README.md)、[AGENTS.md](../AGENTS.md)、
+> [ROADMAP](ROADMAP.md) 为准。
+
 ## ✅ 已完成工作
 
 ### 1. 开发环境搭建

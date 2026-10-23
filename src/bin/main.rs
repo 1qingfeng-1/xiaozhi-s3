@@ -136,6 +136,9 @@ async fn main(spawner: Spawner) -> ! {
     use esp_radio::wifi::PowerSaveMode;
     let mut controller = controller;
     let _ = controller.set_power_saving(PowerSaveMode::Minimum);
+    // 控制器交给重连任务保活射频: 运行期断线自动重连 (原先仅 main 持有)
+    let reconnect_token = wifi::reconnect_task(controller).unwrap();
+    spawner.spawn(reconnect_token);
     info!("设备 ID: {}", mac.as_str());
 
     // 开机 OTA: **独立任务** (勿内联 main — main future 膨胀会挤掉 opus 主栈)

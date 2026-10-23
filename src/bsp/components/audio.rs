@@ -23,6 +23,7 @@ use esp_hal::{
 
 use alloc::boxed::Box;
 use alloc::vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 use xiaozhi_core::audio::codec::{
     self as codec_mod, RegWrite, es7210_init_sequence, es8311_init_sequence, es8311_volume_write,
 };
@@ -40,6 +41,8 @@ pub const TX_RING_BYTES: usize = TX_BUF_SIZE;
 const BEEP_CHUNK_SIZE: usize = DMA_CHUNK_SIZE;
 /// 单个 DMA 描述符管理的最大字节数
 const DMA_CHUNK_SIZE: usize = 4092;
+/// TX 环形欠载计数 (诊断: 播报期队列空 → DMA 回放旧数据)
+static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
 /// RX 循环缓冲 = 8 个整描述符 ≈ 0.25s @ 16kHz 立体声 16bit。
 /// 描述符必须与缓冲精确等分: esp-hal 循环采集的软件状态回溯从链尾
 /// 描述符出发, 数量不匹配 (多余空描述符) 会导致空指针崩溃
@@ -347,6 +350,13 @@ impl Audio {
                 },
             };
             let queued = TX_BUF_SIZE - free.min(TX_BUF_SIZE);
+            // 队列空 = DMA 已绕环回放旧数据 (播报期出现即为"重复字/杂音"根因)
+            if free >= TX_BUF_SIZE && target < TX_BUF_SIZE {
+                let n = UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1;
+                if !n.is_multiple_of(10) || n == 1 {
+                    defmt::warn!("I2S TX 欠载 #{} — DMA 回放旧数据", n);
+                }
+            }
             if queued >= target {
                 return;
             }
@@ -376,6 +386,37 @@ impl Audio {
     pub fn play_block(&mut self, data: &[u8]) {
         self.ensure_tx();
         Self::push_all(&mut self.tx, data);
+    }
+
+    /// 环形 TX 当前可写入字节数 (0 = 已满或未启动)
+    ///
+    /// 供上层「软件 PCM 队列 → DMA 环形」泵送使用: 每次只写空闲空间,
+    /// 环形永远保持填满, DMA 不会追到写指针后回放旧音频。
+    pub fn tx_free(&mut self) -> usize {
+        self.ensure_tx();
+        match self.tx.as_mut() {
+            Some(t) => t.available().unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    /// 非阻塞写入: 只写空闲空间放得下的部分, 返回实际写入字节数
+    pub fn push_avail(&mut self, data: &[u8]) -> usize {
+        let Some(t) = self.tx.as_mut() else {
+            return 0;
+        };
+        let free = match t.available() {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        let n = data.len().min(free);
+        if n == 0 {
+            return 0;
+        }
+        match t.push(&data[..n]) {
+            Ok(written) => written,
+            Err(_) => 0,
+        }
     }
 
     /// 填充正弦波 (250Hz @16kHz: 64 采样/周期, 立体声 16bit)

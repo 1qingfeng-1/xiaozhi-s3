@@ -16,8 +16,10 @@ jobs:
     name: Check formatting
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (with submodule)
         uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Install ESP toolchain
         uses: esp-rs/xtensa-toolchain@v1.7
@@ -44,8 +46,10 @@ jobs:
     name: Clippy lints
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (with submodule)
         uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Install ESP toolchain
         uses: esp-rs/xtensa-toolchain@v1.7
@@ -72,8 +76,10 @@ jobs:
     name: Cargo check
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (with submodule)
         uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Install ESP toolchain
         uses: esp-rs/xtensa-toolchain@v1.7
@@ -134,8 +140,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: [fmt, clippy, check, core-test]
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (with submodule)
         uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Install ESP toolchain
         uses: esp-rs/xtensa-toolchain@v1.7

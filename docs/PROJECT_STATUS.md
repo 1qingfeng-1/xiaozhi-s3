@@ -1,5 +1,11 @@
 # 小智音箱项目 - 开发状态总结
 
+<!-- markdownlint-disable-file -->
+
+> **⚠️ 本文档为早期阶段（2026-08）快照，部分内容已过时（引脚/功能状态）。**
+> 当前实现与进度以 [README](../README.md)、[AGENTS.md](../AGENTS.md)、
+> [ROADMAP](ROADMAP.md) 为准。
+
 ## 项目概述
 
 **项目名称**: 小智音箱 (xiaozhi-s3)

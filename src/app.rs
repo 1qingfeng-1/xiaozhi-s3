@@ -36,7 +36,7 @@ impl defmt::Format for SessionCommand {
     }
 }
 use crate::bsp::components::{
-    Audio, Battery, BreathSpeed, Buttons, Display, LedMode, Leds, Power, Rgb565, TX_RING_BYTES,
+    Audio, Battery, BreathSpeed, Buttons, Display, LedMode, Leds, Power, Rgb565,
 };
 use crate::session;
 
@@ -53,21 +53,34 @@ const FRAME_SAMPLES: usize = SAMPLE_RATE as usize / 1000 * FRAME_MS as usize; //
 const GAIN_PERCENT: u16 = 600;
 /// 上行限幅门限: 留 ~1.4dB 余量, 防 i16 饱和削顶 (削顶会毁掉 ASR)
 const UPLINK_CEILING: i16 = 28_000;
-/// TTS 播报期的 TX 低水位 (20ms): 队列快见底才补静音。
+/// 软件 PCM 队列上限 (立体声 16bit): 32KB ≈ 0.5s
 ///
-/// 播报期每轮都填满会在 TTS 帧之间插静音 (一卡一卡); 完全不补则 DMA 绕环
-/// 重放旧数据 (真机 2026-09-26: 提示音/尾音反复 → 「嘟嘟嘟」)。取低水位兼得。
-const TTS_TX_LOW_WATER: usize = 16_000 / 1000 * 20 * 4; // 20ms 立体声 16bit
+/// 下行 opus 帧突发到达时先入队, 由主循环按 I2S 空闲空间泵入 DMA。
+/// DMA 环形因此始终填满 (没数据时补静音), 不会因欠载回放上一圈旧音频
+/// (真机 2026-10-23: 「我我我听听听到了」= 环形旧数据重放)。
+const PCM_QUEUE_MAX: usize = 192 * 1024;
+/// 播报预缓冲: 攒够 300ms 立体声 PCM 再开播, 吸收服务器帧抖动
+const PCM_PREBUFFER: usize = 16_000 / 1000 * 1000 * 4;
+/// 单帧最大 PCM 字节数 (60ms 立体声 16bit)
+const PCM_FRAME_MAX: usize = 960 * 4;
 /// 唤醒 VAD 阈值 (均方幅度, 原始采集电平域)
 ///
-/// 真机实测 (2026-09-26): 本机麦克风数字电平偏低 — 环境噪声 rms 15~85,
-/// 正常说话峰值仅 200~750 (未达旧阈值 800 → 完全无法唤醒)。取 300:
-/// 约 3.5x 噪声余量, 且低于说话峰值; 去抖 2 帧 (128ms) 滤瞬态。
-/// audio-loopback 亦取 300。
-pub const VAD_THRESHOLD: i16 = 300;
+/// 真机实测 (2026-10-23): 采集时钟修复后本机电平上升 — 安静时 rms 150~300
+/// (偶发噪声峰值 2000+), 正常说话 rms 300~1300。旧阈值 300 会让环境噪声
+/// 频繁误唤醒 (周期性"嘟"提示音, 10 分钟内 26 次)。取 700: 高于安静噪声
+/// 基线, 低于正常说话峰值; 配合 3 帧去抖 (~192ms) 滤瞬态。
+pub const VAD_THRESHOLD: i16 = 400;
 /// 回合结束用 VAD 阈值: 比唤醒阈值低 (原始人声多数帧 rms 200~400);
 /// 误判 "说过话" 只影响收尾时机, 不会误唤醒, 故取低值保证不丢话。
 const LISTEN_VAD_THRESHOLD: i16 = 180;
+/// 回合结束: 累计有声至少 400ms 才算"说过话"
+///
+/// 真机 2026-10-23: 环境噪声/唤醒提示音让单帧即置 heard, 随后 500ms
+/// 安静就判停 (总时长仅 1.5s), 用户还没开口回合已结束 → 服务器只收到
+/// 噪声/静音。改为累计有声时长门槛, 滤掉瞬态噪声。
+const LISTEN_MIN_VOICED_MS: u64 = 400;
+/// 回合结束: 说完后持续静音 800ms 才收尾 (原 500ms 太短)
+const LISTEN_SILENCE_MS: u64 = 800;
 
 /// 乒乓窗口 = 单个 DMA 描述符 (4092B ≈ 64ms): available() 按完整描述符计数
 const BLOCK_BYTES: usize = 4092;
@@ -156,8 +169,20 @@ pub async fn session_task(args: SessionArgs) {
     let mut socket = embassy_net::tcp::TcpSocket::new(stack, rx, tx);
     let mut connected = false;
     let mut want_connect = false;
+    // 下行统计 (诊断重复播放: 每次 tts stop 输出包数/字节数)
+    let mut down_pkts: u32 = 0;
+    let mut down_bytes: u64 = 0;
 
     loop {
+        // ---- WiFi 掉线: 当前 WS 会话不可信, 立即收尾等重连 ----
+        // (重连任务负责重新关联; 这里只关闭并 abort socket, 下次唤醒重建)
+        if connected && !stack.is_link_up() {
+            warn!("WiFi 链路断开 — 关闭当前会话");
+            socket.abort();
+            connected = false;
+            channels.event.try_send(SessionEvent::Closed).ok();
+        }
+
         // ---- 命令 ----
         loop {
             match channels.command.try_receive() {
@@ -280,7 +305,12 @@ pub async fn session_task(args: SessionArgs) {
                                     channels.event.try_send(SessionEvent::TtsStart).ok();
                                 },
                                 (Some("tts"), Some("stop")) => {
-                                    info!("服务器: tts stop");
+                                    info!(
+                                        "服务器: tts stop (下行 {} 包 {}B)",
+                                        down_pkts, down_bytes
+                                    );
+                                    down_pkts = 0;
+                                    down_bytes = 0;
                                     channels.event.try_send(SessionEvent::TtsStop).ok();
                                 },
                                 _ => {
@@ -302,11 +332,13 @@ pub async fn session_task(args: SessionArgs) {
                             }
                         },
                         2 => {
+                            down_pkts += 1;
+                            down_bytes += payload.len() as u64;
                             let mut pkt: OpusPacket = heapless::Vec::new();
-                            if pkt.extend_from_slice(&payload).is_ok()
-                                && channels.downlink.try_send(pkt).is_err()
-                            {
-                                warn!("下行通道满, 丢弃一帧");
+                            if pkt.extend_from_slice(&payload).is_ok() {
+                                // 阻塞发送: 通道满时停止读 TCP → 反压服务器,
+                                // 而不是丢帧 (丢帧 = 漏字)
+                                channels.downlink.send(pkt).await;
                             }
                         },
                         8 => {
@@ -378,6 +410,8 @@ pub async fn run(
         VadWakeDetector::new(VAD_THRESHOLD),
         WakePolicy::new(WakePolicyConfig {
             warmup_ms: 1_000,
+            // 4 帧 ≈256ms 持续人声: 滤掉环境噪声瞬态
+            debounce_frames: 4,
             ..Default::default()
         }),
     );
@@ -386,6 +420,18 @@ pub async fn run(
     let mut pcm_dec: alloc::boxed::Box<[i16]> = alloc::vec![0i16; FRAME_SAMPLES].into_boxed_slice();
     let mut stereo_out: alloc::boxed::Box<[u8]> =
         alloc::vec![0u8; FRAME_SAMPLES * 4].into_boxed_slice();
+    // 软件 PCM 队列: 吸收 TTS 帧突发, 保证 DMA 环形永不为空
+    let mut pcm_q: alloc::collections::VecDeque<u8> =
+        alloc::collections::VecDeque::with_capacity(PCM_QUEUE_MAX);
+    // 播报预缓冲 (TtsStart 置位, 攒够 PCM_PREBUFFER 或 TtsStop 后放行)
+    let mut prebuffer = false;
+    // TtsStop 延迟到播放排空后再交给状态机, 避免设备听到自己的 TTS 尾巴 (回声循环)
+    let mut tts_stop_pending = false;
+    let mut drain_done_at = 0u64;
+    let mut underruns: u32 = 0;
+    let mut tx_bytes: u64 = 0;
+    let mut tx_rate_bytes: u64 = 0;
+    let mut tx_rate_ms: u64 = 0;
     let mut acc_len = 0usize;
     let mut held = false;
     let mut vol_edge = false;
@@ -396,9 +442,14 @@ pub async fn run(
     let mut uplink_frames: u64 = 0;
     let mut last_level_log_ms: u64 = 0;
     let mut idle_peak_rms: i32 = 0;
+    let mut noise_ema: i32 = 0;
     let mut listen_peak_rms: i32 = 0;
+    // 下行解码统计 (诊断重复播放)
+    let mut dec_pkts: u32 = 0;
+    let mut dec_samples: u64 = 0;
     // 上行回合检测 (auto 模式): 说完 → 本地 VAD 静音 → 主动 listen stop
     let mut listen_heard = false;
+    let mut listen_voiced_ms: u64 = 0;
     let mut listen_silence_ms: u64 = 0;
     let mut listen_total_ms: u64 = 0;
     let mut was_listening = false;
@@ -427,11 +478,17 @@ pub async fn run(
                     dispatch(&mut sm, &mut pending, DialogEvent::SessionReady)
                 },
                 Ok(SessionEvent::TtsStart) => {
+                    // 新回复: 队列里若还有上一条的尾音则保留 (清空会"少字"),
+                    // 只在队列不足时重新预缓冲
+                    prebuffer = pcm_q.len() < PCM_PREBUFFER;
                     dispatch(&mut sm, &mut pending, DialogEvent::TtsStart)
                 },
                 Ok(SessionEvent::TtsStop) => {
-                    wake.policy_mut().note_playback_end(now_ms);
-                    dispatch(&mut sm, &mut pending, DialogEvent::TtsStop);
+                    // 服务器发送完毕: 等软件队列 + DMA 排空再通知状态机,
+                    // 否则立刻转入 Listening 会把 TTS 尾音当成用户说话 (回声循环)
+                    prebuffer = false;
+                    tts_stop_pending = true;
+                    drain_done_at = 0;
                 },
                 Ok(SessionEvent::Closed) => {
                     dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed)
@@ -446,6 +503,10 @@ pub async fn run(
                 wake.policy_mut().note_playback_end(now_ms);
                 encoder = None;
                 decoder = None;
+                pcm_q.clear();
+                prebuffer = false;
+                tts_stop_pending = false;
+                drain_done_at = 0;
                 info!("会话已结束, 回到待机监听");
             }
         } else if encoder.is_none() && sm.state() == DialogState::Listening {
@@ -465,6 +526,13 @@ pub async fn run(
         let pressed = buttons.boot_pressed();
         if pressed != held {
             held = pressed;
+            if held && sm.state() == DialogState::Speaking {
+                // 按键打断: 立即丢弃未播完的 TTS
+                pcm_q.clear();
+                prebuffer = false;
+                tts_stop_pending = false;
+                drain_done_at = 0;
+            }
             dispatch(
                 &mut sm,
                 &mut pending,
@@ -550,7 +618,7 @@ pub async fn run(
             last_state = Some(sm.state());
             state_since_ms = now_ms;
         }
-        if sm.state() == DialogState::WaitingReply && now_ms - state_since_ms > 10_000 {
+        if sm.state() == DialogState::WaitingReply && now_ms - state_since_ms > 20_000 {
             warn!("等回复超时 (10s), 结束会话");
             dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
         }
@@ -560,6 +628,7 @@ pub async fn run(
         let is_listening = sm.state() == DialogState::Listening;
         if is_listening && !was_listening {
             listen_heard = false;
+            listen_voiced_ms = 0;
             listen_silence_ms = 0;
             listen_total_ms = 0;
         }
@@ -593,6 +662,18 @@ pub async fn run(
                     // peak = 自上次打印以来的最大块 rms (说话峰值可能落在采样点之间)
                     let (mean, rms) = level_stats(&mono_buf[..ns]);
                     idle_peak_rms = idle_peak_rms.max(rms);
+                    // 环境噪声自适应: 慢速 EMA 估计噪声底, 阈值 = 2x 噪声 + 150,
+                    // 限制在 [VAD_THRESHOLD, 1200], 避免吵环境里持续误唤醒 (周期性"嘟")
+                    // 快降慢升: 迅速跟随安静底噪, 忽略说话/瞬态抬升
+                    noise_ema = if noise_ema == 0 {
+                        rms
+                    } else if rms < noise_ema {
+                        noise_ema - (noise_ema - rms) / 8
+                    } else {
+                        noise_ema + (rms - noise_ema) / 64
+                    };
+                    let wake_threshold = (noise_ema * 2 + 150).clamp(VAD_THRESHOLD as i32, 800);
+                    wake.source_mut().set_threshold(wake_threshold as i16);
                     if now_ms.saturating_sub(last_level_log_ms) >= 1_000 {
                         last_level_log_ms = now_ms;
                         let regs = audio.es7210_debug_regs();
@@ -607,7 +688,7 @@ pub async fn run(
                             mean,
                             rms,
                             idle_peak_rms,
-                            VAD_THRESHOLD,
+                            wake_threshold,
                             rd(0x01),
                             rd(0x08),
                             rd(0x02)
@@ -636,12 +717,13 @@ pub async fn run(
                         }
                     }
                     if voiced {
-                        listen_heard = true;
-                        listen_silence_ms = 0;
-                    } else {
-                        if listen_heard {
-                            listen_silence_ms += frame_ms;
+                        listen_voiced_ms += frame_ms;
+                        if listen_voiced_ms >= LISTEN_MIN_VOICED_MS {
+                            listen_heard = true;
                         }
+                        listen_silence_ms = 0;
+                    } else if listen_heard {
+                        listen_silence_ms += frame_ms;
                     }
                     apply_gain_percent(&mut mono_buf[..ns], GAIN_PERCENT);
                     let limited = limit_peak(&mut mono_buf[..ns], UPLINK_CEILING);
@@ -694,14 +776,15 @@ pub async fn run(
             dispatch(&mut sm, &mut pending, DialogEvent::WakeTriggered);
         }
 
-        // auto 模式本地收尾: 说完静音 700ms, 或 8s 无人声 → listen stop
+        // auto 模式本地收尾: 说过话且静音 800ms, 或 8s 无人声 → listen stop
         if sm.state() == DialogState::Listening && sm.mode() == ListenMode::Auto {
-            let done = (listen_heard && listen_silence_ms >= 500)
-                || (!listen_heard && listen_total_ms >= 8_000);
+            let done = (listen_heard && listen_silence_ms >= LISTEN_SILENCE_MS)
+                // 无人声 12s 才收尾: 多轮对话留足思考时间
+                || (!listen_heard && listen_total_ms >= 12_000);
             if done {
                 info!(
-                    "本地收尾: heard={} 静音={}ms 总时长={}ms",
-                    listen_heard, listen_silence_ms, listen_total_ms
+                    "本地收尾: heard={} 有声={}ms 静音={}ms 总时长={}ms",
+                    listen_heard, listen_voiced_ms, listen_silence_ms, listen_total_ms
                 );
                 dispatch(&mut sm, &mut pending, DialogEvent::AutoListenStop);
             }
@@ -709,7 +792,12 @@ pub async fn run(
 
         // ---- 7. 下行播放: opus → 解码 → 立体声 (每轮 ≤3 帧 ≈180ms,
         // 防止连播期间 RX 积压超过排空缓冲) ----
+        // 队列空间不足时停止取包: 包留在通道里 → 会话任务阻塞 → TCP 反压服务器,
+        // 而不是丢帧 (丢帧 = 漏字)。
         for _ in 0..3 {
+            if pcm_q.len() + PCM_FRAME_MAX > PCM_QUEUE_MAX {
+                break;
+            }
             let pkt = match channels.downlink.try_receive() {
                 Ok(p) => p,
                 Err(_) => break,
@@ -720,23 +808,67 @@ pub async fn run(
             match decoder.decode(&pkt, &mut pcm_dec) {
                 Ok(n) if n > 0 => {
                     let n = n.min(pcm_dec.len());
+                    dec_pkts += 1;
+                    dec_samples += n as u64;
+                    if dec_pkts.is_multiple_of(20) {
+                        info!(
+                            "下行解码: {} 包 {} 样本 (≈{}ms)",
+                            dec_pkts,
+                            dec_samples,
+                            dec_samples * 1000 / SAMPLE_RATE as u64
+                        );
+                    }
                     let written = mono_to_stereo(&pcm_dec[..n], &mut stereo_out);
-                    audio.play_block(&stereo_out[..written]);
+                    // 先入软件队列, 由 pump_audio 按 DMA 空闲空间泵入
+                    pcm_q.extend(stereo_out[..written].iter().copied());
                 },
                 Ok(_) => {},
                 Err(e) => warn!("opus 解码失败: {}", e),
             }
         }
 
-        // ---- 8. 时钟维持 (环形常流; 空闲补静音保 BCLK/WS 不停) ----
-        // 播报期用低水位: 只在队列快见底时补静音, 既不在 TTS 帧之间插静音,
-        // 也不让 DMA 绕环重放旧数据 (真机 2026-09-26: 嘟嘟嘟/一卡一卡)。
-        let tx_target = if sm.state() == DialogState::Speaking {
-            TTS_TX_LOW_WATER
-        } else {
-            TX_RING_BYTES
-        };
-        audio.maintain_silence(silence_buf, tx_target);
+        // ---- 8. 时钟维持: 软件队列 → DMA 环形, 没数据时补静音 ----
+        // 环形缓冲始终填满, DMA 不会追到写指针后回放上一圈旧音频。
+        if prebuffer && pcm_q.len() >= PCM_PREBUFFER {
+            prebuffer = false;
+            info!("预缓冲完成: {}B", pcm_q.len());
+        }
+        let (underran, tx_pushed) = pump_audio(audio, &mut pcm_q, silence_buf, !prebuffer);
+        if underran {
+            underruns += 1;
+            if underruns % 20 == 1 {
+                info!("播报欠载 #{} (PCM 队列空, 补静音)", underruns);
+            }
+        }
+        tx_bytes += tx_pushed as u64;
+        if sm.state() == DialogState::Speaking && now_ms.saturating_sub(tx_rate_ms) >= 1_000 {
+            info!(
+                "TX 推送速率: {}B/s (队列 {}B, 欠载累计 {})",
+                (tx_bytes - tx_rate_bytes) * 1000 / now_ms.saturating_sub(tx_rate_ms).max(1),
+                pcm_q.len(),
+                underruns
+            );
+            tx_rate_ms = now_ms;
+            tx_rate_bytes = tx_bytes;
+        }
+
+        // TtsStop 延迟派发: PCM 队列空后再等 150ms 让 DMA 环形播完,
+        // 确认扬声器彻底安静后才回到 Listening (防回声再次触发对话)
+        if tts_stop_pending {
+            if pcm_q.is_empty() {
+                if drain_done_at == 0 {
+                    drain_done_at = now_ms + 150;
+                }
+                if now_ms >= drain_done_at {
+                    tts_stop_pending = false;
+                    drain_done_at = 0;
+                    wake.policy_mut().note_playback_end(now_ms);
+                    dispatch(&mut sm, &mut pending, DialogEvent::TtsStop);
+                }
+            } else {
+                drain_done_at = 0;
+            }
+        }
         // 让出 CPU: 会话任务/网络任务需要被轮询才能推进连接与收发
         // Idle 时放宽到 10ms (降 CPU 唤醒频率, I2S 缓冲 512ms 容量足够)
         let wait_ms = if sm.state() == DialogState::Idle {
@@ -775,6 +907,46 @@ pub async fn run(
 
 /// 显示面板状态文本 (3x5 点阵字库仅 ASCII)
 /// 16-bit 单声道 → 立体声 (左右复制) 交错 little-endian 字节; 返回写入字节数
+/// 把软件 PCM 队列泵入 I2S DMA 环形, 环形空闲部分用静音填满
+///
+/// 关键: DMA 环形永远保持满载。有真实音频就写真实音频, 没有就写静音,
+/// 杜绝环形欠载时 DMA 绕回重放旧数据 (听感为逐字重复/杂音)。
+/// 返回是否发生「播报中队列空、只能补静音」的欠载
+/// 返回 (是否发生欠载, 本次实际写入 DMA 的字节数)
+fn pump_audio(
+    audio: &mut Audio,
+    q: &mut alloc::collections::VecDeque<u8>,
+    silence: &[u8],
+    allow_audio: bool,
+) -> (bool, usize) {
+    let mut underran = false;
+    let mut total = 0usize;
+    loop {
+        let free = audio.tx_free();
+        if free == 0 {
+            break;
+        }
+        if q.is_empty() && allow_audio {
+            underran = true;
+        }
+        let pushed = if !allow_audio || q.is_empty() {
+            audio.push_avail(&silence[..free.min(silence.len())])
+        } else {
+            q.make_contiguous();
+            let (contig, _) = q.as_slices();
+            let n = free.min(contig.len());
+            let w = audio.push_avail(&contig[..n]);
+            q.drain(..w);
+            w
+        };
+        if pushed == 0 {
+            break;
+        }
+        total += pushed;
+    }
+    (underran, total)
+}
+
 fn mono_to_stereo(src: &[i16], dst: &mut [u8]) -> usize {
     let mut o = 0;
     for &s in src {

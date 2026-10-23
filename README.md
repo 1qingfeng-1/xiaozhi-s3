@@ -137,7 +137,7 @@ espflash flash --chip esp32s3 --baud 460800 target/riscv32imc-esp-espidf/release
 
 ```bash
 cd xiaozhi-core
-cargo +stable nextest run     # 推荐 (并行, 32 个测试)
+cargo +stable nextest run     # 推荐 (并行, 95 个测试)
 # 或
 cargo +stable test
 ```
@@ -223,17 +223,15 @@ git submodule update --init --recursive
 
 ## 下一步
 
-- [x] 纯逻辑核心层 xiaozhi-core (音量映射/时钟计算/寄存器序列/状态机 + 32 单测)
-- [x] 音频模块 esp-hal 1.1.x 薄封装 (DMA/TDM, 委托 xiaozhi-core)
-- [ ] 完善 I2S DMA 收发 (录音/播放数据通路)
-- [ ] 实现按键检测 (长按/短按)
-- [ ] LED 呼吸灯动画
-- [ ] 电池电量检测 (ADC)
-- [ ] WiFi 连接
-- [ ] MQTT 通信
-- [ ] 语音识别 (ASR)
-- [ ] 语音合成 (TTS)
-- [ ] 语音对话 (LLM)
+> ASR / TTS / LLM 由 xiaozhi 服务器完成；设备端只负责采集、编码、播放与设备控制。
+
+- [x] 纯逻辑核心层 xiaozhi-core（音量/时钟/寄存器序列/状态机/OTA/VAD/MCP + 95 单测）
+- [x] I2S 全双工音频通路（录音/播放 + opus 编解码）
+- [x] WiFi 连接 + SoftAP 配网 + NVS 凭据
+- [x] WebSocket 会话（xiaozhi 协议 v1）+ TTS 播放 + 按钮打断
+- [x] VAD 声音唤醒、MCP 设备控制、OTA 下载烧写、ST7789 状态显示、电池/充电
+- [ ] v1.0 真机验收与发布（见 [ROADMAP](docs/ROADMAP.md) 的 M8/M10 清单）
+- [ ] v1.1：WakeNet/AEC（需先解 MMU block 1）、WS v2/v3、显示与提示音资源
 
 ## 贡献
 
