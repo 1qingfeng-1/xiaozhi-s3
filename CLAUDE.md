@@ -32,7 +32,7 @@ cargo check --all
 ### 单元测试（只有 xiaozhi-core 有测试，且只能在 host 跑）
 
 ```bash
-cd xiaozhi-core && cargo +stable nextest run          # 93 个，全绿
+cd xiaozhi-core && cargo +stable nextest run          # 95 个，全绿
 cd xiaozhi-core && cargo +stable nextest run ota_crc  # 按名过滤单个测试
 cd xiaozhi-core && cargo +stable test                 # 无 nextest 时
 ```
