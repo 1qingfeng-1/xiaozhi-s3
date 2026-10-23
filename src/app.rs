@@ -82,6 +82,10 @@ pub type OpusPacket = heapless::Vec<u8, MAX_PACKET_BYTES>;
 
 /// 跨任务共享的设备状态 (MCP get_device_status / set_volume 用)
 pub static VOLUME_PCT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(60);
+
+/// 打断后丢弃服务器剩余下行音频: 把会话任务带宽留给上行, 防 uplink 饿死
+pub static DROP_DOWNLINK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 pub static BATTERY_PCT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 pub static CHARGING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// MCP set_volume 待办 (valid 标记 + 目标值; 音频循环轮询消费)
@@ -326,6 +330,10 @@ pub async fn session_task(args: SessionArgs) {
                         2 => {
                             down_pkts += 1;
                             down_bytes += payload.len() as u64;
+                            if DROP_DOWNLINK.load(core::sync::atomic::Ordering::Relaxed) {
+                                // 打断后剩余音频直接丢弃, 不占用通道
+                                continue;
+                            }
                             let mut pkt: OpusPacket = heapless::Vec::new();
                             if pkt.extend_from_slice(&payload).is_ok() {
                                 // 阻塞发送: 通道满时停止读 TCP → 反压服务器,
@@ -463,6 +471,7 @@ pub async fn run(
                     dispatch(&mut sm, &mut pending, DialogEvent::SessionReady)
                 },
                 Ok(SessionEvent::TtsStart) => {
+                    DROP_DOWNLINK.store(false, core::sync::atomic::Ordering::Relaxed);
                     dec_pkts = 0;
                     dec_samples = 0;
                     playback.on_tts_start();
@@ -486,6 +495,7 @@ pub async fn run(
                 encoder = None;
                 decoder = None;
                 playback.reset();
+                DROP_DOWNLINK.store(false, core::sync::atomic::Ordering::Relaxed);
                 info!("会话已结束, 回到待机监听");
             }
         } else if encoder.is_none() && sm.state() == DialogState::Listening {
@@ -508,6 +518,7 @@ pub async fn run(
             if held && sm.state() == DialogState::Speaking {
                 // 播报中按键: 立即丢弃未播完的 TTS, 转入 auto 聆听
                 playback.reset();
+                DROP_DOWNLINK.store(true, core::sync::atomic::Ordering::Relaxed);
                 barge_in_active = true;
                 dispatch(&mut sm, &mut pending, DialogEvent::BargeIn);
             } else if !held && barge_in_active {
