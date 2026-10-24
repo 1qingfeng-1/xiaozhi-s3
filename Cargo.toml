@@ -40,6 +40,7 @@ embassy-net = { version = "0.8.0", features = ["dhcpv4", "medium-ethernet", "tcp
 esp-storage = { version = "0.8.1", features = ["esp32s3", "defmt"] }
 embedded-storage = "0.3.1"
 embassy-executor = "0.10.0"
+embassy-futures = "0.1.2"
 heapless = "0.8.0"
 esp-backtrace = { version = "0.19.0", default-features = false, features = ["esp32s3", "defmt"] }
 embassy-sync = "0.6"
@@ -65,6 +66,12 @@ tts-selftest = []
 
 ## 空闲提示自测: 空闲窗口缩短为 5s, 便于验证提示音/低功耗流程; 勿用于发布
 idle-selftest = []
+
+## A/B 测试: WiFi 省电始终关闭 (对照自适应切换的丢包); 勿用于发布
+ps-always-none = []
+
+## 注: 空闲轻睡 (Rtc::sleep_light) 试用后出现唤醒/USB 失效, 已回退;
+## 重新实现前不要启用, 详见 ROADMAP 低功耗记录。
 
 ## gezipai 开发板 (ES8311 + ES7210 + ST7789)
 board-gezipai = []

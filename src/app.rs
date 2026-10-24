@@ -92,10 +92,13 @@ pub struct UplinkPacket {
 }
 
 /// 下行音频包: opus + 服务器时间戳 (版本 1 恒为 0)
+///
+/// `lost > 0` 表示前面丢了 `lost` 个包, 由解码器做 PLC (丢包隐藏) 补帧。
 #[derive(Clone)]
 pub struct DownlinkPacket {
     pub timestamp: u32,
     pub data: OpusPacket,
+    pub lost: u8,
 }
 
 /// 跨任务共享的设备状态 (MCP get_device_status / set_volume 用)
@@ -396,6 +399,7 @@ pub async fn session_task(args: SessionArgs) {
                                     .send(DownlinkPacket {
                                         timestamp,
                                         data: pkt,
+                                        lost: 0,
                                     })
                                     .await;
                             }
@@ -546,10 +550,13 @@ pub async fn run(
         60_000
     };
     let mut idle_policy = IdlePromptPolicy::new(IDLE_WINDOW_MS, 0);
+    info!("空闲提示窗口: {}s", IDLE_WINDOW_MS / 1000);
     let mut prompt = PromptPlayer::new();
     let mut prompt_until_ms: u64 = 0;
     let mut prompt_vol_restore_at: u64 = 0;
     let mut low_power = false;
+    let mut pending_connect = false;
+    let mut connect_deadline: u64 = 0;
     let mut volume_dirty = false;
     let preroll = alloc_preroll();
     let preroll_len = preroll.len();
@@ -618,6 +625,9 @@ pub async fn run(
             .as_millis();
         if boot_ms == 0 {
             boot_ms = now_ms;
+            // 空闲窗口从主循环真正开始计（开机/WiFi/OTA 的十多秒不算空闲，
+            // 也避免 systimer 未清零时窗口"已经到期"导致复位后立刻提示）
+            idle_policy.note_activity(now_ms);
         }
         // 喂 RWDT: 主循环存活即视为系统正常 (网络任务独立, 不参与)
         crate::wdt::feed();
@@ -756,6 +766,9 @@ pub async fn run(
             // 按键交互: 重置空闲窗口, 退出低功耗
             idle_policy.note_activity(now_ms);
             low_power = false;
+            if !audio.pa_enabled() {
+                audio.set_pa(true);
+            }
             if held && sm.state() == DialogState::Idle {
                 // BOOT 建连期间也会丢语音: 只补发按下之后的样本
                 preroll_flush = true;
@@ -793,6 +806,9 @@ pub async fn run(
             volume_dirty = true;
             idle_policy.note_activity(now_ms);
             low_power = false;
+            if !audio.pa_enabled() {
+                audio.set_pa(true);
+            }
             info!("音量: {}%", next);
         }
         vol_edge = vol_up || vol_down;
@@ -850,12 +866,17 @@ pub async fn run(
         for (action, mode) in &pending {
             let cmd = match action {
                 Action::ConnectSession => {
+                    // 等 WiFi 省电切到 None 再建连 (UDP 音频对 modem sleep 敏感);
+                    // 最多等 500ms, 超时照常连接
+                    pending_connect = true;
+                    connect_deadline = now_ms + 500;
                     turn_up_frames = 0;
                     turn_rms_max = 0;
                     preroll_frames = 0;
                     let id = TURN_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
                     crate::diag!("[T{}] connect 请求 t={}", id, now_ms);
-                    SessionCommand::Connect
+                    // 实际发送由下方 4.5 在 PS 预切换完成后统一处理
+                    continue;
                 },
                 Action::SendListenStart => SessionCommand::SendListenStart(*mode),
                 Action::SendListenStop => SessionCommand::SendListenStop,
@@ -868,10 +889,29 @@ pub async fn run(
         }
         pending.clear();
 
+        // 音频会话期间关闭 WiFi 省电; 建连前等预切换完成
+        #[cfg(feature = "ps-always-none")]
+        let session_active = true;
+        #[cfg(not(feature = "ps-always-none"))]
+        let session_active = sm.state() != DialogState::Idle;
+        crate::wifi::WIFI_AUDIO_ACTIVE.store(session_active, core::sync::atomic::Ordering::Relaxed);
+        if pending_connect
+            && (crate::wifi::WIFI_PS_READY.load(core::sync::atomic::Ordering::Relaxed)
+                || now_ms >= connect_deadline)
+        {
+            pending_connect = false;
+            if channels.command.try_send(SessionCommand::Connect).is_err() {
+                warn!("命令通道满, 丢弃建连请求");
+            }
+        }
+
         // ---- 4.5 空闲提示: 离开 Idle 视为活动; 60s 无活动播提示音 ----
         if sm.state() != DialogState::Idle {
             idle_policy.note_activity(now_ms);
             low_power = false;
+            if !audio.pa_enabled() {
+                audio.set_pa(true);
+            }
             if prompt.is_active() {
                 // 提示音期间被唤醒: 立即中止并恢复音量
                 prompt.stop();
@@ -1148,6 +1188,20 @@ pub async fn run(
             let Some(decoder) = decoder.as_mut() else {
                 continue;
             };
+            // 丢包隐藏: 对缺口补 1~4 帧 PLC, 避免解码断点产生爆音
+            if pkt.data.is_empty() {
+                for _ in 0..pkt.lost.min(4) {
+                    match decoder.decode(&[], &mut pcm_dec) {
+                        Ok(n) if n > 0 => {
+                            let n = n.min(pcm_dec.len());
+                            let written = mono_to_stereo(&pcm_dec[..n], &mut stereo_out);
+                            playback.push(&stereo_out[..written], 0);
+                        },
+                        _ => break,
+                    }
+                }
+                continue;
+            }
             match decoder.decode(&pkt.data, &mut pcm_dec) {
                 Ok(n) if n > 0 => {
                     let n = n.min(pcm_dec.len());
@@ -1175,7 +1229,9 @@ pub async fn run(
         if prompt.is_active() && prompt.pump(audio, &mut stereo_out[..]) {
             low_power = true;
             prompt_vol_restore_at = now_ms + 300;
-            info!("提示音播放完成, 进入低功耗待机");
+            // 功放断电: 消掉空闲期的功放底噪/RF 串扰, 同时省电
+            audio.set_pa(false);
+            info!("提示音播放完成, 进入低功耗待机 (功放关闭)");
         }
         if !prompt.is_active() {
             let (underran, _) = playback.pump(
@@ -1216,7 +1272,11 @@ pub async fn run(
         } else {
             1
         };
-        embassy_time::Timer::after(embassy_time::Duration::from_millis(wait_ms)).await;
+        // 低功耗待机: 轻睡实验暂时停用 (真机出现无法唤醒, 待单独验证后恢复)
+        let slept = false;
+        if !slept {
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(wait_ms)).await;
+        }
 
         // ---- 9. 灯语 + 显示状态 ----
         let led = match sm.state() {

@@ -64,7 +64,7 @@ pub struct Audio {
     tx_buf: Option<&'static mut [u8]>,
     /// beep 分块生成缓冲 (堆分配, 避免大栈帧)
     beep_buf: &'static mut [u8],
-    _pa: esp_hal::gpio::Output<'static>,
+    pa: esp_hal::gpio::Output<'static>,
     volume: u8,
     /// Codec 地址来自 BOARD.codec_ctrl (禁止驱动层硬编码)
     dac_addr: u8,
@@ -146,7 +146,7 @@ impl Audio {
             tx: None,
             tx_buf: Some(Box::leak(vec![0u8; TX_BUF_SIZE].into_boxed_slice())),
             beep_buf: Box::leak(vec![0u8; BEEP_CHUNK_SIZE].into_boxed_slice()),
-            _pa: pa,
+            pa,
             volume: 60,
             dac_addr,
             adc_addr,
@@ -175,7 +175,7 @@ impl Audio {
         );
         audio.write_seq_logged("音量", &es8311_volume_write(60));
         // 功放使能 (高电平)
-        audio._pa.set_high();
+        audio.pa.set_high();
 
         let capture = Capture { i2s_rx, rx_buf };
         (audio, capture)
@@ -220,7 +220,7 @@ impl Audio {
                 );
             }
         }
-        defmt::info!("PA 使能脚电平: {}", self._pa.is_set_high());
+        defmt::info!("PA 使能脚电平: {}", self.pa.is_set_high());
     }
 
     /// 读取单个 ES8311 寄存器 (失败返回 0xFF)
@@ -290,6 +290,20 @@ impl Audio {
     }
 
     /// 当前音量
+    /// 功放使能: 低功耗待机时关闭 (省电并消除功放底噪), 唤醒/播报前打开
+    pub fn set_pa(&mut self, on: bool) {
+        if on {
+            self.pa.set_high();
+        } else {
+            self.pa.set_low();
+        }
+    }
+
+    /// 功放当前是否使能
+    pub fn pa_enabled(&self) -> bool {
+        self.pa.is_set_high()
+    }
+
     pub fn volume(&self) -> u8 {
         self.volume
     }

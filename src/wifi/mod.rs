@@ -94,7 +94,11 @@ pub async fn connect_station(
     };
     let mut controller = esp_radio::wifi::WifiController::new(
         wifi_peri,
-        esp_radio::wifi::ControllerConfig::default().with_initial_config(config.station_config()),
+        esp_radio::wifi::ControllerConfig::default()
+            // 驱动 RX 队列默认仅 5 帧: TTS 下行/音频解码期间成串到达会丢包
+            // (长句 UDP 断序的根因之一), 提到 16 帧给协议栈留余量
+            .with_rx_queue_size(16)
+            .with_initial_config(config.station_config()),
     )
     .map_err(|_| {
         error!("WiFi 控制器初始化失败");
@@ -134,8 +138,18 @@ pub async fn connect_station(
 /// 已连接时阻塞等待断线事件; 断线后每 3s 重试 `connect_async` 直到重新关联。
 /// DHCP/链路状态由 embassy-net runner 自动处理; 会话任务通过
 /// [`embassy_net::Stack::is_link_up`] 感知掉线并关闭当前 WS 会话。
+pub static WIFI_AUDIO_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// 省电模式已切到请求值 (音频会话前用它做“预切换完成”门控)
+pub static WIFI_PS_READY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 #[embassy_executor::task]
 pub async fn reconnect_task(mut controller: esp_radio::wifi::WifiController<'static>) {
+    use embassy_futures::select::{Either, select};
+    use esp_radio::wifi::PowerSaveMode;
+
+    let mut applied: Option<bool> = None; // Some(true)=省电关闭 (会话中)
     loop {
         if !controller.is_connected() {
             match controller.connect_async().await {
@@ -146,17 +160,63 @@ pub async fn reconnect_task(mut controller: esp_radio::wifi::WifiController<'sta
                     continue;
                 },
             }
+            applied = None;
+            WIFI_PS_READY.store(false, core::sync::atomic::Ordering::Relaxed);
         }
 
-        // 已连接: 阻塞等断线事件, 不轮询
-        match controller.wait_for_disconnect_async().await {
-            Ok(info) => info!("WiFi 已断开: reason={:?} rssi={}", info.reason, info.rssi),
-            Err(_) => {
-                // 与 is_connected() 存在竞争: 稍等避免忙等
-                embassy_time::Timer::after(embassy_time::Duration::from_millis(500)).await;
-            },
+        // 已连接: 等断线 + 每 100ms 检查省电请求
+        loop {
+            let want_none = WIFI_AUDIO_ACTIVE.load(core::sync::atomic::Ordering::Relaxed);
+            if applied != Some(want_none) {
+                let mode = if want_none {
+                    PowerSaveMode::None
+                } else {
+                    PowerSaveMode::Minimum
+                };
+                match controller.set_power_saving(mode) {
+                    Ok(()) => {
+                        applied = Some(want_none);
+                        WIFI_PS_READY.store(want_none, core::sync::atomic::Ordering::Relaxed);
+                        info!(
+                            "WiFi 省电: {}",
+                            if want_none {
+                                "关闭 (会话中)"
+                            } else {
+                                "Minimum (空闲)"
+                            }
+                        );
+                    },
+                    Err(e) => {
+                        applied = Some(want_none);
+                        WIFI_PS_READY.store(false, core::sync::atomic::Ordering::Relaxed);
+                        error!("WiFi 省电模式设置失败: {:?}", e);
+                    },
+                }
+            } else {
+                WIFI_PS_READY.store(want_none, core::sync::atomic::Ordering::Relaxed);
+            }
+
+            match select(
+                controller.wait_for_disconnect_async(),
+                embassy_time::Timer::after(embassy_time::Duration::from_millis(100)),
+            )
+            .await
+            {
+                Either::First(Ok(info)) => {
+                    info!("WiFi 已断开: reason={:?} rssi={}", info.reason, info.rssi);
+                    WIFI_PS_READY.store(false, core::sync::atomic::Ordering::Relaxed);
+                    applied = None;
+                    break;
+                },
+                Either::First(Err(_)) => {
+                    embassy_time::Timer::after(embassy_time::Duration::from_millis(500)).await;
+                    applied = None;
+                    WIFI_PS_READY.store(false, core::sync::atomic::Ordering::Relaxed);
+                    break;
+                },
+                Either::Second(_) => {},
+            }
         }
-        // 给驱动/协议栈处理链路状态的时间, 再进入重连
         embassy_time::Timer::after(embassy_time::Duration::from_millis(500)).await;
     }
 }

@@ -142,11 +142,20 @@ async fn main(spawner: Spawner) -> ! {
     let mut server_aec = ws_version >= 2;
     info!("WS 协议版本: v{}", ws_version);
 
-    // BOOT 键开机按住: 清除凭据强制重回配网
+    // BOOT 键**持续按住 3s**: 清除凭据强制重回配网
+    // (下载模式 BOOT+RST 也会在复位时按住 BOOT, 不能一按下就清)
     if board.buttons.boot_pressed() {
-        info!("BOOT 按下: 清除 WiFi 配置...");
-        let _ = store::clear(flash);
-        embassy_time::Timer::after(embassy_time::Duration::from_millis(200)).await;
+        info!("BOOT 按住: 3s 后清除 WiFi 配置 (防下载模式误清)");
+        let mut held_ms = 0u32;
+        while board.buttons.boot_pressed() && held_ms < 3_000 {
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
+            held_ms += 100;
+        }
+        if held_ms >= 3_000 {
+            info!("BOOT 长按确认: 清除 WiFi 配置...");
+            let _ = store::clear(flash);
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(200)).await;
+        }
     }
 
     // 任务间通道 (静态常驻)

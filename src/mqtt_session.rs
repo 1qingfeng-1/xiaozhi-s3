@@ -520,7 +520,7 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                                 // 用于无人值守验证下行 UDP 音质/断序
                                 #[cfg(feature = "tts-selftest")]
                                 {
-                                    embassy_time::Timer::after(Duration::from_millis(800)).await;
+                                    embassy_time::Timer::after(Duration::from_millis(3000)).await;
                                     let req = "{\"type\":\"listen\",\"state\":\"detect\",\
                                         \"text\":\"请详细介绍人工智能的发展历史，尽量详细一些。\"}";
                                     if publish(
@@ -650,14 +650,23 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                     let expect = prev.wrapping_add(1);
                     if hdr.sequence != expect {
                         seq_gaps += 1;
+                        let missing = hdr.sequence.wrapping_sub(expect);
                         if seq_gaps <= 5 || seq_gaps.is_multiple_of(50) {
                             warn!(
                                 "UDP 下行不连续: seq {} → {} (缺 {}) 累计 {}",
-                                prev,
-                                hdr.sequence,
-                                hdr.sequence.wrapping_sub(expect),
-                                seq_gaps
+                                prev, hdr.sequence, missing, seq_gaps
                             );
+                        }
+                        // 丢包隐藏: 通知音频侧补 PLC 帧 (最多 4 帧, 防通道拥塞)
+                        if missing > 0 && missing < 64 {
+                            channels
+                                .downlink
+                                .send(DownlinkPacket {
+                                    timestamp: 0,
+                                    data: OpusPacket::new(),
+                                    lost: missing.min(4) as u8,
+                                })
+                                .await;
                         }
                     }
                 }
@@ -684,6 +693,7 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                         .send(DownlinkPacket {
                             timestamp: hdr.timestamp,
                             data,
+                            lost: 0,
                         })
                         .await;
                 }
