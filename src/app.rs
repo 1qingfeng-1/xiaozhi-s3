@@ -608,13 +608,17 @@ pub async fn run(
         // 喂 RWDT: 主循环存活即视为系统正常 (网络任务独立, 不参与)
         crate::wdt::feed();
 
-        // ---- 会话自测 (feature `session-selftest`, 默认关): 自动唤醒一次 ----
+        // ---- 会话自测 (feature `session-selftest`, 默认关) ----
+        // 开机 5s 后触发, 之后每 60s 空闲时再触发一次 (浸泡测试用)
         #[cfg(feature = "session-selftest")]
         if sm.state() == DialogState::Idle && now_ms >= 5_000 {
-            use core::sync::atomic::{AtomicBool, Ordering};
-            static FIRED: AtomicBool = AtomicBool::new(false);
-            if !FIRED.swap(true, Ordering::Relaxed) {
-                info!("会话自测: 自动触发唤醒");
+            use core::sync::atomic::{AtomicU32, Ordering};
+            static LAST: AtomicU32 = AtomicU32::new(0);
+            let now32 = now_ms as u32;
+            let last = LAST.load(Ordering::Relaxed);
+            if last == 0 || now32.wrapping_sub(last) >= 60_000 {
+                LAST.store(now32, Ordering::Relaxed);
+                info!("会话自测: 自动触发唤醒 (t={}ms)", now_ms);
                 dispatch(&mut sm, &mut pending, DialogEvent::WakeTriggered);
             }
         }
