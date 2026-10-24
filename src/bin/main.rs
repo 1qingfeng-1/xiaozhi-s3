@@ -115,6 +115,7 @@ async fn main(spawner: Spawner) -> ! {
     let saved_vol = xiaozhi_s3::wifi::store::load_volume(flash);
     xiaozhi_s3::app::VOLUME_PCT.store(saved_vol, core::sync::atomic::Ordering::Relaxed);
     board.audio.set_volume(saved_vol);
+    info!("音量恢复: {}%", saved_vol);
 
     // BOOT 键开机按住: 清除凭据强制重回配网
     if board.buttons.boot_pressed() {
