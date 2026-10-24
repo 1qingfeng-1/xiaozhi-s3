@@ -78,13 +78,16 @@ fn parse_endpoint(s: &str) -> Option<(Ipv4Address, u16)> {
     Some((host.parse().ok()?, port.parse().ok()?))
 }
 
+/// 单次网络读/写等待上限: 半开连接时让会话任务能退出重连
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// TCP 精确读取 N 字节
 async fn read_exact(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> Result<(), &'static str> {
     let mut done = 0;
     while done < buf.len() {
-        let n = socket
-            .read(&mut buf[done..])
+        let n = with_timeout(IO_TIMEOUT, socket.read(&mut buf[done..]))
             .await
+            .map_err(|_| "读取超时")?
             .map_err(|_| "读取失败")?;
         if n == 0 {
             return Err("连接关闭");
@@ -97,14 +100,17 @@ async fn read_exact(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> Result<(), &'
 /// 循环写入全部字节
 async fn write_all(socket: &mut TcpSocket<'_>, mut data: &[u8]) -> Result<(), &'static str> {
     while !data.is_empty() {
-        let n = socket
-            .write_with(|buf| {
+        let n = with_timeout(
+            IO_TIMEOUT,
+            socket.write_with(|buf| {
                 let n = usize::min(buf.len(), data.len());
                 buf[..n].copy_from_slice(&data[..n]);
                 (n, n)
-            })
-            .await
-            .map_err(|_| "写入失败")?;
+            }),
+        )
+        .await
+        .map_err(|_| "写入超时")?
+        .map_err(|_| "写入失败")?;
         if n == 0 {
             return Err("写入零字节");
         }
@@ -389,18 +395,21 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
             let now = now_ms();
             if now.saturating_sub(last_try) >= RECONNECT_MS {
                 last_try = now;
-                match connect_mqtt(
-                    &mut socket,
-                    &config,
-                    host,
-                    port,
-                    read_buf,
-                    out_buf,
-                    channels,
+                match with_timeout(
+                    Duration::from_secs(15),
+                    connect_mqtt(
+                        &mut socket,
+                        &config,
+                        host,
+                        port,
+                        read_buf,
+                        out_buf,
+                        channels,
+                    ),
                 )
                 .await
                 {
-                    Ok(()) => {
+                    Ok(Ok(())) => {
                         connected = true;
                         last_ping = now_ms();
                         if want_connect {
@@ -415,7 +424,11 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                             .await;
                         }
                     },
-                    Err(e) => info!("MQTT 连接失败: {} ({}ms 后重试)", e, RECONNECT_MS),
+                    Ok(Err(e)) => info!("MQTT 连接失败: {} ({}ms 后重试)", e, RECONNECT_MS),
+                    Err(_) => {
+                        socket.abort();
+                        info!("MQTT 握手超时 (15s), {}ms 后重试", RECONNECT_MS)
+                    },
                 }
             }
         }
