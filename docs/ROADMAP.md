@@ -286,6 +286,7 @@ M1 音频通路 ── M2 WiFi/配网 ── M4.1 WS 协议 ── M4.2 opus 全
 | MCP 工具扩展 | ✅ | `self.get_system_info` / `self.reboot`，工具列表 4 个 |
 | 播放时间戳对齐 | ✅ | `PlayoutTimestamps`：按实际播出字节推进，一帧播完才进 AEC 时钟 |
 | 过期 goodbye 过滤 | ✅ | `awaiting_hello` 期间一律忽略；其余按 `session_id`；本地 20s 超时主动 goodbye |
+| 连续唤醒稳定性 | ✅ | 修复建连窗口旧 goodbye 自毁；环境声多次唤醒均稳定进入聆听 |
 | 内部堆优化 | ✅ | MQTT 大缓冲迁 PSRAM，水位 98% → <90% |
 | 主循环看门狗 | ✅ | TIMG0 MWDT 8s，真机 `rst:0x7 (TG0WDT_SYS_RST)` 验证 |
 | OTA 低电保护 | ✅ | 电量 <20% 且未充电跳过升级（防中途掉电） |
@@ -309,4 +310,5 @@ M1 音频通路 ── M2 WiFi/配网 ── M4.1 WS 协议 ── M4.2 opus 全
 - 设备激活 HMAC / OTA 签名：自托管服务器不下发签名清单、也无激活服务端，
   设备侧当前只记录 `activation.code`，待接入对应服务后实现；
 - 无真人说话时不能自动进入会话（自测 feature 可绕过）；
+- 主动语音注入受设备/主机物理距离限制未能完成，播报中打断（barge-in）的主观音质仍需真人复测；
 - 高音量（>80%）掉压、过夜稳定仍未测（见上表）。
