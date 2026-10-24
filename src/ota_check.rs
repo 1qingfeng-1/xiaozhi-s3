@@ -229,15 +229,16 @@ async fn download_and_flash_inner(
     info!("OTA: 烧写 → {} (seq {})", target_name, new_seq);
 
     // 2. HTTP GET
-    let (port, path) = parse_url(url);
+    let (url_host, port, path) = parse_url(url);
+    let host = url_host.unwrap_or(server);
     let rx: &'static mut [u8] = alloc::vec![0u8; 4096].leak();
     let tx: &'static mut [u8] = alloc::vec![0u8; 1024].leak();
     let mut socket = TcpSocket::new(stack, rx, tx);
-    socket.connect((server, port)).await.ok()?;
+    socket.connect((host, port)).await.ok()?;
     let req = alloc::format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
         path,
-        server
+        host
     );
     write_all(&mut socket, req.as_bytes()).await.ok()?;
 
@@ -453,18 +454,21 @@ fn parse_http_status(head: &str) -> Option<u16> {
 }
 
 /// 从 url 取 (端口, 路径): 端口取 host:port (缺省 8003), 路径为 `//` 后到末尾
-fn parse_url(url: &str) -> (u16, &str) {
+fn parse_url(url: &str) -> (Option<Ipv4Address>, u16, &str) {
     let after = url.find("://").map(|i| &url[i + 3..]).unwrap_or(url);
     let (hostport, path) = match after.find('/') {
         Some(i) => (&after[..i], &after[i..]),
         None => (after, "/"),
     };
-    let port = hostport
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8003);
-    (port, path)
+    // 仅支持 IPv4 字面量主机; 域名无 DNS 解析, 回退到配置 server
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>() {
+            Ok(port) => (h, port),
+            Err(_) => (hostport, 8003),
+        },
+        None => (hostport, 8003),
+    };
+    (host.parse().ok(), port, path)
 }
 
 /// 从 HTTP 头取 Content-Length (大小写不敏感; 缺省 `None`)

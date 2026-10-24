@@ -39,10 +39,10 @@ const TX_BUF_SIZE: usize = DMA_CHUNK_SIZE * 2;
 pub const TX_RING_BYTES: usize = TX_BUF_SIZE;
 /// beep 生成分块缓冲 (一整个 DMA 描述符)
 const BEEP_CHUNK_SIZE: usize = DMA_CHUNK_SIZE;
+/// TX available 错误日志计数 (限频用)
+static LATE_WARNS: AtomicU32 = AtomicU32::new(0);
 /// 单个 DMA 描述符管理的最大字节数
 const DMA_CHUNK_SIZE: usize = 4092;
-/// TX 环形欠载计数 (诊断: 播报期队列空 → DMA 回放旧数据)
-static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
 /// RX 循环缓冲 = 8 个整描述符 ≈ 0.25s @ 16kHz 立体声 16bit。
 /// 描述符必须与缓冲精确等分: esp-hal 循环采集的软件状态回溯从链尾
 /// 描述符出发, 数量不匹配 (多余空描述符) 会导致空指针崩溃
@@ -66,6 +66,9 @@ pub struct Audio {
     beep_buf: &'static mut [u8],
     _pa: esp_hal::gpio::Output<'static>,
     volume: u8,
+    /// Codec 地址来自 BOARD.codec_ctrl (禁止驱动层硬编码)
+    dac_addr: u8,
+    adc_addr: u8,
 }
 
 /// 录音子系统 (I2S RX, ES7210 麦克风)
@@ -95,11 +98,13 @@ impl Audio {
         din: GPIO21<'static>,
         pa: esp_hal::gpio::Output<'static>,
         sample_rate_hz: u32,
+        dac_addr: u8,
+        adc_addr: u8,
     ) -> (Self, Capture) {
         // 1. Codec 寄存器初始化 (序列来自 xiaozhi-core)
         let es8311_seq = es8311_init_sequence();
         // 复位保持 (0x1F) → delay 5ms → 其余寄存器
-        if let Err(e) = Self::write_seq(&mut i2c, &es8311_seq[..1]) {
+        if let Err(e) = Self::write_seq(&mut i2c, &es8311_seq[..1], dac_addr, adc_addr) {
             defmt::error!("ES8311 复位写失败: {:?}", e);
         }
         let start = Instant::now();
@@ -143,6 +148,8 @@ impl Audio {
             beep_buf: Box::leak(vec![0u8; BEEP_CHUNK_SIZE].into_boxed_slice()),
             _pa: pa,
             volume: 60,
+            dac_addr,
+            adc_addr,
         };
         audio.write_seq_logged("ES8311", &es8311_seq[1..]);
         // ES7210: 先复位, 再读回 REG08 默认值 (绝不能整字节写 0x00: 会清掉
@@ -151,10 +158,10 @@ impl Audio {
         audio.write_seq_logged("ES7210 复位", &es7210_seq[..2]);
         let start = Instant::now();
         while start.elapsed() < Duration::from_millis(5) {}
-        let r08_default = audio.read_reg_at(codec_mod::CodecAddr::Es7210.value(), 0x08);
+        let r08_default = audio.read_reg_at(adc_addr, 0x08);
         defmt::info!("ES7210 REG08 复位默认=0x{:02X}", r08_default);
         audio.write_seq_logged("ES7210", &es7210_seq[2..]);
-        let r08 = audio.read_reg_at(codec_mod::CodecAddr::Es7210.value(), 0x08);
+        let r08 = audio.read_reg_at(adc_addr, 0x08);
         defmt::info!("ES7210 REG08 序列后=0x{:02X}", r08);
         // slave 模式: 只清 bit0; 保留 bit4 (ADC/MCLK 使能) 及其它默认位
         let fixed = (r08 & !0x01) | 0x10;
@@ -164,7 +171,7 @@ impl Audio {
         );
         defmt::info!(
             "ES7210 REG08 修正=0x{:02X}",
-            audio.read_reg_at(codec_mod::CodecAddr::Es7210.value(), 0x08)
+            audio.read_reg_at(adc_addr, 0x08)
         );
         audio.write_seq_logged("音量", &es8311_volume_write(60));
         // 功放使能 (高电平)
@@ -218,7 +225,7 @@ impl Audio {
 
     /// 读取单个 ES8311 寄存器 (失败返回 0xFF)
     fn read_reg(&mut self, reg: u8) -> u8 {
-        self.read_reg_at(codec_mod::CodecAddr::Es8311.value(), reg)
+        self.read_reg_at(self.dac_addr, reg)
     }
 
     /// 读取任意 Codec 寄存器 (失败返回 0xFF)
@@ -252,12 +259,13 @@ impl Audio {
         let _ = Self::write_seq(
             &mut self.i2c,
             &[RegWrite::new(codec_mod::CodecAddr::Es7210, reg, val)],
+            self.dac_addr,
+            self.adc_addr,
         );
     }
 
     /// 回读 ES7210 关键寄存器 (排查槽位/字长/麦克风供电是否与预期一致)
     pub fn es7210_debug_regs(&mut self) -> [(u8, u8); 12] {
-        const ADDR: u8 = 0x40;
         let mut out = [(0u8, 0u8); 12];
         for (i, reg) in [
             0x11u8, 0x12, 0x02, 0x07, 0x01, 0x40, 0x43, 0x44, 0x47, 0x4B, 0x4C, 0x08,
@@ -265,7 +273,7 @@ impl Audio {
         .into_iter()
         .enumerate()
         {
-            out[i] = (reg, self.read_reg_at(ADDR, reg));
+            out[i] = (reg, self.read_reg_at(self.adc_addr, reg));
         }
         out
     }
@@ -273,7 +281,12 @@ impl Audio {
     /// 设置音量 (0~100), 0 为数字静音
     pub fn set_volume(&mut self, percent: u8) {
         self.volume = percent.clamp(0, 100);
-        let _ = Self::write_seq(&mut self.i2c, &es8311_volume_write(self.volume));
+        let _ = Self::write_seq(
+            &mut self.i2c,
+            &es8311_volume_write(self.volume),
+            self.dac_addr,
+            self.adc_addr,
+        );
     }
 
     /// 当前音量
@@ -350,13 +363,6 @@ impl Audio {
                 },
             };
             let queued = TX_BUF_SIZE - free.min(TX_BUF_SIZE);
-            // 队列空 = DMA 已绕环回放旧数据 (播报期出现即为"重复字/杂音"根因)
-            if free >= TX_BUF_SIZE && target < TX_BUF_SIZE {
-                let n = UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1;
-                if !n.is_multiple_of(10) || n == 1 {
-                    defmt::warn!("I2S TX 欠载 #{} — DMA 回放旧数据", n);
-                }
-            }
             if queued >= target {
                 return;
             }
@@ -398,7 +404,11 @@ impl Audio {
             Some(t) => match t.available() {
                 Ok(v) => v,
                 Err(e) => {
-                    defmt::warn!("I2S TX available 失败 (可能欠载): {:?}", e);
+                    // 限频: 卡死时主循环 1ms 调一次, 不能每轮刷日志
+                    let n = LATE_WARNS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n % 100 == 1 {
+                        defmt::warn!("I2S TX available 失败 (可能欠载): {:?} #{}", e, n);
+                    }
                     0
                 },
             },
@@ -443,16 +453,22 @@ impl Audio {
     fn write_seq(
         i2c: &mut I2c<'static, Blocking>,
         seq: &[RegWrite],
+        dac_addr: u8,
+        adc_addr: u8,
     ) -> Result<(), esp_hal::i2c::master::Error> {
         for w in seq {
-            i2c.write(w.codec.value(), [w.reg, w.value].as_slice())?;
+            let addr = match w.codec {
+                codec_mod::CodecAddr::Es8311 => dac_addr,
+                codec_mod::CodecAddr::Es7210 => adc_addr,
+            };
+            i2c.write(addr, [w.reg, w.value].as_slice())?;
         }
         Ok(())
     }
 
     /// 序列写入 (失败打印日志, 不中断初始化)
     fn write_seq_logged(&mut self, name: &str, seq: &[RegWrite]) {
-        if let Err(e) = Self::write_seq(&mut self.i2c, seq) {
+        if let Err(e) = Self::write_seq(&mut self.i2c, seq, self.dac_addr, self.adc_addr) {
             defmt::error!("Codec {} 初始化失败: {:?}", name, e);
         }
     }

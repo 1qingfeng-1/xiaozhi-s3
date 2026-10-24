@@ -178,8 +178,8 @@ async fn main(spawner: Spawner) -> ! {
     board.audio.beep(150);
 
     // 会话任务 (WS 连接/收发; 长阻塞 await 集中于此)
-    // esp-rtos task 宏: 调用即自派生任务 (内部分配任务栈并注册调度器),
-    // 不产生 SpawnToken (勿再交 spawner.spawn, 会因 token 未消费 panic)
+    // embassy_executor::task: 调用返回 SpawnToken, 必须交给 spawner.spawn
+    // (丢弃 token 会 panic)
     let token = app::session_task(app::SessionArgs {
         stack,
         server,

@@ -204,6 +204,8 @@ pub fn create_board(peripherals: Peripherals) -> Board {
         peripherals.GPIO21,
         pa,
         BOARD.audio.output_sample_rate,
+        BOARD.codec_ctrl.dac_addr,
+        BOARD.codec_ctrl.adc_addr,
     );
 
     // 显示: ST7789 240x240, SPI2 (SCK=7 MOSI=6 CS=15 DC=16 RST=5 BL=4)

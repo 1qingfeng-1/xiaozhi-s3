@@ -57,20 +57,19 @@ const GAIN_PERCENT: u16 = 600;
 const UPLINK_CEILING: i16 = 28_000;
 /// 唤醒 VAD 阈值 (均方幅度, 原始采集电平域)
 ///
-/// 真机实测 (2026-10-23): 采集时钟修复后本机电平上升 — 安静时 rms 150~300
-/// (偶发噪声峰值 2000+), 正常说话 rms 300~1300。旧阈值 300 会让环境噪声
-/// 频繁误唤醒 (周期性"嘟"提示音, 10 分钟内 26 次)。取 700: 高于安静噪声
-/// 基线, 低于正常说话峰值; 配合 3 帧去抖 (~192ms) 滤瞬态。
+/// 真机实测 (2026-10-23): 安静时 rms 150~300, 正常说话 rms 300~1300。
+/// 固定阈值 300 会误唤醒, 700 又唤不醒; 现以 400 为下限, 按噪声底
+/// `1.5x + 100` 动态上调 (上限 650), 配合 4 帧去抖 (~256ms)。
 pub const VAD_THRESHOLD: i16 = 400;
 /// 回合结束用 VAD 阈值: 比唤醒阈值低 (原始人声多数帧 rms 200~400);
 /// 误判 "说过话" 只影响收尾时机, 不会误唤醒, 故取低值保证不丢话。
 const LISTEN_VAD_THRESHOLD: i16 = 180;
-/// 回合结束: 累计有声至少 400ms 才算"说过话"
+/// 回合结束: 累计有声至少 250ms 才算"说过话"
 ///
 /// 真机 2026-10-23: 环境噪声/唤醒提示音让单帧即置 heard, 随后 500ms
 /// 安静就判停 (总时长仅 1.5s), 用户还没开口回合已结束 → 服务器只收到
 /// 噪声/静音。改为累计有声时长门槛, 滤掉瞬态噪声。
-const LISTEN_MIN_VOICED_MS: u64 = 400;
+const LISTEN_MIN_VOICED_MS: u64 = 250;
 /// 回合结束: 说完后持续静音 800ms 才收尾 (原 500ms 太短)
 const LISTEN_SILENCE_MS: u64 = 800;
 
@@ -297,6 +296,9 @@ pub async fn session_task(args: SessionArgs) {
                                 session::json_str_field(text, "state"),
                             ) {
                                 (Some("tts"), Some("start")) => {
+                                    // 新回复开始: 解除打断后的下行丢弃
+                                    DROP_DOWNLINK
+                                        .store(false, core::sync::atomic::Ordering::Relaxed);
                                     info!("服务器: tts start");
                                     channels.event.try_send(SessionEvent::TtsStart).ok();
                                 },
@@ -422,6 +424,7 @@ pub async fn run(
         alloc::vec![0u8; FRAME_SAMPLES * 4].into_boxed_slice();
     // 播报播放管线: 软件 PCM 队列 + DMA 泵送 + 预缓冲/排空门控
     let mut playback = Playback::new();
+    let mut volume_dirty = false;
     let mut barge_in_active = false;
     let mut tx_rate_bytes: u64 = 0;
     let mut tx_rate_ms: u64 = 0;
@@ -543,7 +546,7 @@ pub async fn run(
             let next = (cur + if vol_up { 5 } else { -5 }).clamp(0, 100) as u8;
             audio.set_volume(next);
             VOLUME_PCT.store(next, core::sync::atomic::Ordering::Relaxed);
-            crate::wifi::store::save_volume(flash, next);
+            volume_dirty = true;
             info!("音量: {}%", next);
         }
         vol_edge = vol_up || vol_down;
@@ -553,7 +556,7 @@ pub async fn run(
             let v = PENDING_VOLUME.swap(0, core::sync::atomic::Ordering::Relaxed);
             audio.set_volume(v);
             VOLUME_PCT.store(v, core::sync::atomic::Ordering::Relaxed);
-            crate::wifi::store::save_volume(flash, v);
+            volume_dirty = true;
             info!("MCP 音量: {}%", v);
         }
         // 充电状态: GPIO 实时 (不读 ADC, 与 WiFi PHY 无冲突)
@@ -574,20 +577,21 @@ pub async fn run(
                 pct,
                 if charging { "是" } else { "否" }
             );
-            // 堆水位诊断 (10s): 内部堆 128KB, >90% 告警 (防 opus/PSRAM 泄漏)
+            // 堆水位诊断 (10s): 只看内部 RAM 分区, 不能把 8MB PSRAM 算进去
             let hs = esp_alloc::HEAP.stats();
-            let used_pct = if hs.size > 0 {
-                hs.current_usage * 100 / hs.size
-            } else {
-                0
-            };
-            if used_pct > 90 {
-                warn!(
-                    "堆水位: {}% ({}KB/{}KB) — 接近耗尽",
-                    used_pct,
-                    hs.current_usage / 1024,
-                    hs.size / 1024
-                );
+            if let Some(r) = hs.region_stats.iter().flatten().find(|r| {
+                r.capabilities
+                    .contains(esp_alloc::MemoryCapability::Internal)
+            }) {
+                let used_pct = if r.size > 0 { r.used * 100 / r.size } else { 0 };
+                if used_pct > 90 {
+                    warn!(
+                        "内部堆水位: {}% ({}KB/{}KB) — 接近耗尽",
+                        used_pct,
+                        r.used / 1024,
+                        r.size / 1024
+                    );
+                }
             }
         }
 
@@ -606,11 +610,7 @@ pub async fn run(
         }
         pending.clear();
 
-        // ---- 5. 等回复超时: 10s 无服务器消息恢复待机 ----
-        if last_state != Some(sm.state()) {
-            last_state = Some(sm.state());
-            state_since_ms = now_ms;
-        }
+        // ---- 5. 等回复超时: 20s 无服务器消息恢复待机 ----
         if sm.state() == DialogState::WaitingReply && now_ms - state_since_ms > 20_000 {
             warn!("等回复超时 (20s), 结束会话");
             dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
@@ -658,9 +658,13 @@ pub async fn run(
                     // 环境噪声自适应: 慢速 EMA 估计噪声底, 阈值 = 2x 噪声 + 150,
                     // 限制在 [VAD_THRESHOLD, 1200], 避免吵环境里持续误唤醒 (周期性"嘟")
                     // 快降慢升: 迅速跟随安静底噪, 忽略说话/瞬态抬升
-                    noise_ema = update_noise_floor(noise_ema, rms);
-                    let wake_threshold = adaptive_threshold(noise_ema, VAD_THRESHOLD, 800);
-                    wake.source_mut().set_threshold(wake_threshold as i16);
+                    // 阈值先用上一轮噪声底算; 只有低于阈值的块才更新噪声底,
+                    // 避免说话声自己把阈值抬高 (天花板 650)
+                    let wake_threshold = adaptive_threshold(noise_ema, VAD_THRESHOLD, 650);
+                    if rms < wake_threshold as i32 {
+                        noise_ema = update_noise_floor(noise_ema, rms);
+                    }
+                    wake.source_mut().set_threshold(wake_threshold);
                     if now_ms.saturating_sub(last_level_log_ms) >= 1_000 {
                         last_level_log_ms = now_ms;
                         let regs = audio.es7210_debug_regs();
@@ -691,7 +695,17 @@ pub async fn run(
                     let frame_ms = ns as u64 * 1000 / SAMPLE_RATE as u64;
                     listen_total_ms += frame_ms;
                     let warmup = listen_total_ms <= 600;
-                    let voiced = !warmup && is_voice_active(&mono_buf[..ns], LISTEN_VAD_THRESHOLD);
+                    // 按 60ms 子块做 VAD: pop 块可能长达 ~448ms, 整块判定会
+                    // 让短语音 (<400ms) 永远累计不够、噪声块却能一票置 heard
+                    let mut voiced_ms = 0u64;
+                    if !warmup {
+                        for chunk in mono_buf[..ns].chunks(FRAME_SAMPLES) {
+                            if is_voice_active(chunk, LISTEN_VAD_THRESHOLD) {
+                                voiced_ms += chunk.len() as u64 * 1000 / SAMPLE_RATE as u64;
+                            }
+                        }
+                    }
+                    let voiced = voiced_ms > 0;
                     // 一次性原始 I2S 转储 (排查字节序/槽位): 首个有声帧的前 512 帧
                     if !raw_dumped && voiced {
                         raw_dumped = true;
@@ -703,11 +717,11 @@ pub async fn run(
                             info!("RAW {} L={} R={}", k, l, r);
                         }
                     }
+                    listen_voiced_ms += voiced_ms;
+                    if listen_voiced_ms >= LISTEN_MIN_VOICED_MS {
+                        listen_heard = true;
+                    }
                     if voiced {
-                        listen_voiced_ms += frame_ms;
-                        if listen_voiced_ms >= LISTEN_MIN_VOICED_MS {
-                            listen_heard = true;
-                        }
                         listen_silence_ms = 0;
                     } else if listen_heard {
                         listen_silence_ms += frame_ms;
@@ -763,7 +777,7 @@ pub async fn run(
             dispatch(&mut sm, &mut pending, DialogEvent::WakeTriggered);
         }
 
-        // auto 模式本地收尾: 说过话且静音 800ms, 或 8s 无人声 → listen stop
+        // auto 模式本地收尾: 说过话且静音 800ms, 或 12s 无人声 → listen stop
         if sm.state() == DialogState::Listening && sm.mode() == ListenMode::Auto {
             let done = (listen_heard && listen_silence_ms >= LISTEN_SILENCE_MS)
                 // 无人声 12s 才收尾: 多轮对话留足思考时间
@@ -782,12 +796,6 @@ pub async fn run(
         // 队列空间不足时停止取包: 包留在通道里 → 会话任务阻塞 → TCP 反压服务器,
         // 而不是丢帧 (丢帧 = 漏字)。
         for _ in 0..3 {
-            // 非播报态丢弃下行音频: 按键打断后服务器可能仍在发剩余包,
-            // 若继续解码播放, 听感上就是"按了没停"
-            if sm.state() != DialogState::Speaking {
-                while channels.downlink.try_receive().is_ok() {}
-                break;
-            }
             if !playback.has_space() {
                 break;
             }
@@ -865,9 +873,19 @@ pub async fn run(
             leds.set_mode(led);
             last_led = Some(led);
         }
+        // 音量落盘: 仅在 Idle 稳定 1s 后写, 避免 Listening/Speaking 期擦写 Flash
+        if volume_dirty
+            && sm.state() == DialogState::Idle
+            && now_ms.saturating_sub(state_since_ms) >= 1_000
+        {
+            let v = VOLUME_PCT.load(core::sync::atomic::Ordering::Relaxed);
+            crate::wifi::store::save_volume(flash, v);
+            volume_dirty = false;
+        }
         leds.tick();
         if last_state != Some(sm.state()) {
             last_state = Some(sm.state());
+            state_since_ms = now_ms;
             display.draw_status(
                 state_text(sm.state()),
                 match sm.state() {

@@ -46,26 +46,28 @@ impl Battery {
 
     /// 单次采样。AdcCalCurve (basic+line+curve) 校准后返回值已是引脚电压 mV,
     /// 勿再按 12bit raw code 换算 (参考 esp-hal calibration/line.rs 文档)。
-    fn read_raw_mv(&mut self) -> u16 {
-        loop {
+    fn read_raw_mv(&mut self) -> Option<u16> {
+        // 限次重试: ADC 持续错误时返回 None, 避免忙等卡死音频主循环
+        for _ in 0..3 {
             if let Ok(v) = self.adc.read_oneshot(&mut self.pin) {
-                return v;
+                return Some(v);
             }
         }
+        None
     }
 
     /// 读取电池端电压 (mV): 多次采样均值 × 分压还原系数
-    pub fn read_voltage_mv(&mut self) -> u32 {
+    pub fn read_voltage_mv(&mut self) -> Option<u32> {
         let mut acc = 0u32;
         for _ in 0..SAMPLE_COUNT {
-            acc += self.read_raw_mv() as u32;
+            acc += self.read_raw_mv()? as u32;
         }
-        acc / SAMPLE_COUNT * self.multiplier as u32
+        Some(acc / SAMPLE_COUNT * self.multiplier as u32)
     }
 
     /// 读取电量百分比 (0~100); 配置非法时 None
     pub fn percentage(&mut self) -> Option<u8> {
-        let mv = self.read_voltage_mv() as i32;
+        let mv = self.read_voltage_mv()? as i32;
         let p = battery_percentage(mv, self.min_mv as i32, self.max_mv as i32);
         (p >= 0).then_some(p as u8)
     }
@@ -73,7 +75,7 @@ impl Battery {
     /// 读取上报电量 (0~100): 充电完成 (DONE 有效) 钳位 100%,
     /// 其余状态按电压线性映射; 配置非法时 None
     pub fn reported_percentage(&mut self, status: PowerStatus) -> Option<u8> {
-        let mv = self.read_voltage_mv() as i32;
+        let mv = self.read_voltage_mv()? as i32;
         reported_battery_percentage(status, mv, self.min_mv as i32, self.max_mv as i32)
             .map(|p| p as u8)
     }
