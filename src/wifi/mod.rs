@@ -103,7 +103,9 @@ pub async fn connect_station(
     let (stack, runner) = embassy_net::new(
         interface,
         embassy_net::Config::dhcpv4(Default::default()),
-        mk_static!(StackResources<4>, StackResources::<4>::new()),
+        // 6 = DHCP + OTA TCP + 会话 TCP (WS 或 MQTT) + UDP 音频 + 2 余量
+        // (MQTT+UDP 模式同时占 TCP 与 UDP 两个 socket; 超容 new 会 panic)
+        mk_static!(StackResources<6>, StackResources::<6>::new()),
         0x1234_5678_9ABC_DEF0,
     );
     spawner.spawn(net_task(runner).unwrap());

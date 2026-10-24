@@ -18,7 +18,7 @@ use esp_storage::FlashStorage;
 use xiaozhi_core::ota;
 
 /// 检查结果
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UpdateReport {
     /// 服务器最新版本
     pub latest_version: heapless::String<32>,
@@ -26,6 +26,8 @@ pub struct UpdateReport {
     pub update_available: bool,
     /// 固件下载 url (清单 firmware.url)
     pub url: heapless::String<160>,
+    /// MQTT 网关配置 (服务器启用 `mqtt_gateway` 时下发)
+    pub mqtt: Option<crate::wifi::store::MqttSettings>,
 }
 
 /// 板型标识 (服务器按 `board.type` 匹配 `data/bin/<type>_<version>.bin`;
@@ -68,7 +70,17 @@ pub async fn boot_ota_task(
     done: embassy_sync::channel::Sender<'static, RawMutex, (), 1>,
 ) {
     let flash = unsafe { &mut *flash_ptr.0 };
-    match check(stack, server, &mac).await {
+    let report = check(stack, server, &mac).await;
+    // MQTT 网关配置: 服务器下发 → 持久化 (内容未变不重复擦写)
+    if let Some(mqtt) = report.as_ref().and_then(|r| r.mqtt.as_ref()) {
+        if crate::wifi::store::load_mqtt(flash).as_ref() != Some(mqtt) {
+            match crate::wifi::store::save_mqtt(flash, mqtt) {
+                Ok(()) => info!("MQTT 配置已更新: {}", mqtt.endpoint.as_str()),
+                Err(e) => error!("MQTT 配置保存失败: {}", e),
+            }
+        }
+    }
+    match report {
         Some(report) if report.update_available => {
             if should_skip(flash, report.latest_version.as_str()) {
                 // should_skip 内已告警
@@ -135,7 +147,8 @@ async fn check_inner(
     );
     write_all(&mut socket, request.as_bytes()).await.ok()?;
 
-    let resp: &'static mut heapless::String<1024> =
+    // 2048: 清单含 firmware + mqtt 两个对象时 ~600B, 留足固件 url 余量
+    let resp: &'static mut heapless::String<2048> =
         alloc::boxed::Box::leak(alloc::boxed::Box::new(heapless::String::new()));
     let mut read_buf = [0u8; 256];
     loop {
@@ -174,10 +187,24 @@ async fn check_inner(
     } else {
         info!("OTA: 已是最新 ({})", current);
     }
+    let mqtt = ota::parse_mqtt_config(body).and_then(to_mqtt_settings);
     Some(UpdateReport {
         latest_version: latest,
         update_available,
         url,
+        mqtt,
+    })
+}
+
+/// 清单里的 MQTT 配置 → 定长持久化结构 (字段超长则视为无效)
+fn to_mqtt_settings(m: ota::MqttConfig<'_>) -> Option<crate::wifi::store::MqttSettings> {
+    Some(crate::wifi::store::MqttSettings {
+        endpoint: heapless::String::try_from(m.endpoint).ok()?,
+        client_id: heapless::String::try_from(m.client_id).ok()?,
+        username: heapless::String::try_from(m.username).ok()?,
+        password: heapless::String::try_from(m.password).ok()?,
+        publish_topic: heapless::String::try_from(m.publish_topic).ok()?,
+        subscribe_topic: heapless::String::try_from(m.subscribe_topic).ok()?,
     })
 }
 
@@ -514,7 +541,7 @@ fn parse_content_length(head: &str) -> Option<u32> {
 }
 
 /// 逐字节 push 进 resp (容量满即停)
-fn push_bytes(resp: &mut heapless::String<1024>, chunk: &[u8]) {
+fn push_bytes(resp: &mut heapless::String<2048>, chunk: &[u8]) {
     for b in chunk {
         if resp.push(*b as char).is_err() {
             return;

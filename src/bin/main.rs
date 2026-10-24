@@ -228,18 +228,39 @@ async fn main(spawner: Spawner) -> ! {
     embassy_time::Timer::after(embassy_time::Duration::from_millis(400)).await;
     board.audio.set_volume(saved_vol);
 
-    // 会话任务 (WS 连接/收发; 长阻塞 await 集中于此)
+    // 传输方式: OTA 下发过 MQTT 网关配置 → MQTT+UDP, 否则 WebSocket
     // embassy_executor::task: 调用返回 SpawnToken, 必须交给 spawner.spawn
     // (丢弃 token 会 panic)
-    let token = app::session_task(app::SessionArgs {
-        stack,
-        server,
-        mac: mac.clone(),
-        channels,
-        ws_version,
-    })
-    .unwrap();
-    spawner.spawn(token);
+    let mqtt_cfg = store::load_mqtt(flash);
+    // UDP 通道恒带时间戳, 服务端 AEC 可用 → 播报中持续上行
+    let server_aec = server_aec || mqtt_cfg.is_some();
+    if let Some(cfg) = mqtt_cfg {
+        info!(
+            "传输: MQTT+UDP ({} → {})",
+            cfg.endpoint.as_str(),
+            cfg.subscribe_topic.as_str()
+        );
+        let token = xiaozhi_s3::mqtt_session::mqtt_session_task(
+            xiaozhi_s3::mqtt_session::MqttSessionArgs {
+                stack,
+                config: cfg,
+                channels,
+            },
+        )
+        .unwrap();
+        spawner.spawn(token);
+    } else {
+        // 会话任务 (WS 连接/收发; 长阻塞 await 集中于此)
+        let token = app::session_task(app::SessionArgs {
+            stack,
+            server,
+            mac: mac.clone(),
+            channels,
+            ws_version,
+        })
+        .unwrap();
+        spawner.spawn(token);
+    }
 
     // 采集常驻 + 主循环 (采集故障 → 直线路径重建 → 重进)
     let mut cap = match board.capture.start() {

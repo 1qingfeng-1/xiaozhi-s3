@@ -16,6 +16,7 @@ pub mod app;
 pub mod audio;
 pub mod bsp;
 pub mod macros;
+pub mod mqtt_session;
 pub mod ota_check;
 pub mod session;
 pub mod wifi;

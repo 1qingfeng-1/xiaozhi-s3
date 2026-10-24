@@ -32,6 +32,7 @@ impl defmt::Format for SessionCommand {
             SessionCommand::SendListenStart(_) => defmt::write!(f, "ListenStart"),
             SessionCommand::SendListenStop => defmt::write!(f, "ListenStop"),
             SessionCommand::SendTtsAbort => defmt::write!(f, "TtsAbort"),
+            SessionCommand::CloseSession => defmt::write!(f, "CloseSession"),
             SessionCommand::SetVolume(_) => defmt::write!(f, "SetVolume"),
         }
     }
@@ -132,6 +133,8 @@ pub enum SessionCommand {
     SendListenStop,
     /// 打断 TTS
     SendTtsAbort,
+    /// 本地会话结束: 通知服务器关闭通道 (MQTT 网关据此释放 bridge)
+    CloseSession,
     /// MCP: 设置音量 (音频任务执行 I2C 写)
     SetVolume(u8),
 }
@@ -237,6 +240,9 @@ pub async fn session_task(args: SessionArgs) {
                     // 音频主循环轮询 PENDING_VOLUME 并执行 I2C 写
                     PENDING_VOLUME.store(v, core::sync::atomic::Ordering::Relaxed);
                     PENDING_VOLUME_VALID.store(true, core::sync::atomic::Ordering::Relaxed);
+                },
+                Ok(SessionCommand::CloseSession) => {
+                    // WS 服务端按会话超时自行回收, 无需显式 goodbye
                 },
                 Ok(SessionCommand::SendTtsAbort) => {
                     if connected {
@@ -593,6 +599,17 @@ pub async fn run(
             boot_ms = now_ms;
         }
 
+        // ---- 会话自测 (feature `session-selftest`, 默认关): 自动唤醒一次 ----
+        #[cfg(feature = "session-selftest")]
+        if sm.state() == DialogState::Idle && now_ms >= 5_000 {
+            use core::sync::atomic::{AtomicBool, Ordering};
+            static FIRED: AtomicBool = AtomicBool::new(false);
+            if !FIRED.swap(true, Ordering::Relaxed) {
+                info!("会话自测: 自动触发唤醒");
+                dispatch(&mut sm, &mut pending, DialogEvent::WakeTriggered);
+            }
+        }
+
         // ---- 1. 会话事件 ----
         loop {
             match channels.event.try_receive() {
@@ -820,6 +837,15 @@ pub async fn run(
         // ---- 5. 等回复超时: 20s 无服务器消息恢复待机 ----
         if sm.state() == DialogState::WaitingReply && now_ms - state_since_ms > 20_000 {
             warn!("等回复超时 (20s), 结束会话");
+            // 通知服务器释放通道 (MQTT 网关 bridge 会一直挂着, 下次 hello
+            // 触发旧 bridge 关闭并向设备发过期 goodbye)
+            if channels
+                .command
+                .try_send(SessionCommand::CloseSession)
+                .is_err()
+            {
+                warn!("命令通道满, 放弃 close 通知");
+            }
             dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
         }
 
@@ -1057,8 +1083,6 @@ pub async fn run(
             };
             match decoder.decode(&pkt.data, &mut pcm_dec) {
                 Ok(n) if n > 0 => {
-                    // 该帧开始出声: 记录服务器时间戳供上行配对 (服务端 AEC)
-                    aec_clock.push(pkt.timestamp);
                     let n = n.min(pcm_dec.len());
                     dec_pkts += 1;
                     dec_samples += n as u64;
@@ -1071,7 +1095,8 @@ pub async fn run(
                         );
                     }
                     let written = mono_to_stereo(&pcm_dec[..n], &mut stereo_out);
-                    playback.push(&stereo_out[..written]);
+                    // 时间戳随 PCM 入队, 真正播出时由 pump 交给 AEC 时钟
+                    playback.push(&stereo_out[..written], pkt.timestamp);
                 },
                 Ok(_) => {},
                 Err(e) => warn!("opus 解码失败: {}", e),
@@ -1079,7 +1104,12 @@ pub async fn run(
         }
 
         // ---- 8. 时钟维持: 软件队列 → DMA 环形, 没数据时补静音 ----
-        let (underran, _) = playback.pump(audio, silence_buf, sm.state() == DialogState::Speaking);
+        let (underran, _) = playback.pump(
+            audio,
+            silence_buf,
+            sm.state() == DialogState::Speaking,
+            &mut aec_clock,
+        );
         if underran && playback.underruns() % 100 == 1 {
             info!("播报欠载 #{} (PCM 队列空, 补静音)", playback.underruns());
         }
@@ -1261,7 +1291,11 @@ fn event_label(ev: DialogEvent) -> &'static str {
 ///
 /// 由 [`session_task`] 在收到服务器 `type=mcp` 文本帧时调用, 回送
 /// initialize/tools_list/tools_call 应答 (见 session.rs HELLO 的 `features.mcp`)。
-fn mcp_handle(text: &str, volume: u8, channels: &Channels) -> Option<heapless::String<1024>> {
+pub(crate) fn mcp_handle(
+    text: &str,
+    volume: u8,
+    channels: &Channels,
+) -> Option<heapless::String<1024>> {
     use xiaozhi_core::mcp;
     let Some(req) = mcp::parse_request(text) else {
         return None; // notifications / 无法解析: 无需回应

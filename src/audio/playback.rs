@@ -8,7 +8,8 @@
 
 use core::alloc::Layout;
 
-use xiaozhi_core::audio::playback::PlaybackFlow;
+use xiaozhi_core::audio::playback::{PlaybackFlow, PlayoutTimestamps};
+use xiaozhi_core::protocol::AecClock;
 
 use crate::bsp::components::Audio;
 
@@ -51,6 +52,8 @@ pub struct Playback {
     flow: PlaybackFlow,
     underruns: u32,
     tx_bytes: u64,
+    /// 服务器时间戳按**实际播出**进度入队 (服务端 AEC 对齐用)
+    ts: PlayoutTimestamps,
 }
 
 impl Playback {
@@ -65,6 +68,7 @@ impl Playback {
             flow: PlaybackFlow::new(PREBUFFER, DRAIN_MS),
             underruns: 0,
             tx_bytes: 0,
+            ts: PlayoutTimestamps::new(),
         }
     }
 
@@ -82,7 +86,10 @@ impl Playback {
     }
 
     /// 写入 PCM，返回实际写入字节数（环形，自动回绕）
-    pub fn push(&mut self, pcm: &[u8]) -> usize {
+    ///
+    /// `timestamp` 为服务器帧时间戳 (v1/无时间戳传 0): 只有真正播出时才
+    /// 交给服务端 AEC, 所以先随字节数入队, 由 [`Self::pump`] 按消费进度弹出。
+    pub fn push(&mut self, pcm: &[u8], timestamp: u32) -> usize {
         let n = pcm.len().min(self.cap - self.len);
         let first = n.min(self.cap - self.write);
         self.buf[self.write..self.write + first].copy_from_slice(&pcm[..first]);
@@ -91,6 +98,7 @@ impl Playback {
         }
         self.write = (self.write + n) % self.cap;
         self.len += n;
+        self.ts.push_frame(n, timestamp);
         n
     }
 
@@ -110,7 +118,15 @@ impl Playback {
     }
 
     /// 泵入 DMA 环形；返回 (是否欠载, 写入字节数)
-    pub fn pump(&mut self, audio: &mut Audio, silence: &[u8], active: bool) -> (bool, usize) {
+    ///
+    /// 实际播出（写入 DMA）的字节会推进时间戳队列, 由 `clock` 交给上行帧。
+    pub fn pump(
+        &mut self,
+        audio: &mut Audio,
+        silence: &[u8],
+        active: bool,
+        clock: &mut AecClock,
+    ) -> (bool, usize) {
         let allow = self.flow.allow_audio(self.len);
         let mut underran = false;
         let mut total = 0usize;
@@ -129,6 +145,7 @@ impl Playback {
                 let n = free.min(src.len());
                 let w = audio.push_avail(&src[..n]);
                 self.consume(w);
+                self.ts.consume(w, clock);
                 w
             };
             if pushed == 0 {
@@ -172,6 +189,7 @@ impl Playback {
         self.read = 0;
         self.write = 0;
         self.len = 0;
+        self.ts.clear();
         self.flow.reset();
     }
 }

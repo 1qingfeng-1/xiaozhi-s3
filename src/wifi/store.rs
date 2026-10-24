@@ -133,6 +133,93 @@ pub fn save_ws_version(flash: &mut FlashStorage<'_>, version: u16) -> Result<(),
     NorFlash::write(flash, PROTOCOL_SECTOR, &word).map_err(|_| "Flash 写入失败")
 }
 
+/// MQTT 网关配置 (OTA 下发; 存在时设备改走 MQTT+UDP 传输)
+#[derive(Clone, PartialEq, Eq)]
+pub struct MqttSettings {
+    /// `host:port` (网关 MQTT broker)
+    pub endpoint: heapless::String<64>,
+    pub client_id: heapless::String<96>,
+    pub username: heapless::String<96>,
+    pub password: heapless::String<96>,
+    pub publish_topic: heapless::String<32>,
+    pub subscribe_topic: heapless::String<64>,
+}
+
+impl MqttSettings {
+    /// 各字段容量 (序列化/反序列化共用): endpoint/client_id/username/
+    /// password/publish_topic/subscribe_topic
+    const CAPS: [usize; 6] = [64, 96, 96, 96, 32, 64];
+
+    /// 序列化后的总长度上界 (magic 4 + 6×(len 2 + 容量))
+    const BUF_LEN: usize = 4 + 6 * 2 + 64 + 96 + 96 + 96 + 32 + 64;
+
+    fn fields(&self) -> [&str; 6] {
+        [
+            self.endpoint.as_str(),
+            self.client_id.as_str(),
+            self.username.as_str(),
+            self.password.as_str(),
+            self.publish_topic.as_str(),
+            self.subscribe_topic.as_str(),
+        ]
+    }
+}
+
+/// MQTT 配置扇区 (0xA000, NVS 分区内独立扇区)
+const MQTT_SECTOR: u32 = 0xA000;
+const MQTT_MAGIC: u32 = 0x4643_514D; // 'MQCF' 小端
+
+/// 保存 MQTT 配置 (整扇区擦写; 仅在内容变化时调用)
+pub fn save_mqtt(flash: &mut FlashStorage<'_>, cfg: &MqttSettings) -> Result<(), &'static str> {
+    let mut buf = [0u8; 512];
+    if buf.len() < MqttSettings::BUF_LEN {
+        return Err("MQTT 配置缓冲不足");
+    }
+    buf[..4].copy_from_slice(&MQTT_MAGIC.to_le_bytes());
+    let mut o = 4usize;
+    for s in cfg.fields() {
+        let len = u16::try_from(s.len()).map_err(|_| "MQTT 字段过长")?;
+        buf[o..o + 2].copy_from_slice(&len.to_le_bytes());
+        o += 2;
+        if o + s.len() > buf.len() {
+            return Err("MQTT 配置超出容量");
+        }
+        buf[o..o + s.len()].copy_from_slice(s.as_bytes());
+        o += s.len();
+    }
+    NorFlash::erase(flash, MQTT_SECTOR, MQTT_SECTOR + 4096).map_err(|_| "Flash 擦除失败")?;
+    NorFlash::write(flash, MQTT_SECTOR, &buf[..o]).map_err(|_| "Flash 写入失败")
+}
+
+/// 读取 MQTT 配置 (无记录/损坏 → None)
+pub fn load_mqtt(flash: &mut FlashStorage<'_>) -> Option<MqttSettings> {
+    let mut buf = [0u8; 512];
+    flash.read(MQTT_SECTOR, &mut buf).ok()?;
+    if u32::from_le_bytes(buf[..4].try_into().ok()?) != MQTT_MAGIC {
+        return None;
+    }
+    let mut o = 4usize;
+    let mut out: [heapless::String<96>; 6] = core::array::from_fn(|_| heapless::String::new());
+    for (i, cap) in MqttSettings::CAPS.iter().enumerate() {
+        let len = u16::from_le_bytes(buf.get(o..o + 2)?.try_into().ok()?) as usize;
+        o += 2;
+        let s = core::str::from_utf8(buf.get(o..o + len)?).ok()?;
+        o += len;
+        if s.len() > *cap {
+            return None;
+        }
+        *out.get_mut(i)? = heapless::String::try_from(s).ok()?;
+    }
+    Some(MqttSettings {
+        endpoint: heapless::String::try_from(out[0].as_str()).ok()?,
+        client_id: heapless::String::try_from(out[1].as_str()).ok()?,
+        username: heapless::String::try_from(out[2].as_str()).ok()?,
+        password: heapless::String::try_from(out[3].as_str()).ok()?,
+        publish_topic: heapless::String::try_from(out[4].as_str()).ok()?,
+        subscribe_topic: heapless::String::try_from(out[5].as_str()).ok()?,
+    })
+}
+
 /// 启动自检: 写已知模式到备用扇区并读回, 验证存储层工作正常
 pub fn self_test(flash: &mut FlashStorage<'_>) -> bool {
     const TEST_SECTOR: u32 = 0x9000; // NVS 分区首扇区 (未使用)

@@ -24,6 +24,8 @@ pub const LISTEN_START_MANUAL: &str =
 pub const LISTEN_START_AUTO: &str = "{\"type\":\"listen\",\"state\":\"start\",\"mode\":\"auto\"}";
 pub const LISTEN_STOP: &str = "{\"type\":\"listen\",\"state\":\"stop\"}";
 pub const TTS_ABORT: &str = "{\"type\":\"tts\",\"state\":\"abort\"}";
+/// 设备主动结束会话 (MQTT 网关据此关闭 bridge; WS 服务端忽略)
+pub const GOODBYE: &str = "{\"type\":\"goodbye\"}";
 
 /// 允许的协议版本范围 (v1 裸 opus / v2 16B 头含时间戳 / v3 4B 头)
 pub use xiaozhi_core::protocol::{VERSION_MAX, VERSION_MIN};
