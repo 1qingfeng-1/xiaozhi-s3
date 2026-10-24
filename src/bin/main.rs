@@ -58,6 +58,27 @@ const POP_BUF_SIZE: usize = 4092 * 8;
 /// 单 DMA 描述符字节数 (4092B ≈ 64ms @ 16kHz 立体声)
 const BLOCK_BYTES: usize = 4092;
 
+/// 从 PSRAM (External) 分配字节缓冲; 失败回退内部 RAM
+fn psram_bytes(len: usize) -> &'static mut [u8] {
+    use core::alloc::Layout;
+    let layout = Layout::from_size_align(len, 4).expect("bad layout");
+    // SAFETY: 非零布局, 分配块常驻 (泄漏至重启)
+    let p =
+        unsafe { esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::External.into(), layout) };
+    if p.is_null() {
+        alloc::vec![0u8; len].leak()
+    } else {
+        // SAFETY: alloc_caps 返回 len 字节可写内存
+        unsafe { core::slice::from_raw_parts_mut(p, len) }
+    }
+}
+
+fn psram_i16(len: usize) -> &'static mut [i16] {
+    let b = psram_bytes(len * 2);
+    // SAFETY: 4 字节对齐, 长度按 i16 计
+    unsafe { core::slice::from_raw_parts_mut(b.as_mut_ptr().cast(), len) }
+}
+
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
@@ -161,10 +182,11 @@ async fn main(spawner: Spawner) -> ! {
 
     // 会话常驻缓冲 (帧长/常量与 app.rs 对齐: 960 样本 @16kHz 60ms)
     // 堆分配而非 mk_static: 大数组进 bss 会把主栈压到 <87KB (opus SILK)
-    let pop_buf: &'static mut [u8] = alloc::vec![0u8; POP_BUF_SIZE].leak();
-    let mono_buf: &'static mut [i16] = alloc::vec![0i16; POP_BUF_SIZE / 4].leak();
-    let acc_buf: &'static mut [i16] = alloc::vec![0i16; 1920].leak();
-    let silence_buf: &'static mut [u8] = alloc::vec![0u8; BLOCK_BYTES].leak();
+    // 大块 CPU 缓冲放 PSRAM: 内部堆只有 128KB, 不能把 40KB 常驻缓冲留在内部
+    let pop_buf: &'static mut [u8] = psram_bytes(POP_BUF_SIZE);
+    let mono_buf: &'static mut [i16] = psram_i16(POP_BUF_SIZE / 4);
+    let acc_buf: &'static mut [i16] = psram_i16(1920);
+    let silence_buf: &'static mut [u8] = psram_bytes(BLOCK_BYTES);
 
     // wakenet 自检 (feature `wakenet`): 强制链接 esp-sr 符号闭包
     #[cfg(feature = "wakenet")]

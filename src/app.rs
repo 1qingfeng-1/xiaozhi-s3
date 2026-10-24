@@ -425,6 +425,15 @@ pub async fn run(
     // 播报播放管线: 软件 PCM 队列 + DMA 泵送 + 预缓冲/排空门控
     let mut playback = Playback::new();
     let mut volume_dirty = false;
+    info!(
+        "PCM 环: {}KB ({})",
+        playback.capacity() / 1024,
+        if playback.capacity() == crate::audio::playback::QUEUE_MAX {
+            "PSRAM"
+        } else {
+            "内部回退"
+        }
+    );
     let mut barge_in_active = false;
     let mut tx_rate_bytes: u64 = 0;
     let mut tx_rate_ms: u64 = 0;
@@ -568,7 +577,10 @@ pub async fn run(
         // 会话期间频繁读 ADC 干扰射频 — 曾崩 pm_on_beacon_rx)
         if sm.state() == DialogState::Idle && now_ms - battery_last_read >= 10_000 {
             battery_last_read = now_ms;
-            let pct = battery.reported_percentage(power.status()).unwrap_or(0);
+            // ADC 读失败时保留上次值, 不要把电量误置 0
+            let pct = battery
+                .reported_percentage(power.status())
+                .unwrap_or_else(|| BATTERY_PCT.load(core::sync::atomic::Ordering::Relaxed));
             BATTERY_PCT.store(pct, core::sync::atomic::Ordering::Relaxed);
             // 10s 一次诊断 (M8 项 9 验收): 电量 + 充电态, 确认不再崩 pm_on_beacon_rx
             let charging = matches!(power.status(), xiaozhi_core::board::PowerStatus::Charging);

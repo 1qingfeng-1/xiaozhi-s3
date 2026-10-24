@@ -48,9 +48,13 @@ impl Battery {
     /// 勿再按 12bit raw code 换算 (参考 esp-hal calibration/line.rs 文档)。
     fn read_raw_mv(&mut self) -> Option<u16> {
         // 限次重试: ADC 持续错误时返回 None, 避免忙等卡死音频主循环
-        for _ in 0..3 {
+        for _ in 0..20 {
             if let Ok(v) = self.adc.read_oneshot(&mut self.pin) {
                 return Some(v);
+            }
+            // 给 ADC/校准一点时间, 避免连续失败
+            for _ in 0..20_000 {
+                core::hint::spin_loop();
             }
         }
         None
