@@ -25,7 +25,7 @@ pub struct UpdateReport {
     /// 是否比当前固件新
     pub update_available: bool,
     /// 固件下载 url (清单 firmware.url)
-    pub url: heapless::String<64>,
+    pub url: heapless::String<160>,
 }
 
 /// 板型标识 (服务器按 `board.type` 匹配 `data/bin/<type>_<version>.bin`;
@@ -167,7 +167,7 @@ async fn check_inner(
         ota::compare_versions(manifest.version, current) == core::cmp::Ordering::Greater;
     let mut latest = heapless::String::<32>::new();
     let _ = latest.push_str(manifest.version);
-    let mut url = heapless::String::<64>::new();
+    let mut url = heapless::String::<160>::new();
     let _ = url.push_str(manifest.url);
     if update_available {
         info!("OTA: 有新版本 {} (当前 {})", latest.as_str(), current);
@@ -240,6 +240,7 @@ async fn download_and_flash_inner(
         path,
         host
     );
+    info!("OTA GET {}", req.as_str());
     write_all(&mut socket, req.as_bytes()).await.ok()?;
 
     // 3. 读 HTTP 头 + 校验状态码
@@ -305,7 +306,8 @@ async fn download_and_flash_inner(
     sector_buf[..128].copy_from_slice(&img_head);
     let mut fill = 128usize;
     let mut written = 0u32;
-    let mut total = 128u32;
+    // 扇区计数已包含前 128B 镜像头, 不能从 128 起算 (会多算 128B)
+    let mut total = 0u32;
     let mut last_log = 0u32;
 
     loop {
