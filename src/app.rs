@@ -22,6 +22,7 @@ use xiaozhi_core::audio::wake::{
     update_noise_floor,
 };
 use xiaozhi_core::dialog::{Action, DialogEvent, DialogSm, DialogState, ListenMode};
+use xiaozhi_core::idle::IdlePromptPolicy;
 
 use crate::audio::opus::{MAX_PACKET_BYTES, OpusDecoder, OpusEncoder};
 
@@ -41,6 +42,7 @@ use crate::audio::playback::Playback;
 use crate::bsp::components::{
     Audio, Battery, BreathSpeed, Buttons, Display, LedMode, Leds, Power, Rgb565,
 };
+use crate::prompt::PromptPlayer;
 use crate::session;
 
 /// 上行音频参数 (16kHz 单声道 60ms, 对齐 C++ 参考与 hello.audio_params;
@@ -536,6 +538,18 @@ pub async fn run(
         alloc::vec![0u8; FRAME_SAMPLES * 4].into_boxed_slice();
     // 播报播放管线: 软件 PCM 队列 + DMA 泵送 + 预缓冲/排空门控
     let mut playback = Playback::new();
+    // 空闲提示: 60s 无活动 → 播放语音提示 → 进入低功耗待机
+    // (idle-selftest: 窗口缩到 5s, 便于真机验证流程)
+    const IDLE_WINDOW_MS: u64 = if cfg!(feature = "idle-selftest") {
+        5_000
+    } else {
+        60_000
+    };
+    let mut idle_policy = IdlePromptPolicy::new(IDLE_WINDOW_MS, 0);
+    let mut prompt = PromptPlayer::new();
+    let mut prompt_until_ms: u64 = 0;
+    let mut prompt_vol_restore_at: u64 = 0;
+    let mut low_power = false;
     let mut volume_dirty = false;
     let preroll = alloc_preroll();
     let preroll_len = preroll.len();
@@ -739,6 +753,9 @@ pub async fn run(
         let pressed = buttons.boot_pressed();
         if pressed != held {
             held = pressed;
+            // 按键交互: 重置空闲窗口, 退出低功耗
+            idle_policy.note_activity(now_ms);
+            low_power = false;
             if held && sm.state() == DialogState::Idle {
                 // BOOT 建连期间也会丢语音: 只补发按下之后的样本
                 preroll_flush = true;
@@ -774,6 +791,8 @@ pub async fn run(
             audio.set_volume(next);
             VOLUME_PCT.store(next, core::sync::atomic::Ordering::Relaxed);
             volume_dirty = true;
+            idle_policy.note_activity(now_ms);
+            low_power = false;
             info!("音量: {}%", next);
         }
         vol_edge = vol_up || vol_down;
@@ -784,6 +803,8 @@ pub async fn run(
             audio.set_volume(v);
             VOLUME_PCT.store(v, core::sync::atomic::Ordering::Relaxed);
             volume_dirty = true;
+            idle_policy.note_activity(now_ms);
+            low_power = false;
             info!("MCP 音量: {}%", v);
         }
         // 充电状态: GPIO 实时 (不读 ADC, 与 WiFi PHY 无冲突)
@@ -846,6 +867,36 @@ pub async fn run(
             }
         }
         pending.clear();
+
+        // ---- 4.5 空闲提示: 离开 Idle 视为活动; 60s 无活动播提示音 ----
+        if sm.state() != DialogState::Idle {
+            idle_policy.note_activity(now_ms);
+            low_power = false;
+            if prompt.is_active() {
+                // 提示音期间被唤醒: 立即中止并恢复音量
+                prompt.stop();
+                prompt_vol_restore_at = now_ms + 300;
+            }
+        } else {
+            // 音量恢复 (提示音播放前可能压到 60%)
+            if prompt_vol_restore_at != 0 && now_ms >= prompt_vol_restore_at {
+                audio.set_volume(VOLUME_PCT.load(core::sync::atomic::Ordering::Relaxed));
+                prompt_vol_restore_at = 0;
+            }
+            if !prompt.is_active() && idle_policy.poll(now_ms) {
+                let vol = VOLUME_PCT
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    .min(60);
+                audio.set_volume(vol);
+                prompt.start();
+                prompt_until_ms = now_ms + prompt.duration_ms() + 400;
+                info!(
+                    "空闲 {}s: 播放提示音 (音量 {}%)",
+                    idle_policy.idle_for_ms(now_ms) / 1000,
+                    vol
+                );
+            }
+        }
 
         // ---- 5. 等回复超时: 20s 无服务器消息恢复待机 ----
         if sm.state() == DialogState::WaitingReply && now_ms - state_since_ms > 20_000 {
@@ -939,7 +990,10 @@ pub async fn run(
                         );
                         idle_peak_rms = 0;
                     }
-                    triggered |= wake.feed(&mono_buf[..ns], now_ms) == WakeEvent::Triggered;
+                    // 提示音播放期 + 尾音窗口: 不喂 VAD, 防扬声器自唤醒
+                    if now_ms >= prompt_until_ms {
+                        triggered |= wake.feed(&mono_buf[..ns], now_ms) == WakeEvent::Triggered;
+                    }
                 },
                 DialogState::Listening => {
                     // 回合结束判定 (auto 模式): 本地能量 VAD 找静音收尾点。
@@ -1117,14 +1171,22 @@ pub async fn run(
         }
 
         // ---- 8. 时钟维持: 软件队列 → DMA 环形, 没数据时补静音 ----
-        let (underran, _) = playback.pump(
-            audio,
-            silence_buf,
-            sm.state() == DialogState::Speaking,
-            &mut aec_clock,
-        );
-        if underran && playback.underruns() % 100 == 1 {
-            info!("播报欠载 #{} (PCM 队列空, 补静音)", playback.underruns());
+        // 空闲提示音优先占用输出; 播完后恢复常规泵送 (补静音)
+        if prompt.is_active() && prompt.pump(audio, &mut stereo_out[..]) {
+            low_power = true;
+            prompt_vol_restore_at = now_ms + 300;
+            info!("提示音播放完成, 进入低功耗待机");
+        }
+        if !prompt.is_active() {
+            let (underran, _) = playback.pump(
+                audio,
+                silence_buf,
+                sm.state() == DialogState::Speaking,
+                &mut aec_clock,
+            );
+            if underran && playback.underruns() % 100 == 1 {
+                info!("播报欠载 #{} (PCM 队列空, 补静音)", playback.underruns());
+            }
         }
         if playback.take_prebuffer_done() {
             crate::diag!("预缓冲完成: {}B", playback.queue_len());
@@ -1158,6 +1220,7 @@ pub async fn run(
 
         // ---- 9. 灯语 + 显示状态 ----
         let led = match sm.state() {
+            DialogState::Idle if low_power => LedMode::Off,
             DialogState::Idle => LedMode::Breathing(BreathSpeed::Slow),
             DialogState::Connecting => LedMode::Breathing(BreathSpeed::Fast),
             DialogState::Listening => LedMode::Breathing(BreathSpeed::Medium),

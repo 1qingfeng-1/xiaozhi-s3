@@ -63,6 +63,9 @@ watchdog-selftest = []
 ## 长句自测: 会话就绪后自动发一条文本请求, 触发服务端长 TTS (验证下行链路)
 tts-selftest = []
 
+## 空闲提示自测: 空闲窗口缩短为 5s, 便于验证提示音/低功耗流程; 勿用于发布
+idle-selftest = []
+
 ## gezipai 开发板 (ES8311 + ES7210 + ST7789)
 board-gezipai = []
 
