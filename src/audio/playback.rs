@@ -21,7 +21,7 @@ pub const PREBUFFER: usize = 16_000 / 1000 * 1000 * 4;
 /// 单帧最大 PCM 字节数 (60ms 立体声 16bit)
 pub const FRAME_MAX: usize = 960 * 4;
 /// TtsStop 后等 DMA 播完的余量
-const DRAIN_MS: u64 = 150;
+const DRAIN_MS: u64 = 50;
 
 /// 优先从 PSRAM (External) 分配；失败回退内部 RAM (容量缩半)
 fn alloc_ring(size: usize) -> (&'static mut [u8], usize) {

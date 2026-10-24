@@ -71,7 +71,7 @@ const LISTEN_VAD_THRESHOLD: i16 = 180;
 /// 噪声/静音。改为累计有声时长门槛, 滤掉瞬态噪声。
 const LISTEN_MIN_VOICED_MS: u64 = 250;
 /// 回合结束: 说完后持续静音 800ms 才收尾 (原 500ms 太短)
-const LISTEN_SILENCE_MS: u64 = 800;
+const LISTEN_SILENCE_MS: u64 = 1_500;
 /// 唤醒预录: 保存最近 1s 原始 PCM, 覆盖建连窗口 (~0.7s) 内丢失的语音
 const PREROLL_SAMPLES: usize = 16_000;
 
@@ -439,6 +439,8 @@ pub async fn run(
     let mut preroll_from: u64 = 0;
     // 提示音/开机静音窗: 防扬声器声音被麦克风录进上行
     let mut mic_mute_until_ms: u64 = 0;
+    // TTS 结束后的静默期: 防止扬声器尾音/回声立刻触发本地收尾
+    let mut listen_grace_until_ms: u64 = 0;
     let mut boot_ms: u64 = 0;
     info!(
         "PCM 环: {}KB ({})",
@@ -811,7 +813,8 @@ pub async fn run(
                             }
                         }
                     }
-                    let voiced = voiced_ms > 0 && now_ms >= mic_mute_until_ms;
+                    let in_grace = now_ms < listen_grace_until_ms;
+                    let voiced = voiced_ms > 0 && now_ms >= mic_mute_until_ms && !in_grace;
                     // 一次性原始 I2S 转储 (排查字节序/槽位): 首个有声帧的前 512 帧
                     if !raw_dumped && voiced {
                         raw_dumped = true;
@@ -829,7 +832,7 @@ pub async fn run(
                     }
                     if voiced {
                         listen_silence_ms = 0;
-                    } else if listen_heard {
+                    } else if listen_heard && !in_grace {
                         listen_silence_ms += frame_ms;
                     }
                     apply_gain_percent(&mut mono_buf[..ns], GAIN_PERCENT);
@@ -984,6 +987,7 @@ pub async fn run(
         // TtsStop 延迟派发: 队列空 + DMA 播完后才回到 Listening (防回声)
         if playback.poll_stop(now_ms) {
             wake.policy_mut().note_playback_end(now_ms);
+            listen_grace_until_ms = now_ms + 100;
             dispatch(&mut sm, &mut pending, DialogEvent::TtsStop);
         }
         // 让出 CPU: 会话任务/网络任务需要被轮询才能推进连接与收发
