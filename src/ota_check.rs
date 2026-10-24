@@ -373,7 +373,9 @@ async fn download_and_flash_inner(
     let entry_bytes = entry.to_bytes();
     let entry_abs = OTADATA_BASE + ota::otadata_entry_offset(target_slot);
     let otadata_sector = OTADATA_BASE + target_slot as u32 * SECTOR;
-    if let Err(e) = embedded_storage::nor_flash::NorFlash::erase(flash, otadata_sector, SECTOR) {
+    if let Err(e) =
+        embedded_storage::nor_flash::NorFlash::erase(flash, otadata_sector, otadata_sector + SECTOR)
+    {
         error!(
             "OTA: otadata 扇区擦除失败 @0x{:05X}: {:?}",
             otadata_sector, e
@@ -544,10 +546,13 @@ async fn write_all(socket: &mut TcpSocket<'_>, mut data: &[u8]) -> Result<(), ()
 ///
 /// 成功返回确认的 seq; 无待确认条目返回 None。
 pub fn confirm_running_image(flash: &mut FlashStorage<'static>) -> Option<u32> {
-    let mut buf = [0xFFu8; 64];
-    flash.read(OTADATA_BASE, &mut buf).ok()?;
-    let e0 = ota::OtaDataEntry::from_bytes(&buf[..32]);
-    let e1 = ota::OtaDataEntry::from_bytes(&buf[32..]);
+    // 两条目各占一扇区 (4KB 间距), 不能按相邻 32B 读
+    let mut b0 = [0xFFu8; 32];
+    flash.read(OTADATA_BASE, &mut b0).ok()?;
+    let mut b1 = [0xFFu8; 32];
+    flash.read(OTADATA_BASE + SECTOR, &mut b1).ok()?;
+    let e0 = ota::OtaDataEntry::from_bytes(&b0);
+    let e1 = ota::OtaDataEntry::from_bytes(&b1);
     let (slot, entry) = if e0.is_pending() {
         (0usize, e0)
     } else if e1.is_pending() {
@@ -557,7 +562,7 @@ pub fn confirm_running_image(flash: &mut FlashStorage<'static>) -> Option<u32> {
     };
     let other = 1 - slot;
     let abs = OTADATA_BASE + other as u32 * SECTOR;
-    if embedded_storage::nor_flash::NorFlash::erase(flash, abs, SECTOR).is_err() {
+    if embedded_storage::nor_flash::NorFlash::erase(flash, abs, abs + SECTOR).is_err() {
         error!("OTA: 确认镜像时擦除 otadata 失败");
         return None;
     }
