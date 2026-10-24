@@ -287,6 +287,7 @@ M1 音频通路 ── M2 WiFi/配网 ── M4.1 WS 协议 ── M4.2 opus 全
 | 播放时间戳对齐 | ✅ | `PlayoutTimestamps`：按实际播出字节推进，一帧播完才进 AEC 时钟 |
 | 过期 goodbye 过滤 | ✅ | `awaiting_hello` 期间一律忽略；其余按 `session_id`；本地 20s 超时主动 goodbye |
 | 连续唤醒稳定性 | ✅ | 修复建连窗口旧 goodbye 自毁；环境声多次唤醒均稳定进入聆听 |
+| 长句播报卡顿/杂音 | ✅ | 根因：WiFi modem sleep 使 AP 缓存并突发投递 UDP + 2KB 收包缓冲溢出；改 `PowerSaveMode::None` + 64KB 缓冲后用户复测「长句正常」（125 包断序 0） |
 | 内部堆优化 | ✅ | MQTT 大缓冲迁 PSRAM，水位 98% → <90% |
 | 主循环看门狗 | ✅ | TIMG0 MWDT 8s，真机 `rst:0x7 (TG0WDT_SYS_RST)` 验证 |
 | OTA 低电保护 | ✅ | 电量 <20% 且未充电跳过升级（防中途掉电） |
@@ -303,6 +304,16 @@ M1 音频通路 ── M2 WiFi/配网 ── M4.1 WS 协议 ── M4.2 opus 全
 
 - `session-selftest`：开机 5s 自动触发一次唤醒，验证传输/播报链路；
 - `watchdog-selftest`：启用 RWDT 后阻塞主循环 12s，验证 8s 看门狗复位。
+
+**长句音质问题（2026-10-24 真机修复记录）**：
+
+- 现象：长句 TTS 卡顿 + 杂音；日志显示下行 UDP `断序` 最高 85/382 包。
+- 根因：`PowerSaveMode::Minimum` 下 AP 按 DTIM 缓存/突发投递 UDP 包，
+  叠加设备 UDP 收包缓冲仅 2KB（≈2 包），突发时静默丢包；opus 解码断点即杂音。
+- 修复：WiFi 省电关闭（`PowerSaveMode::None`）+ UDP 收包缓冲 64KB/128 元数据。
+- 验证：用户复测「长句正常」；设备日志 125 包长句 `断序 0、迟到 0`。
+- 尝试过「空闲 Minimum / 会话 None」自适应切换，但切换瞬间首句会丢 1~3 包，
+  已回退；待机功耗与音质的取舍当前选择优先音质。
 
 **已知限制**：
 
