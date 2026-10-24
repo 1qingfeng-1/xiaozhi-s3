@@ -365,10 +365,21 @@ async fn download_and_flash_inner(
         return None;
     }
 
-    // 6. 写 otadata 条目 (镜像已完整校验, 才允许切换)
-    let entry = ota::OtaDataEntry::new(new_seq, version.as_str(), ota::OtaImageState::Valid);
+    // 6. 擦除目标 otadata 扇区并写 PENDING_VERIFY 条目
+    //    新镜像首次启动成功、WiFi 连上后才由 confirm_running_image 置 VALID;
+    //    未确认时由二级引导器按 PENDING_VERIFY 回滚到旧槽。
+    let entry =
+        ota::OtaDataEntry::new(new_seq, version.as_str(), ota::OtaImageState::PendingVerify);
     let entry_bytes = entry.to_bytes();
     let entry_abs = OTADATA_BASE + ota::otadata_entry_offset(target_slot);
+    let otadata_sector = OTADATA_BASE + target_slot as u32 * SECTOR;
+    if let Err(e) = embedded_storage::nor_flash::NorFlash::erase(flash, otadata_sector, SECTOR) {
+        error!(
+            "OTA: otadata 扇区擦除失败 @0x{:05X}: {:?}",
+            otadata_sector, e
+        );
+        return None;
+    }
     if let Err(e) = flash.write(entry_abs, &entry_bytes) {
         error!("OTA: otadata 写失败 @0x{:05X}: {:?}", entry_abs, e);
         return None;
@@ -527,4 +538,34 @@ async fn write_all(socket: &mut TcpSocket<'_>, mut data: &[u8]) -> Result<(), ()
         data = &data[n..];
     }
     Ok(())
+}
+
+/// 启动确认: 若当前活动条目为 PENDING_VERIFY, 在 WiFi 连通后写 VALID 确认。
+///
+/// 成功返回确认的 seq; 无待确认条目返回 None。
+pub fn confirm_running_image(flash: &mut FlashStorage<'static>) -> Option<u32> {
+    let mut buf = [0xFFu8; 64];
+    flash.read(OTADATA_BASE, &mut buf).ok()?;
+    let e0 = ota::OtaDataEntry::from_bytes(&buf[..32]);
+    let e1 = ota::OtaDataEntry::from_bytes(&buf[32..]);
+    let (slot, entry) = if e0.is_pending() {
+        (0usize, e0)
+    } else if e1.is_pending() {
+        (1usize, e1)
+    } else {
+        return None;
+    };
+    let other = 1 - slot;
+    let abs = OTADATA_BASE + other as u32 * SECTOR;
+    if embedded_storage::nor_flash::NorFlash::erase(flash, abs, SECTOR).is_err() {
+        error!("OTA: 确认镜像时擦除 otadata 失败");
+        return None;
+    }
+    let valid = ota::OtaDataEntry::new(entry.ota_seq, entry.label_str(), ota::OtaImageState::Valid);
+    if flash.write(abs, &valid.to_bytes()).is_err() {
+        error!("OTA: 确认镜像写 VALID 失败");
+        return None;
+    }
+    info!("OTA: 已确认运行镜像 seq={}", entry.ota_seq);
+    Some(entry.ota_seq)
 }

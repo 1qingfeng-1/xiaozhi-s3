@@ -389,7 +389,7 @@ pub struct AppArgs<'a, 'b> {
 ///
 /// 返回 [`RunOutcome::CaptureFault`] 时调用方需重建采集句柄后重新进入
 /// (esp-hal RX 饱和后只能整体重建, 且重建必须在直线路径上做, 见 AGENTS.md)。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_variables, unused_assignments)]
 pub async fn run(
     args: AppArgs<'_, '_>,
     pop_buf: &mut [u8],

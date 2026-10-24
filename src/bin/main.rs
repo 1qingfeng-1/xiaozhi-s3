@@ -168,6 +168,9 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(reconnect_token);
     info!("设备 ID: {}", mac.as_str());
 
+    // 启动确认: 新镜像首次跑到这里 (WiFi 已连通) 才置 VALID, 否则引导器回滚
+    let _ = xiaozhi_s3::ota_check::confirm_running_image(flash);
+
     // 开机 OTA: **独立任务** (勿内联 main — main future 膨胀会挤掉 opus 主栈)
     // 采集未 start; flash 交出后等 done 再用; 成功路径任务内 reset
     let ota_done = xiaozhi_s3::mk_static!(
