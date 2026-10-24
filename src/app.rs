@@ -897,8 +897,7 @@ pub async fn run(
         }
         if triggered {
             let t = TURN_ID.load(core::sync::atomic::Ordering::Relaxed);
-            info!("[T{}] beep wake t={}", t, now_ms);
-            audio.beep(120);
+            info!("[T{}] wake t={}", t, now_ms);
             mic_mute_until_ms = now_ms + 250;
             // 仅语音唤醒需要补发预录; BOOT 对讲不补 (否则先发静音, 服务端提前收尾)
             preroll_flush = true;

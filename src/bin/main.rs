@@ -114,8 +114,10 @@ async fn main(spawner: Spawner) -> ! {
     // 音量恢复 (NVS 0xD000; 无记录 → 默认 60): 原子量 + ES8311 硬件同步
     let saved_vol = xiaozhi_s3::wifi::store::load_volume(flash);
     xiaozhi_s3::app::VOLUME_PCT.store(saved_vol, core::sync::atomic::Ordering::Relaxed);
-    board.audio.set_volume(saved_vol);
-    info!("音量恢复: {}%", saved_vol);
+    // 开机软启动: 提示音/首轮限到 50%, 防高音量瞬时电流掉压复位
+    let boot_vol = saved_vol.min(50);
+    board.audio.set_volume(boot_vol);
+    info!("音量恢复: {}% (软启动 {}%)", saved_vol, boot_vol);
 
     // BOOT 键开机按住: 清除凭据强制重回配网
     if board.buttons.boot_pressed() {
@@ -199,9 +201,15 @@ async fn main(spawner: Spawner) -> ! {
         Err(e) => error!("wakenet 自检失败: {}", e),
     }
 
+    // 开机预热: 先让 I2S/DAC 输出 300ms 静音, 稳定 Codec/功放后再出声
+    // (reset/刷机后的第一轮播报杂音即上电瞬态)
+    embassy_time::Timer::after(embassy_time::Duration::from_millis(300)).await;
     // 开机画面 + 提示音
     board.display.draw_status("XIAOZHI S3", Rgb565::WHITE);
     board.audio.beep(150);
+    // 提示音播完 (~150ms + 环形延迟) 再恢复用户音量
+    embassy_time::Timer::after(embassy_time::Duration::from_millis(400)).await;
+    board.audio.set_volume(saved_vol);
 
     // 会话任务 (WS 连接/收发; 长阻塞 await 集中于此)
     // embassy_executor::task: 调用返回 SpawnToken, 必须交给 spawner.spawn
