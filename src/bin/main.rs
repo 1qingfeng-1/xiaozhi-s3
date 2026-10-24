@@ -88,6 +88,11 @@ async fn main(spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(config);
 
     info!("=== 小智音箱启动 ===");
+    #[cfg(feature = "ota-selftest-crash")]
+    {
+        defmt::error!("OTA 回滚自测: 确认前主动 panic");
+        panic!("ota-selftest-crash");
+    }
 
     // 板子工厂: 内部堆第一行注册 → 音频 DMA 缓冲 → PSRAM 最后注册
     let mut board = create_board(peripherals);

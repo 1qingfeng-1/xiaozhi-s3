@@ -560,8 +560,17 @@ pub fn confirm_running_image(flash: &mut FlashStorage<'static>) -> Option<u32> {
     } else {
         return None;
     };
-    let other = 1 - slot;
-    let abs = OTADATA_BASE + other as u32 * SECTOR;
+    // 版本必须匹配当前运行镜像: 回滚后的旧应用不能把坏镜像的 PENDING 确认掉
+    if entry.label_str() != env!("CARGO_PKG_VERSION") {
+        warn!(
+            "OTA: 忽略不匹配的 PENDING 条目 (label={}, running={})",
+            entry.label_str(),
+            env!("CARGO_PKG_VERSION")
+        );
+        return None;
+    }
+    // 写回同一条目: 另一条保留旧的 VALID 作为回滚候选
+    let abs = OTADATA_BASE + slot as u32 * SECTOR;
     if embedded_storage::nor_flash::NorFlash::erase(flash, abs, abs + SECTOR).is_err() {
         error!("OTA: 确认镜像时擦除 otadata 失败");
         return None;

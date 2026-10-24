@@ -51,6 +51,9 @@ default = ["board-gezipai"]
 ## 默认关闭, 发布固件零高频日志; 真机排查时 --features debug-diag
 debug-diag = []
 
+## OTA 回滚自测: 启动后立即 panic (确认前), 验证引导器回滚; 勿用于发布
+ota-selftest-crash = []
+
 ## gezipai 开发板 (ES8311 + ES7210 + ST7789)
 board-gezipai = []
 
