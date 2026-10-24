@@ -12,3 +12,21 @@ macro_rules! mk_static {
         x
     }};
 }
+
+/// 高频诊断日志: 默认编译期移除; `--features debug-diag` 打开
+#[macro_export]
+macro_rules! diag {
+    ($($arg:tt)*) => {{
+        #[cfg(feature = "debug-diag")]
+        { defmt::info!($($arg)*); }
+    }};
+}
+
+/// 高频诊断警告 (同上)
+#[macro_export]
+macro_rules! diag_warn {
+    ($($arg:tt)*) => {{
+        #[cfg(feature = "debug-diag")]
+        { defmt::warn!($($arg)*); }
+    }};
+}

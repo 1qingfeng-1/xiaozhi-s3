@@ -482,10 +482,10 @@ pub async fn run(
     let mut pending: heapless::Vec<(Action, ListenMode), 8> = heapless::Vec::new();
 
     for (reg, val) in audio.es7210_debug_regs() {
-        info!("ES7210 0x{:02X}=0x{:02X}", reg, val);
+        crate::diag!("ES7210 0x{:02X}=0x{:02X}", reg, val);
     }
     for (off, val) in Audio::i2s_debug_regs() {
-        info!("I2S0 0x{:02X}=0x{:08X}", off, val);
+        crate::diag!("I2S0 0x{:02X}=0x{:08X}", off, val);
     }
 
     info!("=== 主循环启动: 待机监听 (说话唤醒 / 按住 BOOT 对讲) ===");
@@ -503,7 +503,7 @@ pub async fn run(
             match channels.event.try_receive() {
                 Ok(SessionEvent::Ready) => {
                     // 就绪提示音: 告知用户连接完成、此刻可开口 (手动/语音两种入口)
-                    info!(
+                    crate::diag!(
                         "[T{}] ready t={}",
                         TURN_ID.load(core::sync::atomic::Ordering::Relaxed),
                         now_ms
@@ -588,9 +588,11 @@ pub async fn run(
                 }
                 if preroll_off >= total {
                     let t = TURN_ID.load(core::sync::atomic::Ordering::Relaxed);
-                    info!(
+                    crate::diag!(
                         "[T{}] preroll 完成: {} 帧 ({} 样本)",
-                        t, preroll_frames, total
+                        t,
+                        preroll_frames,
+                        total
                     );
                     preroll_flush = false;
                     preroll_valid = 0;
@@ -697,7 +699,7 @@ pub async fn run(
                     turn_rms_max = 0;
                     preroll_frames = 0;
                     let id = TURN_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-                    info!("[T{}] connect 请求 t={}", id, now_ms);
+                    crate::diag!("[T{}] connect 请求 t={}", id, now_ms);
                     SessionCommand::Connect
                 },
                 Action::SendListenStart => SessionCommand::SendListenStart(*mode),
@@ -782,7 +784,7 @@ pub async fn run(
                                 .map(|(_, v)| *v)
                                 .unwrap_or(0xFF)
                         };
-                        info!(
+                        crate::diag!(
                             "待机电平: mean={} rms={} peak={} (阈值 {}) ES7210 01={:02X} 08={:02X} 02={:02X}",
                             mean,
                             rms,
@@ -823,7 +825,7 @@ pub async fn run(
                             let o = k * 4;
                             let l = i16::from_le_bytes([pop_buf[o], pop_buf[o + 1]]);
                             let r = i16::from_le_bytes([pop_buf[o + 2], pop_buf[o + 3]]);
-                            info!("RAW {} L={} R={}", k, l, r);
+                            crate::diag!("RAW {} L={} R={}", k, l, r);
                         }
                     }
                     listen_voiced_ms += voiced_ms;
@@ -842,9 +844,13 @@ pub async fn run(
                     listen_peak_rms = listen_peak_rms.max(lrms);
                     if now_ms.saturating_sub(last_level_log_ms) >= 1_000 {
                         last_level_log_ms = now_ms;
-                        info!(
+                        crate::diag!(
                             "聆听电平(增益后): mean={} rms={} peak={} voiced={} lim={}",
-                            lmean, lrms, listen_peak_rms, voiced, limited
+                            lmean,
+                            lrms,
+                            listen_peak_rms,
+                            voiced,
+                            limited
                         );
                         listen_peak_rms = 0;
                     }
@@ -865,7 +871,7 @@ pub async fn run(
                                         turn_up_frames += 1;
                                         turn_rms_max = turn_rms_max.max(lrms);
                                         if uplink_frames.is_multiple_of(100) {
-                                            info!("上行心跳: {} 帧", uplink_frames);
+                                            crate::diag!("上行心跳: {} 帧", uplink_frames);
                                         }
                                         let mut pkt: OpusPacket = heapless::Vec::new();
                                         if pkt.extend_from_slice(&raw[..len]).is_ok()
@@ -897,7 +903,7 @@ pub async fn run(
         }
         if triggered {
             let t = TURN_ID.load(core::sync::atomic::Ordering::Relaxed);
-            info!("[T{}] wake t={}", t, now_ms);
+            crate::diag!("[T{}] wake t={}", t, now_ms);
             mic_mute_until_ms = now_ms + 250;
             // 仅语音唤醒需要补发预录; BOOT 对讲不补 (否则先发静音, 服务端提前收尾)
             preroll_flush = true;
@@ -913,7 +919,7 @@ pub async fn run(
                 // 无人声 12s 才收尾: 多轮对话留足思考时间
                 || (!listen_heard && listen_total_ms >= 12_000);
             if done {
-                info!(
+                crate::diag!(
                     "[T{}] stop: heard={} 有声={}ms 静音={}ms 总时长={}ms 上行帧={} rms_max={}",
                     TURN_ID.load(core::sync::atomic::Ordering::Relaxed),
                     listen_heard,
@@ -948,7 +954,7 @@ pub async fn run(
                     dec_pkts += 1;
                     dec_samples += n as u64;
                     if dec_pkts.is_multiple_of(20) {
-                        info!(
+                        crate::diag!(
                             "下行解码: {} 包 {} 样本 (≈{}ms)",
                             dec_pkts,
                             dec_samples,
@@ -969,11 +975,11 @@ pub async fn run(
             info!("播报欠载 #{} (PCM 队列空, 补静音)", playback.underruns());
         }
         if playback.take_prebuffer_done() {
-            info!("预缓冲完成: {}B", playback.queue_len());
+            crate::diag!("预缓冲完成: {}B", playback.queue_len());
         }
         if sm.state() == DialogState::Speaking && now_ms.saturating_sub(tx_rate_ms) >= 1_000 {
             let tx_bytes = playback.tx_bytes();
-            info!(
+            crate::diag!(
                 "TX 推送速率: {}B/s (队列 {}B, 欠载累计 {})",
                 (tx_bytes - tx_rate_bytes) * 1000 / now_ms.saturating_sub(tx_rate_ms).max(1),
                 playback.queue_len(),

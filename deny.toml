@@ -23,6 +23,8 @@ confidence-threshold = 0.8
 ignore = [
     # paste crate 标记为 unmaintained (esp-hal 依赖链), 暂接受
     "RUSTSEC-2024-0436",
+    # unsafe-libyaml 经 esp-config/serde_yaml 传入, 无安全升级路径 (仅 build 期)
+    "RUSTSEC-2024-0449",
 ]
 # 检查所有依赖
 yanked = "deny"

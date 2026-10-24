@@ -47,6 +47,10 @@ embassy-sync = "0.6"
 [features]
 default = ["board-gezipai"]
 
+## 高频诊断日志 (RAW 转储/寄存器回读/1Hz 电平/[T] 追踪/TX 速率)
+## 默认关闭, 发布固件零高频日志; 真机排查时 --features debug-diag
+debug-diag = []
+
 ## gezipai 开发板 (ES8311 + ES7210 + ST7789)
 board-gezipai = []
 
