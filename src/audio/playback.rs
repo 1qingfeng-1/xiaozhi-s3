@@ -33,8 +33,11 @@ fn alloc_ring(size: usize) -> (&'static mut [u8], usize) {
         let buf = alloc::vec![0u8; QUEUE_FALLBACK].leak();
         (buf, QUEUE_FALLBACK)
     } else {
-        // SAFETY: alloc_caps 返回 size 字节的可写内存
-        (unsafe { core::slice::from_raw_parts_mut(ptr, size) }, size)
+        // SAFETY: alloc_caps 返回 size 字节可写内存; 必须清零
+        unsafe {
+            core::ptr::write_bytes(ptr, 0, size);
+            (core::slice::from_raw_parts_mut(ptr, size), size)
+        }
     }
 }
 

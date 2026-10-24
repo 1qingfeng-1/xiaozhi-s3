@@ -68,8 +68,11 @@ fn psram_bytes(len: usize) -> &'static mut [u8] {
     if p.is_null() {
         alloc::vec![0u8; len].leak()
     } else {
-        // SAFETY: alloc_caps 返回 len 字节可写内存
-        unsafe { core::slice::from_raw_parts_mut(p, len) }
+        // SAFETY: alloc_caps 返回 len 字节可写内存; 必须清零 (否则"静音"是随机字节)
+        unsafe {
+            core::ptr::write_bytes(p, 0, len);
+            core::slice::from_raw_parts_mut(p, len)
+        }
     }
 }
 
