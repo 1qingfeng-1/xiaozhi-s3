@@ -280,10 +280,13 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
     let read_buf = psram_bytes(MQTT_BUF);
     let out_buf = psram_bytes(2048);
     let udp_buf = psram_bytes(UDP_BUF);
-    let udp_rx_meta: &'static mut [PacketMetadata] = alloc::vec![PacketMetadata::EMPTY; 4].leak();
-    let udp_tx_meta: &'static mut [PacketMetadata] = alloc::vec![PacketMetadata::EMPTY; 4].leak();
-    let udp_rx = psram_bytes(UDP_BUF);
-    let udp_tx = psram_bytes(2048);
+    // UDP 收缓冲要能吸收 TTS 突发: 服务器/网关按 WS 到达节奏转发, 短缓冲
+    // (2KB≈2 包) 会静默丢包 → opus 解码断点 → 长句卡顿/杂音 (真机复现)
+    let udp_rx_meta: &'static mut [PacketMetadata] = alloc::vec![PacketMetadata::EMPTY; 64].leak();
+    let udp_tx_meta: &'static mut [PacketMetadata] = alloc::vec![PacketMetadata::EMPTY; 8].leak();
+    // 32KB ≈ 30 包: TTS 合成快于实时, 服务器会成串下发, 缓冲不足会静默丢包
+    let udp_rx = psram_bytes(32 * 1024);
+    let udp_tx = psram_bytes(4096);
     let mut udp = UdpSocket::new(stack, udp_rx_meta, udp_rx, udp_tx_meta, udp_tx);
     if udp.bind(0).is_err() {
         error!("UDP 本地端口绑定失败");
@@ -307,6 +310,9 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
     // 下行统计 (tts stop 时打印)
     let mut down_pkts: u32 = 0;
     let mut down_bytes: u64 = 0;
+    // 下行序列连续性: 丢包会让 opus 解码出现断点 (长句卡顿/杂音)
+    let mut last_seq: Option<u32> = None;
+    let mut seq_gaps: u32 = 0;
 
     loop {
         // ---- WiFi 掉线: 关闭连接, 等链路恢复后重连 ----
@@ -490,6 +496,8 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                     match (mtype, state) {
                         (Some("hello"), _) => {
                             awaiting_hello = false;
+                            last_seq = None;
+                            seq_gaps = 0;
                             session_id.clear();
                             let _ = session_id.push_str(
                                 crate::session::json_str_field(text, "session_id").unwrap_or(""),
@@ -513,7 +521,10 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                             channels.event.send(SessionEvent::TtsStart).await;
                         },
                         (Some("tts"), Some("stop")) => {
-                            info!("服务器: tts stop (下行 {} 包 {}B)", down_pkts, down_bytes);
+                            info!(
+                                "服务器: tts stop (下行 {} 包 {}B, 断序 {})",
+                                down_pkts, down_bytes, seq_gaps
+                            );
                             channels.event.send(SessionEvent::TtsStop).await;
                         },
                         (Some("goodbye"), _) => {
@@ -600,7 +611,7 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
             let Some(aes) = aes_key.as_ref() else {
                 continue;
             };
-            for _ in 0..4 {
+            for _ in 0..32 {
                 let recv = with_timeout(Duration::from_millis(1), udp.recv_from(udp_buf)).await;
                 let Ok(Ok((n, _meta))) = recv else {
                     break;
@@ -611,6 +622,22 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                 if hdr.msg_type != 1 || hdr.payload_len as usize != n - udp_proto::UDP_HEADER_LEN {
                     continue;
                 }
+                if let Some(prev) = last_seq {
+                    let expect = prev.wrapping_add(1);
+                    if hdr.sequence != expect {
+                        seq_gaps += 1;
+                        if seq_gaps <= 5 || seq_gaps.is_multiple_of(50) {
+                            warn!(
+                                "UDP 下行不连续: seq {} → {} (缺 {}) 累计 {}",
+                                prev,
+                                hdr.sequence,
+                                hdr.sequence.wrapping_sub(expect),
+                                seq_gaps
+                            );
+                        }
+                    }
+                }
+                last_seq = Some(hdr.sequence);
                 if DROP_DOWNLINK.load(core::sync::atomic::Ordering::Relaxed) {
                     continue;
                 }
