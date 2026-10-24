@@ -312,7 +312,10 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
     let mut down_bytes: u64 = 0;
     // 下行序列连续性: 丢包会让 opus 解码出现断点 (长句卡顿/杂音)
     let mut last_seq: Option<u32> = None;
+    let mut max_seq: u32 = 0;
     let mut seq_gaps: u32 = 0;
+    // 迟到包: seq 小于已见最大值的包 (乱序证据)
+    let mut late_pkts: u32 = 0;
 
     loop {
         // ---- WiFi 掉线: 关闭连接, 等链路恢复后重连 ----
@@ -497,7 +500,9 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                         (Some("hello"), _) => {
                             awaiting_hello = false;
                             last_seq = None;
+                            max_seq = 0;
                             seq_gaps = 0;
+                            late_pkts = 0;
                             session_id.clear();
                             let _ = session_id.push_str(
                                 crate::session::json_str_field(text, "session_id").unwrap_or(""),
@@ -511,6 +516,25 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                             ) {
                                 udp_ready = true;
                                 channels.event.send(SessionEvent::Ready).await;
+                                // 长句自测: 直接发文本请求, 触发服务端长 TTS,
+                                // 用于无人值守验证下行 UDP 音质/断序
+                                #[cfg(feature = "tts-selftest")]
+                                {
+                                    embassy_time::Timer::after(Duration::from_millis(800)).await;
+                                    let req = "{\"type\":\"listen\",\"state\":\"detect\",\
+                                        \"text\":\"请详细介绍人工智能的发展历史，尽量详细一些。\"}";
+                                    if publish(
+                                        &mut socket,
+                                        out_buf,
+                                        config.publish_topic.as_str(),
+                                        req.as_bytes(),
+                                    )
+                                    .await
+                                    .is_ok()
+                                    {
+                                        info!("长句自测: 已请求长 TTS");
+                                    }
+                                }
                             }
                         },
                         (Some("tts"), Some("start")) => {
@@ -522,8 +546,8 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                         },
                         (Some("tts"), Some("stop")) => {
                             info!(
-                                "服务器: tts stop (下行 {} 包 {}B, 断序 {})",
-                                down_pkts, down_bytes, seq_gaps
+                                "服务器: tts stop (下行 {} 包 {}B, 断序 {}, 迟到 {}, max_seq {})",
+                                down_pkts, down_bytes, seq_gaps, late_pkts, max_seq
                             );
                             channels.event.send(SessionEvent::TtsStop).await;
                         },
@@ -638,6 +662,10 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                     }
                 }
                 last_seq = Some(hdr.sequence);
+                if hdr.sequence < max_seq {
+                    late_pkts += 1;
+                }
+                max_seq = max_seq.max(hdr.sequence);
                 if DROP_DOWNLINK.load(core::sync::atomic::Ordering::Relaxed) {
                     continue;
                 }

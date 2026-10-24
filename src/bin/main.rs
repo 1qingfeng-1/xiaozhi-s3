@@ -182,10 +182,12 @@ async fn main(spawner: Spawner) -> ! {
         },
         Mode::Provision => wifi::provision::run(spawner, p.WIFI, flash).await,
     };
-    // WiFi 射频省电 (beacon 间 modem sleep, 降待机功耗; 不影响 TCP 吞吐)
+    // WiFi 省电: UDP 音频对丢包/抖动敏感, modem sleep 会让 AP 缓存并突发
+    // 投递下行包 (实测长句 TTS 断序 ~18% → 卡顿/杂音), 会话设备必须关闭。
+    // 代价是待机功耗略升; 后续可按会话状态自适应切换。
     use esp_radio::wifi::PowerSaveMode;
     let mut controller = controller;
-    let _ = controller.set_power_saving(PowerSaveMode::Minimum);
+    let _ = controller.set_power_saving(PowerSaveMode::None);
     // 控制器交给重连任务保活射频: 运行期断线自动重连 (原先仅 main 持有)
     let reconnect_token = wifi::reconnect_task(controller).unwrap();
     spawner.spawn(reconnect_token);

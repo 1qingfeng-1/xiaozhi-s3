@@ -60,6 +60,9 @@ session-selftest = []
 ## 看门狗自测: 启用 RWDT 后阻塞主循环 12s, 应触发复位; 勿用于发布
 watchdog-selftest = []
 
+## 长句自测: 会话就绪后自动发一条文本请求, 触发服务端长 TTS (验证下行链路)
+tts-selftest = []
+
 ## gezipai 开发板 (ES8311 + ES7210 + ST7789)
 board-gezipai = []
 
