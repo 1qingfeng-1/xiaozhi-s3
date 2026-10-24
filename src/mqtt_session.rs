@@ -301,6 +301,9 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
     // 当前会话 id: 网关关闭旧 bridge 时会补发一条带**旧 session_id** 的
     // goodbye, 设备必须按 id 过滤, 否则新会话刚建立就被判为关闭。
     let mut session_id: heapless::String<48> = heapless::String::new();
+    // 已发出 hello、尚未收到回复: 期间到达的 goodbye 一定是旧 bridge 的
+    // (网关先关旧 bridge 再建新会话), 必须忽略。
+    let mut awaiting_hello = false;
     // 下行统计 (tts stop 时打印)
     let mut down_pkts: u32 = 0;
     let mut down_bytes: u64 = 0;
@@ -312,6 +315,7 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
             socket.abort();
             connected = false;
             udp_ready = false;
+            awaiting_hello = false;
             channels.event.send(SessionEvent::Closed).await;
         }
 
@@ -330,6 +334,8 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                         .await
                         .is_ok()
                         {
+                            awaiting_hello = true;
+                            session_id.clear();
                             info!("会话: 已发送 hello (等待 UDP 配置)");
                         }
                     } else {
@@ -415,13 +421,18 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                         if want_connect {
                             want_connect = false;
                             let hello = xiaozhi_core::protocol::udp_hello_message();
-                            let _ = publish(
+                            if publish(
                                 &mut socket,
                                 out_buf,
                                 config.publish_topic.as_str(),
                                 hello.as_bytes(),
                             )
-                            .await;
+                            .await
+                            .is_ok()
+                            {
+                                awaiting_hello = true;
+                                session_id.clear();
+                            }
                         }
                     },
                     Ok(Err(e)) => info!("MQTT 连接失败: {} ({}ms 后重试)", e, RECONNECT_MS),
@@ -446,6 +457,7 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
             socket.abort();
             connected = false;
             udp_ready = false;
+            awaiting_hello = false;
             channels.event.send(SessionEvent::Closed).await;
             embassy_time::Timer::after(Duration::from_millis(50)).await;
             continue;
@@ -477,6 +489,7 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                     let state = crate::session::json_str_field(text, "state");
                     match (mtype, state) {
                         (Some("hello"), _) => {
+                            awaiting_hello = false;
                             session_id.clear();
                             let _ = session_id.push_str(
                                 crate::session::json_str_field(text, "session_id").unwrap_or(""),
@@ -506,7 +519,10 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                         (Some("goodbye"), _) => {
                             let sid =
                                 crate::session::json_str_field(text, "session_id").unwrap_or("");
-                            if !session_id.is_empty() && sid != session_id.as_str() {
+                            if awaiting_hello {
+                                // 网关关闭旧 bridge 的通知, 新会话正在建立
+                                info!("忽略建连期间的 goodbye (旧会话 {})", sid);
+                            } else if !session_id.is_empty() && sid != session_id.as_str() {
                                 // 旧 bridge 关闭产生的过期通知: 忽略
                                 info!(
                                     "忽略过期 goodbye (会话 {}), 当前 {}",
