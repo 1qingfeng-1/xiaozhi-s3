@@ -13,11 +13,11 @@ use xiaozhi_core::audio::playback::PlaybackFlow;
 use crate::bsp::components::Audio;
 
 /// PCM 队列上限 (立体声 16bit, 128KB ≈ 2s, 走 PSRAM)
-pub const QUEUE_MAX: usize = 128 * 1024;
+pub const QUEUE_MAX: usize = 192 * 1024;
 /// PSRAM 分配失败时的内部 RAM 回退容量 (0.5s)
 const QUEUE_FALLBACK: usize = 32 * 1024;
 /// 预缓冲阈值: 0.5s 立体声
-pub const PREBUFFER: usize = 16_000 / 1000 * 500 * 4;
+pub const PREBUFFER: usize = 16_000 / 1000 * 1000 * 4;
 /// 单帧最大 PCM 字节数 (60ms 立体声 16bit)
 pub const FRAME_MAX: usize = 960 * 4;
 /// TtsStop 后等 DMA 播完的余量

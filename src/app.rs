@@ -72,6 +72,8 @@ const LISTEN_VAD_THRESHOLD: i16 = 180;
 const LISTEN_MIN_VOICED_MS: u64 = 250;
 /// 回合结束: 说完后持续静音 800ms 才收尾 (原 500ms 太短)
 const LISTEN_SILENCE_MS: u64 = 800;
+/// 唤醒预录: 保存最近 1s 原始 PCM, 覆盖建连窗口 (~0.7s) 内丢失的语音
+const PREROLL_SAMPLES: usize = 16_000;
 
 /// 乒乓窗口 = 单个 DMA 描述符 (4092B ≈ 64ms): available() 按完整描述符计数
 const BLOCK_BYTES: usize = 4092;
@@ -85,6 +87,8 @@ pub static VOLUME_PCT: core::sync::atomic::AtomicU8 = core::sync::atomic::Atomic
 /// 打断后丢弃服务器剩余下行音频: 把会话任务带宽留给上行, 防 uplink 饿死
 pub static DROP_DOWNLINK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+/// 当前会话轮次 (日志关联用)
+pub static TURN_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static BATTERY_PCT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 pub static CHARGING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// MCP set_volume 待办 (valid 标记 + 目标值; 音频循环轮询消费)
@@ -175,7 +179,7 @@ pub async fn session_task(args: SessionArgs) {
             warn!("WiFi 链路断开 — 关闭当前会话");
             socket.abort();
             connected = false;
-            channels.event.try_send(SessionEvent::Closed).ok();
+            channels.event.send(SessionEvent::Closed).await;
         }
 
         // ---- 命令 ----
@@ -194,7 +198,7 @@ pub async fn session_task(args: SessionArgs) {
                         };
                         if ws.send_text(msg.as_bytes()).await.is_err() {
                             connected = false;
-                            channels.event.try_send(SessionEvent::Closed).ok();
+                            channels.event.send(SessionEvent::Closed).await;
                         }
                     }
                 },
@@ -205,7 +209,7 @@ pub async fn session_task(args: SessionArgs) {
                         };
                         if ws.send_text(session::LISTEN_STOP.as_bytes()).await.is_err() {
                             connected = false;
-                            channels.event.try_send(SessionEvent::Closed).ok();
+                            channels.event.send(SessionEvent::Closed).await;
                         }
                     }
                 },
@@ -221,7 +225,7 @@ pub async fn session_task(args: SessionArgs) {
                         };
                         if ws.send_text(session::TTS_ABORT.as_bytes()).await.is_err() {
                             connected = false;
-                            channels.event.try_send(SessionEvent::Closed).ok();
+                            channels.event.send(SessionEvent::Closed).await;
                         }
                     }
                 },
@@ -236,7 +240,7 @@ pub async fn session_task(args: SessionArgs) {
                 // 已连接: 补发就绪。上一轮"按下 BOOT→建连中松开→回 Idle"时,
                 // 迟到的 Ready 被状态机忽略, 但会话仍活着; 若不补发,
                 // 下次按键会一直停在 Connecting (永远等不到就绪) — 真机复现。
-                channels.event.try_send(SessionEvent::Ready).ok();
+                channels.event.send(SessionEvent::Ready).await;
             } else {
                 info!("会话任务: 开始连接...");
                 let started = esp_hal::time::Instant::now().duration_since_epoch();
@@ -253,16 +257,16 @@ pub async fn session_task(args: SessionArgs) {
                             .saturating_sub(started)
                             .as_millis();
                         info!("会话连接完成: {}ms", elapsed);
-                        channels.event.try_send(SessionEvent::Ready).ok();
+                        channels.event.send(SessionEvent::Ready).await;
                     },
                     Ok(Err(e)) => {
                         warn!("会话连接失败: {}", e);
-                        channels.event.try_send(SessionEvent::Closed).ok();
+                        channels.event.send(SessionEvent::Closed).await;
                     },
                     Err(_) => {
                         warn!("会话连接超时 (8s) — 中止");
                         socket.abort();
-                        channels.event.try_send(SessionEvent::Closed).ok();
+                        channels.event.send(SessionEvent::Closed).await;
                     },
                 }
             }
@@ -276,7 +280,7 @@ pub async fn session_task(args: SessionArgs) {
                 };
                 if ws.send_frame(2, &pkt).await.is_err() {
                     connected = false;
-                    channels.event.try_send(SessionEvent::Closed).ok();
+                    channels.event.send(SessionEvent::Closed).await;
                 }
             }
         }
@@ -300,7 +304,7 @@ pub async fn session_task(args: SessionArgs) {
                                     DROP_DOWNLINK
                                         .store(false, core::sync::atomic::Ordering::Relaxed);
                                     info!("服务器: tts start");
-                                    channels.event.try_send(SessionEvent::TtsStart).ok();
+                                    channels.event.send(SessionEvent::TtsStart).await;
                                 },
                                 (Some("tts"), Some("stop")) => {
                                     info!(
@@ -309,7 +313,7 @@ pub async fn session_task(args: SessionArgs) {
                                     );
                                     down_pkts = 0;
                                     down_bytes = 0;
-                                    channels.event.try_send(SessionEvent::TtsStop).ok();
+                                    channels.event.send(SessionEvent::TtsStop).await;
                                 },
                                 _ => {
                                     // MCP 帧 (type=mcp): 解析并回送 initialize/tools_list/tools_call 应答
@@ -320,7 +324,7 @@ pub async fn session_task(args: SessionArgs) {
                                             info!("MCP 应答: {}", resp.as_str());
                                             if ws.send_text(resp.as_bytes()).await.is_err() {
                                                 connected = false;
-                                                channels.event.try_send(SessionEvent::Closed).ok();
+                                                channels.event.send(SessionEvent::Closed).await;
                                             }
                                         }
                                     } else {
@@ -346,7 +350,7 @@ pub async fn session_task(args: SessionArgs) {
                         8 => {
                             info!("服务器关闭连接");
                             connected = false;
-                            channels.event.try_send(SessionEvent::Closed).ok();
+                            channels.event.send(SessionEvent::Closed).await;
                         },
                         9 => {
                             let _ = ws.send_pong(&payload).await;
@@ -356,7 +360,7 @@ pub async fn session_task(args: SessionArgs) {
                     Err(e) => {
                         warn!("WS 接收错误: {} — 会话关闭", e);
                         connected = false;
-                        channels.event.try_send(SessionEvent::Closed).ok();
+                        channels.event.send(SessionEvent::Closed).await;
                     },
                 }
             }
@@ -425,6 +429,17 @@ pub async fn run(
     // 播报播放管线: 软件 PCM 队列 + DMA 泵送 + 预缓冲/排空门控
     let mut playback = Playback::new();
     let mut volume_dirty = false;
+    let preroll = alloc_preroll();
+    let preroll_len = preroll.len();
+    let mut preroll_w = 0usize;
+    let mut preroll_valid = 0usize;
+    let mut preroll_flush = false;
+    let mut preroll_off = 0usize;
+    let mut preroll_seq: u64 = 0;
+    let mut preroll_from: u64 = 0;
+    // 提示音/开机静音窗: 防扬声器声音被麦克风录进上行
+    let mut mic_mute_until_ms: u64 = 0;
+    let mut boot_ms: u64 = 0;
     info!(
         "PCM 环: {}KB ({})",
         playback.capacity() / 1024,
@@ -445,6 +460,9 @@ pub async fn run(
     let mut state_since_ms = 0u64;
     let mut battery_last_read = 0u64;
     let mut uplink_frames: u64 = 0;
+    let mut turn_up_frames: u32 = 0;
+    let mut turn_rms_max: i32 = 0;
+    let mut preroll_frames: u32 = 0;
     let mut last_level_log_ms: u64 = 0;
     let mut idle_peak_rms: i32 = 0;
     let mut noise_ema: i32 = 0;
@@ -474,11 +492,20 @@ pub async fn run(
         let now_ms = esp_hal::time::Instant::now()
             .duration_since_epoch()
             .as_millis();
+        if boot_ms == 0 {
+            boot_ms = now_ms;
+        }
+
         // ---- 1. 会话事件 ----
         loop {
             match channels.event.try_receive() {
                 Ok(SessionEvent::Ready) => {
                     // 就绪提示音: 告知用户连接完成、此刻可开口 (手动/语音两种入口)
+                    info!(
+                        "[T{}] ready t={}",
+                        TURN_ID.load(core::sync::atomic::Ordering::Relaxed),
+                        now_ms
+                    );
                     audio.beep(150);
                     dispatch(&mut sm, &mut pending, DialogEvent::SessionReady)
                 },
@@ -507,6 +534,8 @@ pub async fn run(
                 encoder = None;
                 decoder = None;
                 playback.reset();
+                preroll_flush = false;
+                preroll_off = 0;
                 DROP_DOWNLINK.store(false, core::sync::atomic::Ordering::Relaxed);
                 info!("会话已结束, 回到待机监听");
             }
@@ -522,11 +551,62 @@ pub async fn run(
                 _ => error!("opus 编解码器创建失败"),
             }
         }
+        // 唤醒预录补发: 非阻塞分片 (每轮 ≤4 帧), 避免阻塞主循环
+        // 导致 I2S RX 排空不及时 (DmaError::Late → 采集重建)
+        if preroll_flush {
+            if let Some(enc) = encoder.as_mut() {
+                let total = ((preroll_seq - preroll_from) as usize).min(preroll_valid);
+                let start = (preroll_w + preroll_len - total) % preroll_len;
+                let mut sent = 0;
+                while preroll_off < total && sent < 4 {
+                    let n = (total - preroll_off).min(FRAME_SAMPLES);
+                    for i in 0..n {
+                        pcm_dec[i] = preroll[(start + preroll_off + i) % preroll_len];
+                    }
+                    for i in n..FRAME_SAMPLES {
+                        pcm_dec[i] = 0;
+                    }
+                    apply_gain_percent(&mut pcm_dec[..FRAME_SAMPLES], GAIN_PERCENT);
+                    limit_peak(&mut pcm_dec[..FRAME_SAMPLES], UPLINK_CEILING);
+                    let mut raw = [0u8; MAX_PACKET_BYTES];
+                    if let Ok(len) = enc.encode(&pcm_dec[..FRAME_SAMPLES], &mut raw) {
+                        let mut pkt: OpusPacket = heapless::Vec::new();
+                        if pkt.extend_from_slice(&raw[..len]).is_ok()
+                            && channels.uplink.try_send(pkt).is_ok()
+                        {
+                            preroll_off += n;
+                            sent += 1;
+                            preroll_frames += 1;
+                        } else {
+                            break; // 通道满: 下一轮继续
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if preroll_off >= total {
+                    let t = TURN_ID.load(core::sync::atomic::Ordering::Relaxed);
+                    info!(
+                        "[T{}] preroll 完成: {} 帧 ({} 样本)",
+                        t, preroll_frames, total
+                    );
+                    preroll_flush = false;
+                    preroll_valid = 0;
+                    preroll_off = 0;
+                }
+            }
+        }
 
         // ---- 3. 按键: BOOT 对讲 + 音量 ----
         let pressed = buttons.boot_pressed();
         if pressed != held {
             held = pressed;
+            if held && sm.state() == DialogState::Idle {
+                // BOOT 建连期间也会丢语音: 只补发按下之后的样本
+                preroll_flush = true;
+                preroll_off = 0;
+                preroll_from = preroll_seq;
+            }
             if held && sm.state() == DialogState::Speaking {
                 // 播报中按键: 立即丢弃未播完的 TTS, 转入 auto 聆听
                 playback.reset();
@@ -610,7 +690,14 @@ pub async fn run(
         // ---- 4. 状态机动作 → 会话命令 (非阻塞) ----
         for (action, mode) in &pending {
             let cmd = match action {
-                Action::ConnectSession => SessionCommand::Connect,
+                Action::ConnectSession => {
+                    turn_up_frames = 0;
+                    turn_rms_max = 0;
+                    preroll_frames = 0;
+                    let id = TURN_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                    info!("[T{}] connect 请求 t={}", id, now_ms);
+                    SessionCommand::Connect
+                },
                 Action::SendListenStart => SessionCommand::SendListenStart(*mode),
                 Action::SendListenStop => SessionCommand::SendListenStop,
                 Action::SendTtsAbort => SessionCommand::SendTtsAbort,
@@ -663,6 +750,13 @@ pub async fn run(
                 // VAD 必须在原始电平域 (硬件增益后、无软件增益, 对齐 C++ 参考):
                 // 若在软件增益后跑, 阈值等效原始值被放大, 环境噪声即误触发
                 DialogState::Idle => {
+                    preroll_push(
+                        preroll,
+                        &mut preroll_w,
+                        &mut preroll_valid,
+                        &mut preroll_seq,
+                        &mono_buf[..ns],
+                    );
                     // 1Hz 电平诊断 (原始域): 阈值调参/假唤醒排查
                     // peak = 自上次打印以来的最大块 rms (说话峰值可能落在采样点之间)
                     let (mean, rms) = level_stats(&mono_buf[..ns]);
@@ -717,7 +811,7 @@ pub async fn run(
                             }
                         }
                     }
-                    let voiced = voiced_ms > 0;
+                    let voiced = voiced_ms > 0 && now_ms >= mic_mute_until_ms;
                     // 一次性原始 I2S 转储 (排查字节序/槽位): 首个有声帧的前 512 帧
                     if !raw_dumped && voiced {
                         raw_dumped = true;
@@ -751,7 +845,9 @@ pub async fn run(
                         );
                         listen_peak_rms = 0;
                     }
-                    if let Some(encoder) = encoder.as_mut() {
+                    if preroll_flush || now_ms < mic_mute_until_ms {
+                        // 等预录补发完成 / 提示音静音窗内: 不编码实时音频
+                    } else if let Some(encoder) = encoder.as_mut() {
                         let mut src = &mono_buf[..ns];
                         while !src.is_empty() {
                             let take = usize::min(acc_buf.len() - acc_len, src.len());
@@ -763,6 +859,8 @@ pub async fn run(
                                 match encoder.encode(&acc_buf[..FRAME_SAMPLES], &mut raw) {
                                     Ok(len) => {
                                         uplink_frames += 1;
+                                        turn_up_frames += 1;
+                                        turn_rms_max = turn_rms_max.max(lrms);
                                         if uplink_frames.is_multiple_of(100) {
                                             info!("上行心跳: {} 帧", uplink_frames);
                                         }
@@ -781,11 +879,29 @@ pub async fn run(
                         }
                     }
                 },
-                _ => {}, // Speaking/Connecting/WaitingReply: 排空即弃
+                DialogState::Connecting => {
+                    // 建连期间继续预录, 避免唤醒后第一句被吞
+                    preroll_push(
+                        preroll,
+                        &mut preroll_w,
+                        &mut preroll_valid,
+                        &mut preroll_seq,
+                        &mono_buf[..ns],
+                    );
+                },
+                _ => {}, // Speaking/WaitingReply: 排空即弃
             }
         }
         if triggered {
+            let t = TURN_ID.load(core::sync::atomic::Ordering::Relaxed);
+            info!("[T{}] beep wake t={}", t, now_ms);
             audio.beep(120);
+            mic_mute_until_ms = now_ms + 250;
+            // 仅语音唤醒需要补发预录; BOOT 对讲不补 (否则先发静音, 服务端提前收尾)
+            preroll_flush = true;
+            preroll_off = 0;
+            // 只补触发之后的音频: 不把唤醒词本身发给服务器 (否则 VAD 听到"你好"就收尾)
+            preroll_from = preroll_seq;
             dispatch(&mut sm, &mut pending, DialogEvent::WakeTriggered);
         }
 
@@ -796,8 +912,14 @@ pub async fn run(
                 || (!listen_heard && listen_total_ms >= 12_000);
             if done {
                 info!(
-                    "本地收尾: heard={} 有声={}ms 静音={}ms 总时长={}ms",
-                    listen_heard, listen_voiced_ms, listen_silence_ms, listen_total_ms
+                    "[T{}] stop: heard={} 有声={}ms 静音={}ms 总时长={}ms 上行帧={} rms_max={}",
+                    TURN_ID.load(core::sync::atomic::Ordering::Relaxed),
+                    listen_heard,
+                    listen_voiced_ms,
+                    listen_silence_ms,
+                    listen_total_ms,
+                    turn_up_frames,
+                    turn_rms_max
                 );
                 dispatch(&mut sm, &mut pending, DialogEvent::AutoListenStop);
             }
@@ -917,6 +1039,37 @@ pub async fn run(
 /// 关键: DMA 环形永远保持满载。有真实音频就写真实音频, 没有就写静音,
 /// 杜绝环形欠载时 DMA 绕回重放旧数据 (听感为逐字重复/杂音)。
 /// 返回是否发生「播报中队列空、只能补静音」的欠载
+/// PSRAM 分配唤醒预录环 (失败回退内部 RAM)
+fn alloc_preroll() -> &'static mut [i16] {
+    use core::alloc::Layout;
+    let bytes = PREROLL_SAMPLES * 2;
+    let layout = Layout::from_size_align(bytes, 4).expect("bad layout");
+    // SAFETY: 非零布局; 分配块常驻
+    let p =
+        unsafe { esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::External.into(), layout) };
+    if p.is_null() {
+        alloc::vec![0i16; PREROLL_SAMPLES].leak()
+    } else {
+        // SAFETY: 可写 bytes 字节, 清零后按 i16 使用
+        unsafe {
+            core::ptr::write_bytes(p, 0, bytes);
+            core::slice::from_raw_parts_mut(p.cast::<i16>(), PREROLL_SAMPLES)
+        }
+    }
+}
+
+/// 追加原始 PCM 到预录环 (保留最近 len 个样本)
+fn preroll_push(buf: &mut [i16], w: &mut usize, valid: &mut usize, seq: &mut u64, samples: &[i16]) {
+    for &s in samples {
+        buf[*w] = s;
+        *seq += 1;
+        *w = (*w + 1) % buf.len();
+        if *valid < buf.len() {
+            *valid += 1;
+        }
+    }
+}
+
 fn mono_to_stereo(src: &[i16], dst: &mut [u8]) -> usize {
     let mut o = 0;
     for &s in src {
