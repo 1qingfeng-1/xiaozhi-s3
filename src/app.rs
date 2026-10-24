@@ -88,6 +88,9 @@ pub static VOLUME_PCT: core::sync::atomic::AtomicU8 = core::sync::atomic::Atomic
 pub static DROP_DOWNLINK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 /// 当前会话轮次 (日志关联用)
+/// MCP self.reboot 待执行 (会话任务发完应答后复位)
+pub static MCP_REBOOT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 pub static TURN_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static BATTERY_PCT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 pub static CHARGING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -1181,6 +1184,10 @@ fn mcp_handle(text: &str, volume: u8, channels: &Channels) -> Option<heapless::S
                     warn!("MCP: 命令通道满, 音量设置丢弃");
                 }
                 mcp::text_result_response(req.id, "true")
+            },
+            ("self.reboot", _) => {
+                MCP_REBOOT.store(true, core::sync::atomic::Ordering::Relaxed);
+                mcp::text_result_response(req.id, "rebooting")
             },
             ("self.get_system_info", _) => {
                 let level = BATTERY_PCT.load(core::sync::atomic::Ordering::Relaxed);
