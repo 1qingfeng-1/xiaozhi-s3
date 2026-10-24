@@ -204,6 +204,13 @@ pub async fn session_task(args: SessionArgs) {
             connected = false;
             channels.event.send(SessionEvent::Closed).await;
         }
+        // TCP 对端关闭/半开: can_recv() 在缓冲空时为 false, 必须查状态
+        if connected && socket.state() != embassy_net::tcp::State::Established {
+            warn!("WS 链路已断开 (TCP 状态异常) — 会话关闭");
+            socket.abort();
+            connected = false;
+            channels.event.send(SessionEvent::Closed).await;
+        }
 
         // ---- 命令 ----
         loop {

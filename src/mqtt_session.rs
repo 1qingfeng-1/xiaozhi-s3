@@ -438,6 +438,19 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
             continue;
         }
 
+        // ---- TCP 半开/对端关闭检测 ----
+        // can_recv() 在缓冲为空时恒为 false (连接已关闭也返回 false),
+        // 只看 can_recv 会永远发现不了对端断开; 用连接状态兜底。
+        if socket.state() != embassy_net::tcp::State::Established {
+            warn!("MQTT 链路已断开 (TCP 状态异常), 准备重连");
+            socket.abort();
+            connected = false;
+            udp_ready = false;
+            channels.event.send(SessionEvent::Closed).await;
+            embassy_time::Timer::after(Duration::from_millis(50)).await;
+            continue;
+        }
+
         // ---- MQTT 收包 (每轮最多 4 个) ----
         for _ in 0..4 {
             if !socket.can_recv() {
