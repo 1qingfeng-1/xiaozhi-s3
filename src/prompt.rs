@@ -6,11 +6,22 @@
 
 use crate::bsp::components::Audio;
 
-/// 提示音 PCM（单声道 i16 little-endian）
-const PCM: &[u8] = include_bytes!("../assets/idle_prompt.raw");
+/// 空闲提示音 PCM（单声道 i16 little-endian）
+pub const IDLE_PROMPT: &[u8] = include_bytes!("../assets/idle_prompt.raw");
+/// 语音唤醒应答「我在」
+pub const WAKE_ACK: &[u8] = include_bytes!("../assets/wake_ack.raw");
 
-/// 空闲提示音播放器
+/// 当前片段类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clip {
+    IdlePrompt,
+    WakeAck,
+}
+
+/// 提示音播放器（空闲提示 / 唤醒应答共用）
 pub struct PromptPlayer {
+    pcm: &'static [u8],
+    kind: Clip,
     pos: usize,
     active: bool,
 }
@@ -18,14 +29,32 @@ pub struct PromptPlayer {
 impl PromptPlayer {
     pub const fn new() -> Self {
         Self {
+            pcm: IDLE_PROMPT,
+            kind: Clip::IdlePrompt,
             pos: 0,
             active: false,
         }
     }
 
-    pub fn start(&mut self) {
+    /// 播放空闲提示音
+    pub fn play_idle(&mut self) {
+        self.pcm = IDLE_PROMPT;
+        self.kind = Clip::IdlePrompt;
         self.pos = 0;
         self.active = true;
+    }
+
+    /// 播放唤醒应答「我在」
+    pub fn play_wake_ack(&mut self) {
+        self.pcm = WAKE_ACK;
+        self.kind = Clip::WakeAck;
+        self.pos = 0;
+        self.active = true;
+    }
+
+    /// 当前片段是否为唤醒应答
+    pub fn is_wake_ack(&self) -> bool {
+        self.kind == Clip::WakeAck
     }
 
     /// 中止播放（唤醒/进入会话时调用）
@@ -39,7 +68,7 @@ impl PromptPlayer {
 
     /// 提示音时长（毫秒）
     pub fn duration_ms(&self) -> u64 {
-        (PCM.len() as u64 / 2) * 1000 / 16_000
+        (self.pcm.len() as u64 / 2) * 1000 / 16_000
     }
 
     /// 把提示音泵入 I2S TX 环形（立体声化），返回 `true` 表示播放完成
@@ -49,7 +78,7 @@ impl PromptPlayer {
         if !self.active {
             return true;
         }
-        let samples = PCM.len() / 2;
+        let samples = self.pcm.len() / 2;
         loop {
             let free = audio.tx_free();
             if free < 4 {
@@ -65,7 +94,7 @@ impl PromptPlayer {
             }
             for i in 0..frames {
                 let o = (self.pos + i) * 2;
-                let b = [PCM[o], PCM[o + 1]];
+                let b = [self.pcm[o], self.pcm[o + 1]];
                 let d = i * 4;
                 stereo[d..d + 2].copy_from_slice(&b);
                 stereo[d + 2..d + 4].copy_from_slice(&b);

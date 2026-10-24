@@ -557,6 +557,8 @@ pub async fn run(
     let mut low_power = false;
     let mut pending_connect = false;
     let mut connect_deadline: u64 = 0;
+    let mut ack_pending = false;
+    let mut ack_flush_at: u64 = 0;
     let mut volume_dirty = false;
     let preroll = alloc_preroll();
     let preroll_len = preroll.len();
@@ -912,23 +914,24 @@ pub async fn run(
             if !audio.pa_enabled() {
                 audio.set_pa(true);
             }
-            if prompt.is_active() {
-                // 提示音期间被唤醒: 立即中止并恢复音量
+            if prompt.is_active() && !prompt.is_wake_ack() {
+                // 空闲提示音期间被唤醒: 立即中止 (唤醒应答会另行播放)
                 prompt.stop();
                 prompt_vol_restore_at = now_ms + 300;
             }
-        } else {
-            // 音量恢复 (提示音播放前可能压到 60%)
-            if prompt_vol_restore_at != 0 && now_ms >= prompt_vol_restore_at {
-                audio.set_volume(VOLUME_PCT.load(core::sync::atomic::Ordering::Relaxed));
-                prompt_vol_restore_at = 0;
-            }
+        }
+        // 音量恢复 (提示音/唤醒应答播放前可能压到 60%), 与状态无关
+        if prompt_vol_restore_at != 0 && now_ms >= prompt_vol_restore_at {
+            audio.set_volume(VOLUME_PCT.load(core::sync::atomic::Ordering::Relaxed));
+            prompt_vol_restore_at = 0;
+        }
+        if sm.state() == DialogState::Idle {
             if !prompt.is_active() && idle_policy.poll(now_ms) {
                 let vol = VOLUME_PCT
                     .load(core::sync::atomic::Ordering::Relaxed)
                     .min(60);
                 audio.set_volume(vol);
-                prompt.start();
+                prompt.play_idle();
                 prompt_until_ms = now_ms + prompt.duration_ms() + 400;
                 info!(
                     "空闲 {}s: 播放提示音 (音量 {}%)",
@@ -1144,13 +1147,31 @@ pub async fn run(
         if triggered {
             let t = TURN_ID.load(core::sync::atomic::Ordering::Relaxed);
             crate::diag!("[T{}] wake t={}", t, now_ms);
-            mic_mute_until_ms = now_ms + 250;
-            // 仅语音唤醒需要补发预录; BOOT 对讲不补 (否则先发静音, 服务端提前收尾)
+            // 本地应答「我在」: 应答期间不上行、不跑 VAD, 播完再补发之后的预录
+            // (避免把应答本身发给服务器, 也避免服务器听到唤醒词提前收尾)
+            if !audio.pa_enabled() {
+                audio.set_pa(true);
+            }
+            let vol = VOLUME_PCT
+                .load(core::sync::atomic::Ordering::Relaxed)
+                .min(60);
+            audio.set_volume(vol);
+            prompt.play_wake_ack();
+            let ack_end = now_ms + prompt.duration_ms() + 250;
+            mic_mute_until_ms = ack_end;
+            prompt_vol_restore_at = ack_end;
+            ack_pending = true;
+            ack_flush_at = ack_end;
+            info!("唤醒应答: 我在 ({}ms)", prompt.duration_ms());
+            dispatch(&mut sm, &mut pending, DialogEvent::WakeTriggered);
+        }
+
+        // 应答结束: 从此刻开始补发预录 (丢弃唤醒词与应答音)
+        if ack_pending && now_ms >= ack_flush_at {
+            ack_pending = false;
             preroll_flush = true;
             preroll_off = 0;
-            // 只补触发之后的音频: 不把唤醒词本身发给服务器 (否则 VAD 听到"你好"就收尾)
             preroll_from = preroll_seq;
-            dispatch(&mut sm, &mut pending, DialogEvent::WakeTriggered);
         }
 
         // auto 模式本地收尾: 说过话且静音 800ms, 或 12s 无人声 → listen stop
@@ -1227,11 +1248,16 @@ pub async fn run(
         // ---- 8. 时钟维持: 软件队列 → DMA 环形, 没数据时补静音 ----
         // 空闲提示音优先占用输出; 播完后恢复常规泵送 (补静音)
         if prompt.is_active() && prompt.pump(audio, &mut stereo_out[..]) {
-            low_power = true;
-            prompt_vol_restore_at = now_ms + 300;
-            // 功放断电: 消掉空闲期的功放底噪/RF 串扰, 同时省电
-            audio.set_pa(false);
-            info!("提示音播放完成, 进入低功耗待机 (功放关闭)");
+            if prompt.is_wake_ack() {
+                // 唤醒应答播完: 恢复用户音量 (预录补发已由 ack_flush_at 触发)
+                prompt_vol_restore_at = now_ms + 200;
+            } else {
+                low_power = true;
+                prompt_vol_restore_at = now_ms + 300;
+                // 功放断电: 消掉空闲期的功放底噪/RF 串扰, 同时省电
+                audio.set_pa(false);
+                info!("提示音播放完成, 进入低功耗待机 (功放关闭)");
+            }
         }
         if !prompt.is_active() {
             let (underran, _) = playback.pump(

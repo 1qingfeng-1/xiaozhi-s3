@@ -13,4 +13,12 @@ curl -sS -m 20 -X POST "$PROXY" \
   -d "{\"input\":\"$TEXT\"}" -o /tmp/idle_prompt.mp3
 ffmpeg -y -loglevel error -i /tmp/idle_prompt.mp3 \
   -ar 16000 -ac 1 -f s16le assets/idle_prompt.raw
-ls -l assets/idle_prompt.raw
+
+# 唤醒应答「我在」
+curl -sS -m 20 -X POST "$PROXY" \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"我在"}' -o /tmp/wake_ack.mp3
+ffmpeg -y -loglevel error -i /tmp/wake_ack.mp3 \
+  -ar 16000 -ac 1 -f s16le assets/wake_ack.raw
+
+ls -l assets/idle_prompt.raw assets/wake_ack.raw
