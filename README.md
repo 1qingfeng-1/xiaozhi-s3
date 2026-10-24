@@ -225,13 +225,15 @@ git submodule update --init --recursive
 
 > ASR / TTS / LLM 由 xiaozhi 服务器完成；设备端只负责采集、编码、播放与设备控制。
 
-- [x] 纯逻辑核心层 xiaozhi-core（音量/时钟/寄存器序列/状态机/OTA/VAD/MCP + 95 单测）
+- [x] 纯逻辑核心层 xiaozhi-core（音量/时钟/寄存器序列/状态机/OTA/VAD/MCP/AES/MQTT + 136 单测）
 - [x] I2S 全双工音频通路（录音/播放 + opus 编解码）
 - [x] WiFi 连接 + SoftAP 配网 + NVS 凭据
-- [x] WebSocket 会话（xiaozhi 协议 v1）+ TTS 播放 + 按钮打断
+- [x] WebSocket 会话（xiaozhi 协议 v1/v2/v3）+ TTS 播放 + 按钮打断
+- [x] MQTT + UDP 传输（AES-128-CTR、服务端 AEC 时间戳、网关下发配置），见 [docs/MQTT_UDP.md](docs/MQTT_UDP.md)
 - [x] VAD 声音唤醒、MCP 设备控制、OTA 下载烧写、ST7789 状态显示、电池/充电
 - [ ] v1.0 真机验收与发布（见 [ROADMAP](docs/ROADMAP.md) 的 M8/M10 清单）
-- [ ] v1.1：WakeNet/AEC（需先解 MMU block 1）、WS v2/v3、显示与提示音资源
+- [x] v1.1：MCP 工具扩展、WS v2 时间戳、MQTT+UDP、主循环看门狗、OTA 低电保护
+- [ ] v1.2：跨芯片移植（C3/C6/P4，见 [docs/PORTING.md](docs/PORTING.md)）、设备激活/OTA 签名、显示与提示音资源
 
 ## 贡献
 

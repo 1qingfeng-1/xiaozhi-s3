@@ -598,6 +598,8 @@ pub async fn run(
         if boot_ms == 0 {
             boot_ms = now_ms;
         }
+        // 喂 RWDT: 主循环存活即视为系统正常 (网络任务独立, 不参与)
+        crate::wdt::feed();
 
         // ---- 会话自测 (feature `session-selftest`, 默认关): 自动唤醒一次 ----
         #[cfg(feature = "session-selftest")]

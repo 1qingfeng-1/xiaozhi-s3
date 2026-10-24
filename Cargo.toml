@@ -57,6 +57,9 @@ ota-selftest-crash = []
 ## 会话自测: 开机 5s 后自动触发一次唤醒 (无人值守验证传输/播报链路); 勿用于发布
 session-selftest = []
 
+## 看门狗自测: 启用 RWDT 后阻塞主循环 12s, 应触发复位; 勿用于发布
+watchdog-selftest = []
+
 ## gezipai 开发板 (ES8311 + ES7210 + ST7789)
 board-gezipai = []
 

@@ -82,7 +82,12 @@ pub async fn boot_ota_task(
     }
     match report {
         Some(report) if report.update_available => {
-            if should_skip(flash, report.latest_version.as_str()) {
+            let pct = crate::app::BATTERY_PCT.load(core::sync::atomic::Ordering::Relaxed);
+            let charging = crate::app::CHARGING.load(core::sync::atomic::Ordering::Relaxed);
+            if pct < 20 && !charging {
+                // 低电升级中途掉电会留下不完整镜像, 需串口恢复
+                warn!("OTA: 电量 {}% 且未充电, 跳过升级", pct);
+            } else if should_skip(flash, report.latest_version.as_str()) {
                 // should_skip 内已告警
             } else {
                 info!(

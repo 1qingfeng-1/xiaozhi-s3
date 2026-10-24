@@ -19,7 +19,7 @@ cargo fmt --all -- --check
 cargo clippy --all-features -- -D warnings --cap-lints allow   # 与 CI/pre-commit 一致
 cargo check --all
 
-# 核心层 103 个 host 单测 — 必须在 xiaozhi-core/ 目录内跑
+# 核心层 136 个 host 单测 — 必须在 xiaozhi-core/ 目录内跑
 cd xiaozhi-core && cargo +stable nextest run
 # 单测过滤: cargo +stable nextest run ota_crc
 # 或 cargo +stable test
@@ -39,7 +39,7 @@ xtensa；从根目录跑 `cargo +stable nextest run -p xiaozhi-core` 会拿父�
 - **不要在仓库根目录跑 `cargo test`**（作用于 xtensa target，必失败）；
 - xiaozhi-core 是独立 workspace 根（空 `[workspace]` + 自带 `.cargo/config.toml` 覆盖回 host target），
   不继承父目录的 esp target/-nostartfiles；
-- 只有 xiaozhi-core 有单测，且只能在 host 上跑（103 个，当前全绿）。
+- 只有 xiaozhi-core 有单测，且只能在 host 上跑（136 个，当前全绿）。
 
 ## 架构与分层
 
@@ -49,6 +49,8 @@ xiaozhi-s3/          固件 crate (no_std, esp-rtos 双任务)
 ├── src/app.rs       双任务编排: 音频主循环 (非阻塞, 每轮 Idle 10ms/活跃 1ms)
 │                    + 会话任务 (WS 长阻塞 await 集中于此)
 ├── src/session.rs   WS 传输层 (embassy-net TCP 上写手帧编解码, :8000 /xiaozhi/v1/, 含 ping/pong)
+├── src/mqtt_session.rs MQTT+UDP 传输 (MQTT 控制通道 + UDP/AES-128-CTR 音频, 网关配置由 OTA 下发)
+├── src/wdt.rs       主循环看门狗 (TIMG0 MWDT 8s, 每轮 feed)
 ├── src/ota_check.rs OTA: main() 直线路径 POST :8003 检查 → download_and_flash
 │                    (HTTP200/完整性/分区上界/超时/失败退避 → 4KB 擦写 → otadata → 复位)
 ├── src/wifi/        STA 连接 + SoftAP 配网 + Flash 凭据/音量存取 (esp-storage)
@@ -59,7 +61,7 @@ xiaozhi-s3/          固件 crate (no_std, esp-rtos 双任务)
 ├── vendor/          libopus (v1.6.1 裁剪) / esp-sr / esp-dsp 子集 / cjson (均 build.rs 编译或链接)
 xiaozhi-core/        git submodule, 纯逻辑层: audio (音量/时钟/codec 序列/状态机/唤醒 VAD) +
                      dialog (对话状态机) + mcp (JSON-RPC 解析) + ota (清单/版本/e9 头/otadata 条目) +
-                     display + board 规则; host 可单测 (103 个), #![deny(unsafe_code)]
+                     display + board 规则 + protocol/aes/mqtt/udp 编解码; host 可单测 (136 个), #![deny(unsafe_code)]
 ```
 
 分层规则（改代码前必读）：
@@ -129,7 +131,7 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量/时钟/codec 序
 - WiFi STA 连接后设 `PowerSaveMode::Minimum`（beacon 间 modem sleep）；deep-sleep 唤醒
   **v1.0 不做**：BOOT/VOL± 是 GPIO1/18/2，S3 上非 RTC-capable，无法做按键唤醒。
 - embassy-net `StackResources` 容量按**每张表**计（`TcpSocket::new` 超容 panic → 重启循环）：
-  STA 栈 `StackResources<4>`（wifi/mod.rs，DHCP+会话+OTA 共用）；SoftAP 配网表
+  STA 栈 `StackResources<6>`（wifi/mod.rs，DHCP+OTA+会话 TCP+UDP 音频）；SoftAP 配网表
   `StackResources<8>`（provision.rs）；wifi-test `StackResources<3>`。
   socket 跨重连复用（`session_task` 内持有），勿每次 connect 新建（泄漏耗尽内部堆）。
 - `session_task` 是 embassy 任务：参数必须 `'static`（Channels 经 `mk_static!` 常驻），
@@ -137,7 +139,7 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量/时钟/codec 序
 - BOOT 键**开机按住** = 清除 WiFi 凭据重回配网；配网 = SoftAP `xiaozhi-gezipai` +
   表单页 `http://192.168.4.1:8080/`；凭据+服务器 IP 存 NVS `0xE000` 扇区（magic `ZOIX`），
   音量存同分区 `0xD000` 扇区（首字节 0~100，0xFF→默认 60，与凭据分离勿混写）。
-- 对话状态机（`xiaozhi_core::dialog`）：`WaitingReply` 10s 无服务器消息 → 结束会话回待机。
+- 对话状态机（`xiaozhi_core::dialog`）：`WaitingReply` 20s 无服务器消息 → 结束会话回待机。
 - **MCP 已接通并真机验证**（M9，2026-09-06）：hello 发 `features:{"mcp":true}`，
   会话任务内分发 `initialize`/`tools/list`/`tools/call` 到 `app::mcp_handle` 并即时回包
   （工具：`get_device_status`/`set_volume`）。原 NO_MEM 阻塞（commit 27359e0，宣告
@@ -198,3 +200,6 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量/时钟/codec 序
 - 门禁顺序：`fmt --check` → `clippy -D warnings` → `check --all` → core 单测（cd 进子目录）。
 - 开发流程 `docs/DEVELOPMENT.md`、`docs/QUICK_START.md`；阶段计划与**真机验证清单**
   `docs/ROADMAP.md`（下一步上机验证项以此为准）；引脚表见 README「引脚映射」。
+- MQTT 网关部署与 UDP 加密/时间戳：`docs/MQTT_UDP.md`；换板/跨芯片移植：`docs/PORTING.md`。
+- 默认关闭的**自测 feature**：`debug-diag`（高频日志）、`ota-selftest-crash`（确认前 panic）、
+  `session-selftest`（开机 5s 自动唤醒）、`watchdog-selftest`（阻塞主循环验证复位）。

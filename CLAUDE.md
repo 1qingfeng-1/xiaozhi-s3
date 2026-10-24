@@ -32,7 +32,7 @@ cargo check --all
 ### 单元测试（只有 xiaozhi-core 有测试，且只能在 host 跑）
 
 ```bash
-cd xiaozhi-core && cargo +stable nextest run          # 103 个，全绿
+cd xiaozhi-core && cargo +stable nextest run          # 136 个，全绿
 cd xiaozhi-core && cargo +stable nextest run ota_crc  # 按名过滤单个测试
 cd xiaozhi-core && cargo +stable test                 # 无 nextest 时
 ```
@@ -55,6 +55,8 @@ xiaozhi-s3/            固件 crate (no_std)
 ├── src/bin/main.rs    main(): create_board → WiFi/配网 → OTA 任务 → app::run()
 ├── src/app.rs         双任务编排 + 音频主循环（对话/唤醒/播放/灯效/按键）
 ├── src/session.rs     WS 传输层（手帧编解码、hello、ping/pong、:8000 /xiaozhi/v1/）
+├── src/mqtt_session.rs MQTT+UDP 传输（MQTT 控制 + UDP/AES-128-CTR 音频，与 WS 二选一）
+├── src/wdt.rs         主循环看门狗（TIMG0 MWDT，8s 未喂狗硬复位）
 ├── src/ota_check.rs   OTA 任务（POST :8003 检查 → 下载 → 4KB 擦写 → otadata → 复位）
 ├── src/wifi/          STA 连接 + SoftAP 配网 + NVS 凭据/音量 (esp-storage)
 ├── src/audio/         opus FFI 安全封装 + wakenet (esp-sr, feature 门控)
@@ -99,7 +101,8 @@ I2S 全双工：TX 为主机并经 `signal_loopback` 把 BCLK/WS 共享给 RX；
 
 无 factory 分区，双 app 乒乓：`ota_0 @0x20000` / `ota_1 @0x410000`（各 0x3F0000），
 `otadata @0x10000` 两条各占一扇区（4KB 间距），CRC 为 reflected CRC-32。
-NVS 分区内约定：WiFi 凭据 `0xE000`、音量 `0xD000`、OTA 失败计数 `0xC000`。
+NVS 分区内约定：WiFi 凭据 `0xE000`、音量 `0xD000`、OTA 失败计数 `0xC000`、
+MQTT 网关配置 `0xA000`（OTA 下发）、WS 协议版本 `0xB000`。
 OTA 在独立 `boot_ota_task` 中执行（不内联 main，否则 main future 膨胀压垮主栈），
 **flash 擦写绝不能放进音频主循环或 `session_task`**（I2S RX DMA 会溢出）。
 
@@ -110,7 +113,9 @@ OTA 在独立 `boot_ota_task` 中执行（不内联 main，否则 main future �
 - 音频 DMA 缓冲必须在**内部 RAM**；`psram_allocator!` 必须在 DMA 缓冲分配之后注册
   （`create_board` 末尾），否则 I2S 报 `DmaError(UnsupportedMemoryRegion)`。
 - embassy-net `StackResources` 按每张表计数，超容 `TcpSocket::new` 会 panic 重启：
-  STA `<4>`、SoftAP 配网 `<8>`。socket 跨重连复用，勿每次新建。
+  STA `<6>`（DHCP+OTA+会话 TCP+UDP 音频）、SoftAP 配网 `<8>`。socket 跨重连复用，勿每次新建。
+- MQTT/UDP 的大缓冲（TCP 收发、包解析、UDP 收发）必须走 PSRAM；留在内部会把
+  128KB 堆推到 95%+（真机实测）。
 - S3 WiFi PHY 与 SARADC 共用：电池 ADC（GPIO3）只在 **Idle 且 10s 限频**时读，
   会话/播报期读会干扰 PHY 导致 WiFi blob 崩溃。
 - 单个 opus 包上限 1276B；通道容量 uplink 12 / downlink 6 / command 4 / event 4。
@@ -128,6 +133,8 @@ OTA 在独立 `boot_ota_task` 中执行（不内联 main，否则 main future �
 - `AGENTS.md` — 完整工程指南（分层、坑位、真机验证记录），**优先阅读**
 - `README.md` — 硬件与引脚映射
 - `docs/ROADMAP.md` — 阶段计划与真机验证清单（下一步上机项以此为准）
+- `docs/MQTT_UDP.md` — MQTT 网关部署、UDP 加密/时间戳、真机验证记录
+- `docs/PORTING.md` — 同芯片换板四步法；C3/C6/P4 移植差异清单
 - `docs/DEVELOPMENT.md` / `docs/QUICK_START.md` — 开发流程
 - C++ 参考实现：`/home/mrpeng/Documents/xiaozhi-esp32`（ESP-IDF，板级/协议/OTA 对照物；
   移植到 esp-hal 时 Register 层以 `xiaozhi-core` 序列为准）

@@ -88,6 +88,10 @@ async fn main(spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(config);
 
     info!("=== 小智音箱启动 ===");
+    info!(
+        "复位原因: {:?}",
+        defmt::Debug2Format(&esp_hal::system::reset_reason())
+    );
     #[cfg(feature = "ota-selftest-crash")]
     {
         defmt::error!("OTA 回滚自测: 确认前主动 panic");
@@ -100,17 +104,25 @@ async fn main(spawner: Spawner) -> ! {
 
     // 电池电量: ADC 只在 WiFi 启动前读一次 (S3 的 WiFi PHY 与 SARADC 共用,
     // WiFi 激活期间读 ADC1 会干扰 PHY, 曾触发 WiFi blob 崩溃, 见 app.rs)
+    let power_status = board.power.status();
     xiaozhi_s3::app::BATTERY_PCT.store(
-        board
-            .battery
-            .reported_percentage(board.power.status())
-            .unwrap_or(0),
+        board.battery.reported_percentage(power_status).unwrap_or(0),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    // 供电状态供 OTA 低电保护使用 (充电中/已充满不拦截升级)
+    xiaozhi_s3::app::CHARGING.store(
+        matches!(
+            power_status,
+            xiaozhi_core::board::PowerStatus::Charging | xiaozhi_core::board::PowerStatus::Charged
+        ),
         core::sync::atomic::Ordering::Relaxed,
     );
 
     // create_board 按值消耗了 Peripherals; 音频不用的 WIFI/FLASH/TIMG0 经 steal 再取
     let p = unsafe { Peripherals::steal() };
     let timg0 = TimerGroup::new(p.TIMG0);
+    // MWDT 与 timer0 同组: 先取出看门狗句柄, timer0 交给 embassy 时基
+    let mwdt = timg0.wdt;
     let sw_interrupt = SoftwareInterruptControl::new(p.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
@@ -124,14 +136,11 @@ async fn main(spawner: Spawner) -> ! {
     board.audio.set_volume(boot_vol);
     info!("音量恢复: {}% (软启动 {}%)", saved_vol, boot_vol);
 
-    // xiaozhi 协议版本 (NVS 0xB000, 默认 1): ≥2 时上行帧带时间戳并启用服务端 AEC
+    // xiaozhi WS 协议版本 (NVS 0xB000, 默认 1): ≥2 时上行帧带时间戳
+    // (最终传输方式由 OTA 是否下发 MQTT 配置决定, 见下方会话任务选择)
     let ws_version = store::load_ws_version(flash);
-    let server_aec = ws_version >= 2;
-    info!(
-        "协议版本: v{} (服务端 AEC: {})",
-        ws_version,
-        if server_aec { "开" } else { "关" }
-    );
+    let mut server_aec = ws_version >= 2;
+    info!("WS 协议版本: v{}", ws_version);
 
     // BOOT 键开机按住: 清除凭据强制重回配网
     if board.buttons.boot_pressed() {
@@ -233,7 +242,10 @@ async fn main(spawner: Spawner) -> ! {
     // (丢弃 token 会 panic)
     let mqtt_cfg = store::load_mqtt(flash);
     // UDP 通道恒带时间戳, 服务端 AEC 可用 → 播报中持续上行
-    let server_aec = server_aec || mqtt_cfg.is_some();
+    server_aec |= mqtt_cfg.is_some();
+    if server_aec {
+        info!("服务端 AEC: 开 (上行帧携带时间戳)");
+    }
     if let Some(cfg) = mqtt_cfg {
         info!(
             "传输: MQTT+UDP ({} → {})",
@@ -260,6 +272,14 @@ async fn main(spawner: Spawner) -> ! {
         })
         .unwrap();
         spawner.spawn(token);
+    }
+
+    // 看门狗: OTA/配网之后启用, 主循环每轮喂狗 (卡死 8s 硬复位)
+    xiaozhi_s3::wdt::init(mwdt);
+    #[cfg(feature = "watchdog-selftest")]
+    {
+        error!("看门狗自测: 阻塞主循环 12s, 8s 内应复位");
+        esp_hal::delay::Delay::new().delay_millis(12_000);
     }
 
     // 采集常驻 + 主循环 (采集故障 → 直线路径重建 → 重进)

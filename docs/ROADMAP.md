@@ -275,3 +275,33 @@ M1 音频通路 ── M2 WiFi/配网 ── M4.1 WS 协议 ── M4.2 opus 全
 
 **发布注意**：快速改版本号构建可能复用缓存导致镜像版本未更新（真机出现重复升级）；
 发布前必须 clean build 并核对 app_desc 版本。
+
+### v1.1 P1/P2 进展（2026-10-24 晚）
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| 二进制协议 v2/v3 编解码 | ✅ | core `protocol`：v2 16B 头（含时间戳）/ v3 4B 头 + `AecClock`，host 单测 |
+| WS 协议版本可配 | ✅ | NVS 0xB000（默认 1）；v2/v3 需服务端支持 |
+| MQTT + UDP 传输 | ✅ | 真机验证：MQTT 控制 + UDP 音频（AES-128-CTR）、服务端 AEC 时间戳、TTS 下行播放 |
+| MCP 工具扩展 | ✅ | `self.get_system_info` / `self.reboot`，工具列表 4 个 |
+| 播放时间戳对齐 | ✅ | `PlayoutTimestamps`：按实际播出字节推进，一帧播完才进 AEC 时钟 |
+| 过期 goodbye 过滤 | ✅ | 按 `session_id` 忽略旧 bridge 通知；本地 20s 超时主动 goodbye |
+| 内部堆优化 | ✅ | MQTT 大缓冲迁 PSRAM，水位 98% → <90% |
+| 主循环看门狗 | ✅ | TIMG0 MWDT 8s，真机 `rst:0x7 (TG0WDT_SYS_RST)` 验证 |
+| OTA 低电保护 | ✅ | 电量 <20% 且未充电跳过升级（防中途掉电） |
+| 多板（同芯片） | ✅ 路径就绪 | BSP 四步法 + 本文档；另一块 S3 板可直接照做 |
+| 多板（C3/C6/P4） | ⏳ 未移植 | 需独立 crate/target 与硬件；差异清单见 `docs/PORTING.md` |
+| 立即追问（无 AEC） | ⚠️ 依赖 MQTT 网关 | 直连 WS 服务端不解析 16B 头；MQTT+UDP 下服务端 AEC 已生效 |
+
+**MQTT+UDP 部署与验证细节**：见 [`docs/MQTT_UDP.md`](MQTT_UDP.md)。
+
+**本轮新增 feature**（均默认关，仅用于无人值守自测）：
+
+- `session-selftest`：开机 5s 自动触发一次唤醒，验证传输/播报链路；
+- `watchdog-selftest`：启用 RWDT 后阻塞主循环 12s，验证 8s 看门狗复位。
+
+**已知限制**：
+
+- MQTT 为明文 1883，仅建议受信内网；设备侧 TLS 待后续引入；
+- 无真人说话时不能自动进入会话（自测 feature 可绕过）；
+- 高音量（>80%）掉压、过夜稳定仍未测（见上表）。
