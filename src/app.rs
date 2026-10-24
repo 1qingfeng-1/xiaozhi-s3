@@ -1182,6 +1182,15 @@ fn mcp_handle(text: &str, volume: u8, channels: &Channels) -> Option<heapless::S
                 }
                 mcp::text_result_response(req.id, "true")
             },
+            ("self.get_system_info", _) => {
+                let level = BATTERY_PCT.load(core::sync::atomic::Ordering::Relaxed);
+                let charging = CHARGING.load(core::sync::atomic::Ordering::Relaxed);
+                let uptime = esp_hal::time::Instant::now()
+                    .duration_since_epoch()
+                    .as_millis();
+                let info = mcp::system_info_json(APP_VERSION, uptime, volume, level, charging);
+                mcp::text_result_response(req.id, info.as_str())
+            },
             ("self.audio_speaker.set_volume", None) => {
                 mcp::error_response(req.id, "Missing argument: volume")
             },
