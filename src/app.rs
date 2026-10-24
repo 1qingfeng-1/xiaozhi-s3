@@ -81,6 +81,20 @@ const BLOCK_BYTES: usize = 4092;
 /// opus 包通道项 (单包上限 1276B)
 pub type OpusPacket = heapless::Vec<u8, MAX_PACKET_BYTES>;
 
+/// 上行音频包: opus + 服务端 AEC 时间戳 (版本 1 恒为 0)
+#[derive(Clone)]
+pub struct UplinkPacket {
+    pub timestamp: u32,
+    pub data: OpusPacket,
+}
+
+/// 下行音频包: opus + 服务器时间戳 (版本 1 恒为 0)
+#[derive(Clone)]
+pub struct DownlinkPacket {
+    pub timestamp: u32,
+    pub data: OpusPacket,
+}
+
 /// 跨任务共享的设备状态 (MCP get_device_status / set_volume 用)
 pub static VOLUME_PCT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(60);
 
@@ -137,10 +151,10 @@ pub enum SessionEvent {
 
 /// 任务间通道 (main 装配一次, 静态常驻)
 pub struct Channels {
-    /// 音频 → 会话: 编码后的 opus 帧
-    pub uplink: Channel<RawMutex, OpusPacket, 12>,
-    /// 会话 → 音频: 下行 opus 帧 (TTS)
-    pub downlink: Channel<RawMutex, OpusPacket, 6>,
+    /// 音频 → 会话: 编码后的 opus 帧 (+ AEC 时间戳)
+    pub uplink: Channel<RawMutex, UplinkPacket, 12>,
+    /// 会话 → 音频: 下行 opus 帧 (TTS, + 服务器时间戳)
+    pub downlink: Channel<RawMutex, DownlinkPacket, 6>,
     /// 音频 → 会话: 命令
     pub command: Channel<RawMutex, SessionCommand, 4>,
     /// 会话 → 音频: 事件
@@ -153,6 +167,8 @@ pub struct SessionArgs {
     pub server: Ipv4Address,
     pub mac: heapless::String<32>,
     pub channels: &'static Channels,
+    /// xiaozhi 协议版本 (1 = 裸 opus, 2/3 = 带帧头)
+    pub ws_version: u16,
 }
 
 /// 会话任务: 连接/握手/收发 (所有长阻塞 await 集中在此, 不影响音频主循环)
@@ -163,6 +179,7 @@ pub async fn session_task(args: SessionArgs) {
         server,
         mac,
         channels,
+        ws_version,
     } = args;
 
     // socket 持有于任务内, 跨重连复用 (每次 connect 泄漏缓冲会耗尽内部堆)
@@ -249,7 +266,7 @@ pub async fn session_task(args: SessionArgs) {
                 let started = esp_hal::time::Instant::now().duration_since_epoch();
                 match embassy_time::with_timeout(
                     embassy_time::Duration::from_secs(8),
-                    session::connect(&mut socket, server, &mac),
+                    session::connect(&mut socket, server, &mac, ws_version),
                 )
                 .await
                 {
@@ -281,7 +298,11 @@ pub async fn session_task(args: SessionArgs) {
                 let mut ws = session::WsClient {
                     socket: &mut socket,
                 };
-                if ws.send_frame(2, &pkt).await.is_err() {
+                if ws
+                    .send_audio(ws_version, pkt.timestamp, &pkt.data)
+                    .await
+                    .is_err()
+                {
                     connected = false;
                     channels.event.send(SessionEvent::Closed).await;
                 }
@@ -343,11 +364,25 @@ pub async fn session_task(args: SessionArgs) {
                                 // 打断后剩余音频直接丢弃, 不占用通道
                                 continue;
                             }
+                            let (timestamp, opus) =
+                                match session::decode_audio(ws_version, &payload) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        warn!("下行帧解析失败: {} — 丢弃", e);
+                                        continue;
+                                    },
+                                };
                             let mut pkt: OpusPacket = heapless::Vec::new();
-                            if pkt.extend_from_slice(&payload).is_ok() {
+                            if pkt.extend_from_slice(opus).is_ok() {
                                 // 阻塞发送: 通道满时停止读 TCP → 反压服务器,
                                 // 而不是丢帧 (丢帧 = 漏字)
-                                channels.downlink.send(pkt).await;
+                                channels
+                                    .downlink
+                                    .send(DownlinkPacket {
+                                        timestamp,
+                                        data: pkt,
+                                    })
+                                    .await;
                             }
                         },
                         8 => {
@@ -386,6 +421,60 @@ pub struct AppArgs<'a, 'b> {
     pub cap: &'a mut DmaTransferRxCircular<'b, I2sRx<'static, Blocking>>,
     pub channels: &'a Channels,
     pub flash: &'a mut esp_storage::FlashStorage<'static>,
+    /// 服务端 AEC 已启用 (协议版本 ≥2): 播报期间持续上行, 由服务端消除回声
+    pub server_aec: bool,
+}
+
+/// 单声道 PCM → 60ms opus 帧 → 上行通道 (非阻塞)
+///
+/// 返回本轮成功入队的帧数。时间戳取自 [`AecClock`] (服务端 AEC 对齐);
+/// 协议版本 1 时该队列始终为空, 时间戳恒为 0。
+fn encode_uplink(
+    pcm: &[i16],
+    acc_buf: &mut [i16],
+    acc_len: &mut usize,
+    encoder: &mut OpusEncoder,
+    channels: &Channels,
+    aec_clock: &mut xiaozhi_core::protocol::AecClock,
+    uplink_frames: &mut u64,
+) -> usize {
+    let mut sent = 0usize;
+    let mut src = pcm;
+    while !src.is_empty() {
+        let take = usize::min(acc_buf.len() - *acc_len, src.len());
+        acc_buf[*acc_len..*acc_len + take].copy_from_slice(&src[..take]);
+        *acc_len += take;
+        src = &src[take..];
+        while *acc_len >= FRAME_SAMPLES {
+            let mut raw = [0u8; MAX_PACKET_BYTES];
+            match encoder.encode(&acc_buf[..FRAME_SAMPLES], &mut raw) {
+                Ok(len) => {
+                    *uplink_frames += 1;
+                    if uplink_frames.is_multiple_of(100) {
+                        crate::diag!("上行心跳: {} 帧", uplink_frames);
+                    }
+                    let mut data: OpusPacket = heapless::Vec::new();
+                    if data.extend_from_slice(&raw[..len]).is_ok()
+                        && channels
+                            .uplink
+                            .try_send(UplinkPacket {
+                                timestamp: aec_clock.pop(),
+                                data,
+                            })
+                            .is_err()
+                    {
+                        warn!("上行通道满, 丢弃一帧");
+                    } else {
+                        sent += 1;
+                    }
+                },
+                Err(e) => warn!("opus 编码失败: {}", e),
+            }
+            acc_buf.copy_within(FRAME_SAMPLES..*acc_len, 0);
+            *acc_len -= FRAME_SAMPLES;
+        }
+    }
+    sent
 }
 
 /// 主事件循环 (音频侧)
@@ -410,9 +499,12 @@ pub async fn run(
         cap,
         channels,
         flash,
+        server_aec,
     } = args;
 
     let mut sm = DialogSm::new();
+    // 下行播放时间戳 → 上行帧 (服务端 AEC 对齐; 版本 1 恒为 0)
+    let mut aec_clock = xiaozhi_core::protocol::AecClock::new();
     // 开机预热 1s: codec/DMA 上电瞬态 (含 DC 漂移) 可能越过 VAD 阈值,
     // 曾致开机假唤醒 → 卡死 (见 ROADMAP M8); 与 VAD 去 DC 双保险。
     let mut wake = WakeEngine::new(
@@ -518,6 +610,8 @@ pub async fn run(
                     DROP_DOWNLINK.store(false, core::sync::atomic::Ordering::Relaxed);
                     dec_pkts = 0;
                     dec_samples = 0;
+                    // 新一轮播报: 丢弃上一轮残留的 AEC 时间戳
+                    aec_clock.clear();
                     playback.on_tts_start();
                     dispatch(&mut sm, &mut pending, DialogEvent::TtsStart)
                 },
@@ -576,8 +670,15 @@ pub async fn run(
                     let mut raw = [0u8; MAX_PACKET_BYTES];
                     if let Ok(len) = enc.encode(&pcm_dec[..FRAME_SAMPLES], &mut raw) {
                         let mut pkt: OpusPacket = heapless::Vec::new();
+                        let timestamp = aec_clock.pop();
                         if pkt.extend_from_slice(&raw[..len]).is_ok()
-                            && channels.uplink.try_send(pkt).is_ok()
+                            && channels
+                                .uplink
+                                .try_send(UplinkPacket {
+                                    timestamp,
+                                    data: pkt,
+                                })
+                                .is_ok()
                         {
                             preroll_off += n;
                             sent += 1;
@@ -860,34 +961,18 @@ pub async fn run(
                     if preroll_flush || now_ms < mic_mute_until_ms {
                         // 等预录补发完成 / 提示音静音窗内: 不编码实时音频
                     } else if let Some(encoder) = encoder.as_mut() {
-                        let mut src = &mono_buf[..ns];
-                        while !src.is_empty() {
-                            let take = usize::min(acc_buf.len() - acc_len, src.len());
-                            acc_buf[acc_len..acc_len + take].copy_from_slice(&src[..take]);
-                            acc_len += take;
-                            src = &src[take..];
-                            while acc_len >= FRAME_SAMPLES {
-                                let mut raw = [0u8; MAX_PACKET_BYTES];
-                                match encoder.encode(&acc_buf[..FRAME_SAMPLES], &mut raw) {
-                                    Ok(len) => {
-                                        uplink_frames += 1;
-                                        turn_up_frames += 1;
-                                        turn_rms_max = turn_rms_max.max(lrms);
-                                        if uplink_frames.is_multiple_of(100) {
-                                            crate::diag!("上行心跳: {} 帧", uplink_frames);
-                                        }
-                                        let mut pkt: OpusPacket = heapless::Vec::new();
-                                        if pkt.extend_from_slice(&raw[..len]).is_ok()
-                                            && channels.uplink.try_send(pkt).is_err()
-                                        {
-                                            warn!("上行通道满, 丢弃一帧");
-                                        }
-                                    },
-                                    Err(e) => warn!("opus 编码失败: {}", e),
-                                }
-                                acc_buf.copy_within(FRAME_SAMPLES..acc_len, 0);
-                                acc_len -= FRAME_SAMPLES;
-                            }
+                        let sent = encode_uplink(
+                            &mono_buf[..ns],
+                            acc_buf,
+                            &mut acc_len,
+                            encoder,
+                            channels,
+                            &mut aec_clock,
+                            &mut uplink_frames,
+                        );
+                        turn_up_frames += sent as u32;
+                        if sent > 0 {
+                            turn_rms_max = turn_rms_max.max(lrms);
                         }
                     }
                 },
@@ -901,7 +986,26 @@ pub async fn run(
                         &mono_buf[..ns],
                     );
                 },
-                _ => {}, // Speaking/WaitingReply: 排空即弃
+                // 服务端 AEC: 播报中继续上行麦克风 (回声由服务器消除),
+                // 服务器 VAD 检出人声即发 tts stop → 打断并转聆听。
+                // 无 AEC 时不能开: 设备会拾取自己的播报形成自问自答。
+                DialogState::Speaking if server_aec => {
+                    if let Some(encoder) = encoder.as_mut() {
+                        apply_gain_percent(&mut mono_buf[..ns], GAIN_PERCENT);
+                        limit_peak(&mut mono_buf[..ns], UPLINK_CEILING);
+                        let sent = encode_uplink(
+                            &mono_buf[..ns],
+                            acc_buf,
+                            &mut acc_len,
+                            encoder,
+                            channels,
+                            &mut aec_clock,
+                            &mut uplink_frames,
+                        );
+                        turn_up_frames += sent as u32;
+                    }
+                },
+                _ => {}, // WaitingReply: 排空即弃
             }
         }
         if triggered {
@@ -951,8 +1055,10 @@ pub async fn run(
             let Some(decoder) = decoder.as_mut() else {
                 continue;
             };
-            match decoder.decode(&pkt, &mut pcm_dec) {
+            match decoder.decode(&pkt.data, &mut pcm_dec) {
                 Ok(n) if n > 0 => {
+                    // 该帧开始出声: 记录服务器时间戳供上行配对 (服务端 AEC)
+                    aec_clock.push(pkt.timestamp);
                     let n = n.min(pcm_dec.len());
                     dec_pkts += 1;
                     dec_samples += n as u64;

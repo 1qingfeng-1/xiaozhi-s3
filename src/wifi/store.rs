@@ -107,6 +107,32 @@ pub fn load_volume(flash: &mut FlashStorage<'_>) -> u8 {
     }
 }
 
+/// xiaozhi 协议版本 — NVS 独立扇区 (0xB000, 与音量/凭据分离)
+///
+/// 0xB000 首字节: 1 = 裸 opus (默认), 2 = 16B 头含 AEC 时间戳,
+/// 3 = 4B 头。2/3 需要服务端支持对应帧格式 (MQTT/UDP 网关或新版 WS 服务端)。
+const PROTOCOL_SECTOR: u32 = 0xB000;
+
+/// 读取协议版本 (无记录/擦除态 → 1)
+pub fn load_ws_version(flash: &mut FlashStorage<'_>) -> u16 {
+    let mut buf = [0u8; 1];
+    match flash.read(PROTOCOL_SECTOR, &mut buf) {
+        Ok(()) if (1..=3).contains(&buf[0]) => buf[0] as u16,
+        _ => 1,
+    }
+}
+
+/// 保存协议版本 (1..=3)
+pub fn save_ws_version(flash: &mut FlashStorage<'_>, version: u16) -> Result<(), &'static str> {
+    if !(1..=3).contains(&version) {
+        return Err("协议版本超出范围");
+    }
+    let word = [version as u8, 0xFF, 0xFF, 0xFF];
+    NorFlash::erase(flash, PROTOCOL_SECTOR, PROTOCOL_SECTOR + 4096)
+        .map_err(|_| "Flash 擦除失败")?;
+    NorFlash::write(flash, PROTOCOL_SECTOR, &word).map_err(|_| "Flash 写入失败")
+}
+
 /// 启动自检: 写已知模式到备用扇区并读回, 验证存储层工作正常
 pub fn self_test(flash: &mut FlashStorage<'_>) -> bool {
     const TEST_SECTOR: u32 = 0x9000; // NVS 分区首扇区 (未使用)

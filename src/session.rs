@@ -1,5 +1,7 @@
-//! WebSocket 会话传输层 (xiaozhi 协议, version 1: 二进制帧 = 裸 opus 载荷)
+//! WebSocket 会话传输层 (xiaozhi 协议版本 1/2/3)
 //!
+//! 版本 1 的二进制帧 = 裸 opus; 版本 2/3 帧头由
+//! [`xiaozhi_core::protocol`] 编解码 (v2 携带服务端 AEC 时间戳)。
 //! 只做传输: 帧编解码 / 握手 / hello。会话生命周期与状态机见 [`crate::app`]。
 
 use embassy_net::{Ipv4Address, tcp::TcpSocket};
@@ -23,11 +25,17 @@ pub const LISTEN_START_AUTO: &str = "{\"type\":\"listen\",\"state\":\"start\",\"
 pub const LISTEN_STOP: &str = "{\"type\":\"listen\",\"state\":\"stop\"}";
 pub const TTS_ABORT: &str = "{\"type\":\"tts\",\"state\":\"abort\"}";
 
-/// hello 消息 (version 1; `features.mcp` 宣告 MCP 设备控制, 服务器随后下发
-/// initialize/tools_list 握手; audio_params 与上行编码器一致)
-pub const HELLO: &str = "{\"type\":\"hello\",\"version\":1,\"features\":{\"mcp\":true},\
-  \"transport\":\"websocket\",\"audio_params\":{\"format\":\"opus\",\
-  \"sample_rate\":16000,\"channels\":1,\"frame_duration\":60}}";
+/// 允许的协议版本范围 (v1 裸 opus / v2 16B 头含时间戳 / v3 4B 头)
+pub use xiaozhi_core::protocol::{VERSION_MAX, VERSION_MIN};
+
+/// 构造 hello 消息
+///
+/// `features.mcp` 宣告 MCP 设备控制 (服务器随后下发 initialize/tools_list 握手);
+/// `features.aec` 仅在版本 ≥2 时置 true —— 此时上行帧带时间戳, 服务器可据此
+/// 做回声消除 (服务端 AEC)。audio_params 与上行编码器一致。
+pub fn hello_message(version: u16) -> heapless::String<320> {
+    xiaozhi_core::protocol::hello_message(version)
+}
 
 /// 极简 WebSocket 客户端 (客户端帧强制掩码, 服务端帧不掩码)
 ///
@@ -46,6 +54,36 @@ impl WsClient<'_> {
     /// 回复 ping (pong = opcode 0xA, 载荷原样返回)
     pub async fn send_pong(&mut self, payload: &[u8]) -> Result<(), &'static str> {
         self.send_frame(0xA, payload).await
+    }
+
+    /// 发送上行音频帧 (按协议版本加帧头)
+    ///
+    /// v1: 裸 opus; v2: 16B 头 (含时间戳); v3: 4B 头。
+    pub async fn send_audio(
+        &mut self,
+        version: u16,
+        timestamp: u32,
+        opus: &[u8],
+    ) -> Result<(), &'static str> {
+        match version {
+            2 => {
+                let mut buf = [0u8; MAX_PACKET_BYTES + xiaozhi_core::protocol::V2_HEADER_LEN];
+                let n = xiaozhi_core::protocol::encode_v2(timestamp, opus, &mut buf)
+                    .map_err(|_| "v2 组帧失败")?;
+                self.send_frame(2, &buf[..n]).await
+            },
+            3 => {
+                let mut buf = [0u8; MAX_PACKET_BYTES + xiaozhi_core::protocol::V3_HEADER_LEN];
+                let n = xiaozhi_core::protocol::encode_v3(
+                    xiaozhi_core::protocol::MSG_TYPE_OPUS as u8,
+                    opus,
+                    &mut buf,
+                )
+                .map_err(|_| "v3 组帧失败")?;
+                self.send_frame(2, &buf[..n]).await
+            },
+            _ => self.send_frame(2, opus).await,
+        }
     }
 
     /// 发送帧 (FIN + opcode, 掩码); 载荷上限 = opus 单包最大值
@@ -119,6 +157,30 @@ impl WsClient<'_> {
     }
 }
 
+/// 解析下行音频帧, 返回 (时间戳, opus 载荷)
+///
+/// 版本 1 无帧头 (时间戳为 0); 版本 2/3 按帧头切分并校验长度。
+pub fn decode_audio(version: u16, payload: &[u8]) -> Result<(u32, &[u8]), &'static str> {
+    use xiaozhi_core::protocol as p;
+    match version {
+        2 => {
+            let f = p::decode_v2(payload).map_err(|_| "v2 帧解析失败")?;
+            if f.msg_type != p::MSG_TYPE_OPUS {
+                return Err("v2 帧非音频");
+            }
+            Ok((f.timestamp, f.payload))
+        },
+        3 => {
+            let f = p::decode_v3(payload).map_err(|_| "v3 帧解析失败")?;
+            if f.msg_type != p::MSG_TYPE_OPUS as u8 {
+                return Err("v3 帧非音频");
+            }
+            Ok((0, f.payload))
+        },
+        _ => Ok((0, payload)),
+    }
+}
+
 /// TCP 精确读取 N 字节
 async fn read_exact(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> Result<(), ()> {
     let mut done = 0;
@@ -166,17 +228,20 @@ pub async fn connect(
     socket: &mut TcpSocket<'static>,
     server: Ipv4Address,
     mac: &str,
+    version: u16,
 ) -> Result<(u32, u32), &'static str> {
+    let version = version.clamp(VERSION_MIN, VERSION_MAX);
     socket.abort();
     socket
         .connect((server, WS_PORT))
         .await
         .map_err(|_| "WS TCP 连接失败")?;
 
-    handshake(socket, mac, server).await?;
+    handshake(socket, mac, server, version).await?;
 
     let mut ws = WsClient { socket };
-    ws.send_text(HELLO.as_bytes()).await?;
+    let hello = hello_message(version);
+    ws.send_text(hello.as_bytes()).await?;
     let (opcode, payload) = ws.recv_frame().await.map_err(|_| "服务器 hello 接收失败")?;
     if opcode != 1 {
         return Err("服务器首帧非文本");
@@ -193,6 +258,7 @@ async fn handshake(
     socket: &mut TcpSocket<'static>,
     mac: &str,
     server: Ipv4Address,
+    version: u16,
 ) -> Result<(), &'static str> {
     // Sec-WebSocket-Key: 16 随机字节的 base64
     let mut key_bytes = [0u8; 16];
@@ -215,7 +281,7 @@ async fn handshake(
              Sec-WebSocket-Key: {}\r\n\
              Sec-WebSocket-Version: 13\r\n\
              Authorization: Bearer xiaozhi-test\r\n\
-             Protocol-Version: 1\r\n\
+             Protocol-Version: {}\r\n\
              Device-Id: {}\r\n\
              Client-Id: {}\r\n\
              \r\n",
@@ -223,6 +289,7 @@ async fn handshake(
             server,
             WS_PORT,
             key_b64.as_str(),
+            version,
             mac,
             mac
         ),

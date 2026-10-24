@@ -124,6 +124,15 @@ async fn main(spawner: Spawner) -> ! {
     board.audio.set_volume(boot_vol);
     info!("音量恢复: {}% (软启动 {}%)", saved_vol, boot_vol);
 
+    // xiaozhi 协议版本 (NVS 0xB000, 默认 1): ≥2 时上行帧带时间戳并启用服务端 AEC
+    let ws_version = store::load_ws_version(flash);
+    let server_aec = ws_version >= 2;
+    info!(
+        "协议版本: v{} (服务端 AEC: {})",
+        ws_version,
+        if server_aec { "开" } else { "关" }
+    );
+
     // BOOT 键开机按住: 清除凭据强制重回配网
     if board.buttons.boot_pressed() {
         info!("BOOT 按下: 清除 WiFi 配置...");
@@ -227,6 +236,7 @@ async fn main(spawner: Spawner) -> ! {
         server,
         mac: mac.clone(),
         channels,
+        ws_version,
     })
     .unwrap();
     spawner.spawn(token);
@@ -251,6 +261,7 @@ async fn main(spawner: Spawner) -> ! {
                 cap: &mut cap,
                 channels,
                 flash,
+                server_aec,
             },
             &mut pop_buf[..],
             &mut mono_buf[..],
