@@ -19,6 +19,7 @@ use defmt::{error, info, warn};
 use xiaozhi_core::audio::capture::{
     apply_gain_percent, extract_slot, is_voice_active, level_stats, limit_peak,
 };
+use xiaozhi_core::audio::listen::{ListenTurn, ListenTurnConfig};
 use xiaozhi_core::audio::wake::{
     VadWakeDetector, WakeEngine, WakeEvent, WakePolicy, WakePolicyConfig, adaptive_threshold,
     update_noise_floor,
@@ -75,8 +76,12 @@ const LISTEN_VAD_THRESHOLD: i16 = 180;
 /// 安静就判停 (总时长仅 1.5s), 用户还没开口回合已结束 → 服务器只收到
 /// 噪声/静音。改为累计有声时长门槛, 滤掉瞬态噪声。
 const LISTEN_MIN_VOICED_MS: u64 = 250;
-/// 回合结束: 说完后持续静音 800ms 才收尾 (原 500ms 太短)
+/// 回合结束: 说完后持续静音 1500ms 才收尾 (原 500ms/800ms 都太短)
 const LISTEN_SILENCE_MS: u64 = 1_500;
+/// 聆听前 600ms 不统计有声 (codec/DMA 上电瞬态)
+const LISTEN_WARMUP_MS: u64 = 600;
+/// 从未检测到人声时, 12s 后收尾 (给多轮对话留思考时间)
+const LISTEN_NO_VOICE_MS: u64 = 12_000;
 /// 唤醒预录: 保存最近 1s 原始 PCM, 覆盖建连窗口 (~0.7s) 内丢失的语音
 const PREROLL_SAMPLES: usize = 16_000;
 
@@ -731,10 +736,12 @@ pub async fn run(
     let mut dec_pkts: u32 = 0;
     let mut dec_samples: u64 = 0;
     // 上行回合检测 (auto 模式): 说完 → 本地 VAD 静音 → 主动 listen stop
-    let mut listen_heard = false;
-    let mut listen_voiced_ms: u64 = 0;
-    let mut listen_silence_ms: u64 = 0;
-    let mut listen_total_ms: u64 = 0;
+    let mut listen_turn = ListenTurn::new(ListenTurnConfig {
+        warmup_ms: LISTEN_WARMUP_MS,
+        min_voiced_ms: LISTEN_MIN_VOICED_MS,
+        silence_ms: LISTEN_SILENCE_MS,
+        no_voice_ms: LISTEN_NO_VOICE_MS,
+    });
     let mut was_listening = false;
     let mut raw_dumped = false;
     let mut pending: heapless::Vec<(Action, ListenMode), 8> = heapless::Vec::new();
@@ -1264,10 +1271,7 @@ pub async fn run(
         // auto 回合检测: 进入 Listening 时重置
         let is_listening = sm.state() == DialogState::Listening;
         if is_listening && !was_listening {
-            listen_heard = false;
-            listen_voiced_ms = 0;
-            listen_silence_ms = 0;
-            listen_total_ms = 0;
+            listen_turn.reset();
         }
         was_listening = is_listening;
 
@@ -1363,8 +1367,7 @@ pub async fn run(
                     // ⚠️ 不做噪声门: 原始人声 rms 仅 200~400, 与噪声 (30~90) 差距小,
                     // 门限稍高就会把说话帧也清零 (真机实测: 服务端只收到 0.6s 零值)。
                     let frame_ms = ns as u64 * 1000 / SAMPLE_RATE as u64;
-                    listen_total_ms += frame_ms;
-                    let warmup = listen_total_ms <= 600;
+                    let warmup = listen_turn.total_ms() <= LISTEN_WARMUP_MS;
                     // 按 60ms 子块做 VAD: pop 块可能长达 ~448ms, 整块判定会
                     // 让短语音 (<400ms) 永远累计不够、噪声块却能一票置 heard
                     let mut voiced_ms = 0u64;
@@ -1388,15 +1391,7 @@ pub async fn run(
                             crate::diag!("RAW {} L={} R={}", k, l, r);
                         }
                     }
-                    listen_voiced_ms += voiced_ms;
-                    if listen_voiced_ms >= LISTEN_MIN_VOICED_MS {
-                        listen_heard = true;
-                    }
-                    if voiced {
-                        listen_silence_ms = 0;
-                    } else if listen_heard && !in_grace {
-                        listen_silence_ms += frame_ms;
-                    }
+                    listen_turn.feed(voiced_ms, frame_ms, now_ms < mic_mute_until_ms, in_grace);
                     apply_gain_percent(&mut mono_buf[..ns], GAIN_PERCENT);
                     let limited = limit_peak(&mut mono_buf[..ns], UPLINK_CEILING);
                     // 1Hz 上行电平诊断 (增益后): 调增益/查削顶
@@ -1495,19 +1490,16 @@ pub async fn run(
             preroll_deadline = now_ms + 1_000;
         }
 
-        // auto 模式本地收尾: 说过话且静音 800ms, 或 12s 无人声 → listen stop
+        // auto 模式本地收尾: 说过话且静音 1500ms, 或 12s 无人声 → listen stop
         if sm.state() == DialogState::Listening && sm.mode() == ListenMode::Auto {
-            let done = (listen_heard && listen_silence_ms >= LISTEN_SILENCE_MS)
-                // 无人声 12s 才收尾: 多轮对话留足思考时间
-                || (!listen_heard && listen_total_ms >= 12_000);
-            if done {
+            if listen_turn.should_stop() {
                 crate::diag!(
                     "[T{}] stop: heard={} 有声={}ms 静音={}ms 总时长={}ms 上行帧={} rms_max={}",
                     TURN_ID.load(core::sync::atomic::Ordering::Relaxed),
-                    listen_heard,
-                    listen_voiced_ms,
-                    listen_silence_ms,
-                    listen_total_ms,
+                    listen_turn.heard(),
+                    listen_turn.voiced_ms(),
+                    listen_turn.silence_ms(),
+                    listen_turn.total_ms(),
                     turn_up_frames,
                     turn_rms_max
                 );
