@@ -1,0 +1,10 @@
+# 默认负责人
+* @1qingfeng-1
+
+# 纯逻辑层 (子模块)
+/xiaozhi-core/ @1qingfeng-1
+
+# CI / 发布 / 依赖
+/.github/ @1qingfeng-1
+/Cargo.toml @1qingfeng-1
+/Cargo.lock @1qingfeng-1

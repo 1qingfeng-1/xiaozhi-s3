@@ -187,9 +187,7 @@ async fn serve_bytes(socket: &mut tcp::TcpSocket<'_>, ctype: &str, body: &[u8]) 
         body.len()
     );
     // 零拷贝分块写: 头部与正文直接从源切片写出 (大文件不进堆)
-    if !write_all_bounded(socket, head.as_str().as_bytes()).await
-        || !write_all_bounded(socket, body).await
-    {
+    if !write_all_bounded(socket, head.as_bytes()).await || !write_all_bounded(socket, body).await {
         socket.abort();
         return;
     }

@@ -1,0 +1,8 @@
+# markdownlint-cli2 配置
+# 历史过程文档放在 docs/archive/，不参与 lint（内容保留，不再维护）
+globs:
+  - "**/*.md"
+  - "!target/**"
+  - "!vendor/**"
+  - "!CHANGELOG.md"
+  - "!docs/archive/**"

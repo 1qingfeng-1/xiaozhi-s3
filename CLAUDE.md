@@ -23,7 +23,7 @@ cargo run --release --bin audio-loopback  # 其他调试 bin: wifi-test / gpio-t
 
 # 门禁（顺序与 pre-commit/CI 一致）
 cargo fmt --all -- --check
-cargo clippy --all-features -- -D warnings --cap-lints allow
+cargo clippy --all-features -- -D warnings
 cargo check --all
 ```
 
@@ -32,7 +32,7 @@ cargo check --all
 ### 单元测试（只有 xiaozhi-core 有测试，且只能在 host 跑）
 
 ```bash
-cd xiaozhi-core && cargo +stable nextest run          # 178 个，全绿
+cd xiaozhi-core && cargo +stable nextest run          # 197 个，全绿
 cd xiaozhi-core && cargo +stable nextest run ota_crc  # 按名过滤单个测试
 cd xiaozhi-core && cargo +stable test                 # 无 nextest 时
 ```
@@ -137,5 +137,8 @@ OTA 在独立 `boot_ota_task` 中执行（不内联 main，否则 main future �
 - `docs/MQTT_UDP.md` — MQTT 网关部署、UDP 加密/时间戳、真机验证记录
 - `docs/PORTING.md` — 同芯片换板四步法；C3/C6/P4 移植差异清单
 - `docs/DEVELOPMENT.md` / `docs/QUICK_START.md` — 开发流程
+- `docs/CI.md` — 本地门禁、pre-commit、CI 与发布流程
+- `docs/adr/` — 架构决策记录（子模块、双传输、诊断 feature、OTA 签名）
+- `CONTRIBUTING.md` / `SECURITY.md` — 贡献流程与漏洞报告
 - C++ 参考实现：`/home/mrpeng/Documents/xiaozhi-esp32`（ESP-IDF，板级/协议/OTA 对照物；
   移植到 esp-hal 时 Register 层以 `xiaozhi-core` 序列为准）

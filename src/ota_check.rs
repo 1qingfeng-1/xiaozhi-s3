@@ -74,12 +74,12 @@ pub async fn boot_ota_task(
 ) {
     let report = check(stack, server, &mac).await;
     // MQTT 网关配置: 服务器下发 → 持久化 (内容未变不重复擦写)
-    if let Some(mqtt) = report.as_ref().and_then(|r| r.mqtt.as_ref()) {
-        if crate::wifi::store::load_mqtt(flash).as_ref() != Some(mqtt) {
-            match crate::wifi::store::save_mqtt(flash, mqtt) {
-                Ok(()) => info!("MQTT 配置已更新: {}", mqtt.endpoint.as_str()),
-                Err(e) => error!("MQTT 配置保存失败: {}", e),
-            }
+    if let Some(mqtt) = report.as_ref().and_then(|r| r.mqtt.as_ref())
+        && crate::wifi::store::load_mqtt(flash).as_ref() != Some(mqtt)
+    {
+        match crate::wifi::store::save_mqtt(flash, mqtt) {
+            Ok(()) => info!("MQTT 配置已更新: {}", mqtt.endpoint.as_str()),
+            Err(e) => error!("MQTT 配置保存失败: {}", e),
         }
     }
     match report {
@@ -322,10 +322,11 @@ async fn download_and_flash_inner(
         {
             Ok(Ok(addrs)) => addrs
                 .iter()
-                .find_map(|a| match a {
+                .map(|a| match a {
                     // 当前固件只启用 IPv4; 开 IPv6 时需补 Aaaa 分支
-                    embassy_net::IpAddress::Ipv4(ip) => Some(*ip),
+                    embassy_net::IpAddress::Ipv4(ip) => *ip,
                 })
+                .next()
                 .unwrap_or(server),
             _ => {
                 warn!("OTA: 域名解析失败 ({}), 回退配置 server", url_host);

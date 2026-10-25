@@ -279,8 +279,11 @@ impl Audio {
     /// 设置音量 (0~100), 0 为数字静音
     pub fn set_volume(&mut self, percent: u8) {
         // 诊断构建: codec 恒 0 (功放仍使能), 用于区分 PA 电路与扬声器电流
-        #[cfg(feature = "volume-off")]
-        let percent = 0;
+        let percent = if cfg!(feature = "volume-off") {
+            0
+        } else {
+            percent
+        };
         self.volume = percent.clamp(0, 100);
         let _ = Self::write_seq(
             &mut self.i2c,
@@ -294,8 +297,7 @@ impl Audio {
     /// 功放使能: 低功耗待机时关闭 (省电并消除功放底噪), 唤醒/播报前打开
     pub fn set_pa(&mut self, on: bool) {
         // 诊断构建: 功放恒关, 用于判断扬声器 EMI/供电是否影响 WiFi
-        #[cfg(feature = "pa-off")]
-        let on = false;
+        let on = if cfg!(feature = "pa-off") { false } else { on };
         if on {
             self.pa.set_high();
         } else {
@@ -353,15 +355,15 @@ impl Audio {
             match t.push(&data[off..]) {
                 // push 是全量语义: 空间不足返回 Overflow, 等消费后重试
                 Ok(n) => off += n,
-                Err(esp_hal::dma::DmaError::Overflow) => {
-                    // DMA 停摆时不能无限自旋 (只能等 8s 看门狗);
-                    // 200ms 足够覆盖 150ms 提示音的排空等待。
-                    if start.elapsed() > Duration::from_millis(200) {
-                        defmt::warn!("I2S TX 自旋超时 (DMA 停摆?), 丢弃本块");
-                        return;
-                    }
-                    core::hint::spin_loop();
+                // DMA 停摆时不能无限自旋 (只能等 8s 看门狗);
+                // 200ms 足够覆盖 150ms 提示音的排空等待。
+                Err(esp_hal::dma::DmaError::Overflow)
+                    if start.elapsed() > Duration::from_millis(200) =>
+                {
+                    defmt::warn!("I2S TX 自旋超时 (DMA 停摆?), 丢弃本块");
+                    return;
                 },
+                Err(esp_hal::dma::DmaError::Overflow) => core::hint::spin_loop(),
                 Err(e) => {
                     defmt::warn!("I2S TX push 失败: {:?} — 丢弃本块", e);
                     return;
@@ -459,10 +461,7 @@ impl Audio {
         if n == 0 {
             return 0;
         }
-        match t.push(&data[..n]) {
-            Ok(written) => written,
-            Err(_) => 0,
-        }
+        t.push(&data[..n]).unwrap_or_default()
     }
 
     /// 填充正弦波 (250Hz @16kHz: 64 采样/周期, 立体声 16bit)

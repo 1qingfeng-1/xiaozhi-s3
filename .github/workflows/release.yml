@@ -46,21 +46,39 @@ jobs:
             ${{ runner.os }}-cargo-release-
             ${{ runner.os }}-cargo-
 
-      - name: Build release firmware
-        run: |
-          cargo build --release
+      - name: Install espflash
+        uses: taiki-e/install-action@v2
+        with:
+          tool: espflash
 
-      - name: Check firmware size
+      - name: Build release firmware
+        run: cargo build --release --locked
+
+      - name: Generate firmware images
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          echo "=== Release Firmware Size ==="
-          ls -lh target/xtensa-esp32s3-none-elf/release/xiaozhi-s3
-          echo "Flash size: 16MB (16777216 bytes)"
+          ELF=target/xtensa-esp32s3-none-elf/release/xiaozhi-s3
+          mkdir -p release
+          # OTA / 手动写 ota_0 用的应用镜像
+          espflash save-image --chip esp32s3 --flash-size 16mb \
+            "$ELF" "release/xiaozhi-s3-${TAG}.bin"
+          # 整片镜像 (bootloader + 分区表 + app), 用于 USB 全量烧录
+          espflash save-image --chip esp32s3 --flash-size 16mb --merge --skip-padding \
+            "$ELF" "release/xiaozhi-s3-${TAG}-merged.bin"
+
+          SIZE=$(stat -c%s "release/xiaozhi-s3-${TAG}.bin")
+          LIMIT=$((0x3F0000))
+          echo "app image: ${SIZE} / ${LIMIT} bytes ($((SIZE * 100 / LIMIT))%)"
+          test "$SIZE" -le $((LIMIT * 9 / 10))
+
+          (cd release && sha256sum xiaozhi-s3-*.bin > SHA256SUMS)
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v7
         with:
           name: firmware-release
-          path: target/xtensa-esp32s3-none-elf/release/xiaozhi-s3
+          path: release/
           retention-days: 30
 
   # 生成 changelog
@@ -133,18 +151,14 @@ jobs:
           name: changelog
           path: release/
 
-      - name: Prepare release files
-        run: |
-          # 重命名固件文件
-          mv release/xiaozhi-s3 release/xiaozhi-s3-${{ needs.changelog.outputs.tag_name }}.bin
-          ls -lh release/
-
       # Release body 里的 $(...) 不会被执行, 先在这里算好
       - name: Collect release metadata
         id: meta
         run: |
-          echo "size=$(du -sh release/xiaozhi-s3-*.bin | cut -f1)" >> "$GITHUB_OUTPUT"
+          echo "size=$(stat -c%s release/xiaozhi-s3-${{ needs.changelog.outputs.tag_name }}.bin | numfmt --to=iec)" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(cut -d' ' -f1 release/SHA256SUMS | head -1)" >> "$GITHUB_OUTPUT"
           echo "date=$(date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          ls -lh release/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -162,31 +176,34 @@ jobs:
 
             - **芯片**: ESP32-S3R8
             - **Flash**: 16MB
-            - **固件大小**: ${{ steps.meta.outputs.size }}
+            - **应用镜像大小**: ${{ steps.meta.outputs.size }}
+            - **应用镜像 SHA256**: `${{ steps.meta.outputs.sha256 }}`
             - **构建日期**: ${{ steps.meta.outputs.date }}
 
             ### 烧录方法
 
             ```bash
-            # 使用 espflash
-            espflash flash --chip esp32s3 --baud 460800 xiaozhi-s3-${{ needs.changelog.outputs.tag_name }}.bin
+            # 1) 整片镜像 (含 bootloader + 分区表, 推荐首次 USB 烧录)
+            espflash write-bin 0x0 xiaozhi-s3-${{ needs.changelog.outputs.tag_name }}-merged.bin
 
-            # 或使用 cargo
+            # 2) 仅应用镜像 (写 ota_0, 或用于自定义 OTA)
+            espflash write-bin 0x20000 xiaozhi-s3-${{ needs.changelog.outputs.tag_name }}.bin
+
+            # 或从源码构建/烧录
             cargo run --release
             ```
 
-            ### 验证
+            ### 校验
 
             ```bash
-            # 检查固件大小
-            ls -lh xiaozhi-s3-${{ needs.changelog.outputs.tag_name }}.bin
-
-            # 查看固件信息
+            sha256sum -c SHA256SUMS
             espflash image_info --chip esp32s3 xiaozhi-s3-${{ needs.changelog.outputs.tag_name }}.bin
             ```
 
           files: |
             release/xiaozhi-s3-${{ needs.changelog.outputs.tag_name }}.bin
+            release/xiaozhi-s3-${{ needs.changelog.outputs.tag_name }}-merged.bin
+            release/SHA256SUMS
             release/CHANGELOG.md
           draft: false
           prerelease: false

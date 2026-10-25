@@ -29,7 +29,7 @@ repos:
       - id: cargo-clippy
         name: cargo clippy
         description: Lint rust sources with embedded-focused lints
-        entry: bash -c "cargo clippy --all-features -- -D warnings --cap-lints allow"
+        entry: bash -c "cargo clippy --all-features -- -D warnings"
         language: system
         files: \.rs$
         pass_filenames: false
@@ -80,5 +80,6 @@ exclude: |
     CHANGELOG\.md|
     \.pre-commit-config\.yaml|
     Cargo\.lock|
+    docs/archive/.*|
     vendor/.*
   )$

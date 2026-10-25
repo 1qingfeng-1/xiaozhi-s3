@@ -66,7 +66,7 @@ async fn main(spawner: Spawner) -> ! {
     let mut found = 0u8;
     for addr in 1u8..=112 {
         // 读 1 字节探测, 器件应答则成功
-        if let Ok(_) = i2c.read(addr, &mut [0u8]) {
+        if i2c.read(addr, &mut [0u8]).is_ok() {
             info!("  [0x{:02X}] 应答!", addr);
             found += 1;
             // 按功能角色识别板级 Codec (型号仅展示)

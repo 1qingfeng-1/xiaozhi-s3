@@ -1,0 +1,53 @@
+name: Bug 报告
+description: 报告可复现的固件/构建问题
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先搜索已有 issue，并确认已通过 `./scripts/check.sh --with-docs`。
+        安全漏洞请走 SECURITY.md 的私下报告渠道。
+  - type: input
+    id: version
+    attributes:
+      label: 固件版本
+      description: release tag 或 `git describe --always --dirty`
+    validations:
+      required: true
+  - type: dropdown
+    id: board
+    attributes:
+      label: 板型
+      options:
+        - gezipai (ES8311 + ES7210 + ST7789)
+        - 其他 (请在描述中说明)
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 上电
+        2. 说「你好小智」
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为 / 实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 串口日志
+      description: defmt 输出片段（请去除 WiFi 密码等敏感信息）
+      render: text
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其他信息
+      description: 是否使用诊断 feature、是否连接 MQTT、供电方式等

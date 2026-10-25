@@ -43,16 +43,14 @@ pub async fn run_commands<L: ControlLink>(
         match channels.command.try_receive() {
             Ok(SessionCommand::Connect) => out.want_connect = true,
             Ok(SessionCommand::SendListenStart(mode)) => {
-                if connected {
-                    let msg = if mode == xiaozhi_core::dialog::ListenMode::Auto {
-                        session::LISTEN_START_AUTO
-                    } else {
-                        session::LISTEN_START_MANUAL
-                    };
-                    if link.send_control(msg).await.is_err() {
-                        out.send_failed = true;
-                        break;
-                    }
+                let msg = if mode == xiaozhi_core::dialog::ListenMode::Auto {
+                    session::LISTEN_START_AUTO
+                } else {
+                    session::LISTEN_START_MANUAL
+                };
+                if connected && link.send_control(msg).await.is_err() {
+                    out.send_failed = true;
+                    break;
                 }
             },
             Ok(SessionCommand::SendListenStop) => {

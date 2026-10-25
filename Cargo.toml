@@ -4,6 +4,9 @@ license      = "MIT"
 name         = "xiaozhi-s3"
 rust-version = "1.88"
 version = "1.0.0"
+description  = "ESP32-S3 smart speaker firmware (xiaozhi protocol)"
+repository   = "https://github.com/1qingfeng-1/xiaozhi-s3"
+publish      = false
 
 [[bin]]
 name = "xiaozhi-s3"

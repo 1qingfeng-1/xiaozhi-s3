@@ -259,28 +259,29 @@ async fn connect_mqtt(
             Some((Packet::Publish(p), _)) => {
                 // QoS1 必须回 PUBACK, 否则 broker 会反复重发
                 // (MCP 的 set_volume/reboot 会被重复执行)
-                if let Some(id) = p.packet_id {
-                    if let Ok(n) = mqtt::encode_puback(id, out) {
-                        let _ = write_all(socket, &out[..n]).await;
-                    }
+                if let Some(id) = p.packet_id
+                    && let Ok(n) = mqtt::encode_puback(id, out)
+                {
+                    let _ = write_all(socket, &out[..n]).await;
                 }
                 if p.topic != cfg.subscribe_topic.as_str() {
                     continue;
                 }
                 let text = core::str::from_utf8(p.payload).unwrap_or("");
-                if crate::session::json_str_field(text, "type") == Some("mcp") {
-                    let volume = VOLUME_PCT.load(core::sync::atomic::Ordering::Relaxed);
-                    if let Some(resp) = mcp_handle(text, volume) {
-                        if publish(socket, out, cfg.publish_topic.as_str(), resp.as_bytes())
-                            .await
-                            .is_err()
-                        {
-                            crate::app::MCP_REBOOT
-                                .store(false, core::sync::atomic::Ordering::Relaxed);
-                        } else {
-                            crate::app::mcp_maybe_reboot().await;
-                        }
-                    }
+                if crate::session::json_str_field(text, "type") != Some("mcp") {
+                    continue;
+                }
+                let volume = VOLUME_PCT.load(core::sync::atomic::Ordering::Relaxed);
+                let Some(resp) = mcp_handle(text, volume) else {
+                    continue;
+                };
+                if publish(socket, out, cfg.publish_topic.as_str(), resp.as_bytes())
+                    .await
+                    .is_err()
+                {
+                    crate::app::MCP_REBOOT.store(false, core::sync::atomic::Ordering::Relaxed);
+                } else {
+                    crate::app::mcp_maybe_reboot().await;
                 }
             },
             _ => continue,
@@ -499,14 +500,13 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
             match packet {
                 Packet::Publish(p) => {
                     // QoS1: 立即回 PUBACK, 防止 broker 重发导致 MCP 重复执行
-                    if let Some(id) = p.packet_id {
-                        if let Ok(n) = mqtt::encode_puback(id, out_buf) {
-                            if write_all(&mut socket, &out_buf[..n]).await.is_err() {
-                                connected = false;
-                                channels.event.send(SessionEvent::Closed).await;
-                                break;
-                            }
-                        }
+                    if let Some(id) = p.packet_id
+                        && let Ok(n) = mqtt::encode_puback(id, out_buf)
+                        && write_all(&mut socket, &out_buf[..n]).await.is_err()
+                    {
+                        connected = false;
+                        channels.event.send(SessionEvent::Closed).await;
+                        break;
                     }
                     if p.topic != config.subscribe_topic.as_str() {
                         crate::diag!("MQTT: 忽略非订阅 topic {}", p.topic);

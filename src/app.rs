@@ -25,7 +25,9 @@ use xiaozhi_core::audio::wake::{
     MAX_ZCR_PERMILLE, VadWakeDetector, WakeEngine, WakeEvent, WakePolicy, WakePolicyConfig,
     adaptive_threshold, update_noise_floor, zero_crossing_permille,
 };
-use xiaozhi_core::dialog::{Action, DialogEvent, DialogSm, DialogState, ListenMode};
+use xiaozhi_core::dialog::{
+    Action, DialogEvent, DialogSm, DialogState, ListenMode, LoopPhase, stt_has_keyword,
+};
 use xiaozhi_core::idle::IdlePromptPolicy;
 use xiaozhi_core::server_msg::{self, ServerMessage};
 
@@ -1192,10 +1194,11 @@ pub async fn run(
         // ROADMAP 记录自适应切换 (空闲 Minimum / 会话 None) 会因切换瞬间
         // 丢 1~3 包导致长句断序, 已在真机回退; 用 `ps-adaptive` 重新做 A/B,
         // 未复测前不作为默认。
-        #[cfg(feature = "ps-adaptive")]
-        let session_active = sm.state() != DialogState::Idle;
-        #[cfg(not(feature = "ps-adaptive"))]
-        let session_active = true;
+        let session_active = if cfg!(feature = "ps-adaptive") {
+            sm.state() != DialogState::Idle
+        } else {
+            true
+        };
         crate::wifi::WIFI_AUDIO_ACTIVE.store(session_active, core::sync::atomic::Ordering::Relaxed);
         if pending_connect
             && (crate::wifi::WIFI_PS_READY.load(core::sync::atomic::Ordering::Relaxed)
@@ -1641,19 +1644,18 @@ pub async fn run(
         embassy_time::Timer::after(embassy_time::Duration::from_millis(wait_ms)).await;
 
         // ---- 9. 灯语 + 显示状态 ----
-        let led = if keyword_gate {
+        // 阶段归并在 core (host 可测): 门控优先, 低功耗只影响 Idle。
+        let phase = LoopPhase::from_state(sm.state(), keyword_gate, low_power);
+        let led = match phase {
             // 关键词确认期间保持灯灭: 避免随机说话时呼吸灯亮/暗变化
             // (用户会误以为设备被唤醒), 确认通过后再恢复正常状态灯。
-            LedMode::Off
-        } else {
-            match sm.state() {
-                DialogState::Idle if low_power => LedMode::Off,
-                DialogState::Idle => LedMode::Breathing(BreathSpeed::Slow),
-                DialogState::Connecting => LedMode::Breathing(BreathSpeed::Fast),
-                DialogState::Listening => LedMode::Breathing(BreathSpeed::Medium),
-                DialogState::WaitingReply => LedMode::Breathing(BreathSpeed::Fast),
-                DialogState::Speaking => LedMode::On,
-            }
+            LoopPhase::Gated | LoopPhase::LowPowerIdle => LedMode::Off,
+            LoopPhase::Idle => LedMode::Breathing(BreathSpeed::Slow),
+            LoopPhase::Connecting | LoopPhase::WaitingReply => {
+                LedMode::Breathing(BreathSpeed::Fast)
+            },
+            LoopPhase::Listening => LedMode::Breathing(BreathSpeed::Medium),
+            LoopPhase::Speaking => LedMode::On,
         };
         if last_led != Some(led) {
             leds.set_mode(led);
@@ -1756,16 +1758,6 @@ fn state_label(state: DialogState) -> &'static str {
         DialogState::WaitingReply => "等回复",
         DialogState::Speaking => "播报",
     }
-}
-
-/// 服务器 ASR 文本是否包含唤醒词
-///
-/// 容忍常见近音/截断: 「小志」「晓智」, 以及 ASR 只输出「你好，小」的情况。
-fn stt_has_keyword(text: &str) -> bool {
-    text.contains("小智")
-        || text.contains("小志")
-        || text.contains("晓智")
-        || (text.contains("你好") && text.contains('小'))
 }
 
 fn event_label(ev: DialogEvent) -> &'static str {

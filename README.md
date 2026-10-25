@@ -1,5 +1,8 @@
 # 小智音箱 (ESP32-S3)
 
+[![CI](https://github.com/1qingfeng-1/xiaozhi-s3/actions/workflows/ci.yml/badge.svg)](https://github.com/1qingfeng-1/xiaozhi-s3/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 基于 ESP32-S3-AI-2 模组的智能音箱，使用 Rust 开发。
 
 ## 硬件
@@ -12,7 +15,8 @@
 - **充电**: LGS4056HDA (1A)
 - **尺寸**: 19.5mm × 18mm
 
-详见 [硬件文档](../HARDWARE.md)
+引脚与硬件细节见下方[引脚映射](#引脚映射)，唯一事实来源为
+[`src/bsp/gezipai.rs`](src/bsp/gezipai.rs)。
 
 ## 项目结构
 
@@ -41,8 +45,8 @@ xiaozhi-s3/
 │   ├── README.md       # 文档导航
 │   ├── DEVELOPMENT.md  # 开发指南
 │   ├── QUICK_START.md  # 快速开始
-│   ├── PRECOMMIT.md    # Pre-commit 说明
-│   └── GITHUB_ACTIONS.md # GitHub Actions 文档
+│   ├── CI.md           # 门禁 / CI / 发布流程
+│   └── adr/            # 架构决策记录
 ├── rust-toolchain.toml # 指定 esp 工具链
 ├── build.rs            # 构建脚本
 └── Cargo.toml
@@ -115,11 +119,14 @@ cargo build --release
 ### 4. 烧录
 
 ```bash
-# 使用 espflash
+# 构建 + 烧录 + defmt 监视
 cargo run --release
 
-# 或手动
-espflash flash --chip esp32s3 --baud 460800 target/riscv32imc-esp-espidf/release/xiaozhi-s3
+# 或烧录 release 产物中的应用镜像（写入 ota_0）
+espflash write-bin 0x20000 xiaozhi-s3-<tag>.bin
+
+# 首次全量烧录可用整片镜像
+espflash write-bin 0x0 xiaozhi-s3-<tag>-merged.bin
 ```
 
 ## xiaozhi-core 纯逻辑核心层
@@ -137,7 +144,7 @@ espflash flash --chip esp32s3 --baud 460800 target/riscv32imc-esp-espidf/release
 
 ```bash
 cd xiaozhi-core
-cargo +stable nextest run     # 推荐 (并行, 103 个测试)
+cargo +stable nextest run     # 推荐 (并行, 197 个测试)
 # 或
 cargo +stable test
 ```
@@ -200,26 +207,15 @@ git submodule update --init --recursive
 
 ## 文档
 
-### 开发文档
+完整索引见 [`docs/README.md`](docs/README.md)。
 
+- [工程指南](AGENTS.md) - 分层、坑位、真机验证记录（改代码前必读）
 - [开发指南](docs/DEVELOPMENT.md) - 完整的开发流程
 - [快速开始](docs/QUICK_START.md) - 5 分钟上手
-- [项目概述](docs/PROJECT.md) - 项目介绍
-- [项目状态](docs/PROJECT_STATUS.md) - 开发进度
-
-### 工具文档
-
-- [Pre-commit 说明](docs/PRECOMMIT.md) - 代码检查配置
-- [Pre-commit 指南](docs/PRECOMMIT_GUIDE.md) - 详细使用说明
-- [Pre-commit 速查表](docs/PRECOMMIT_CHEATSHEET.md) - 快速参考
-- [GitHub Actions 文档](docs/GITHUB_ACTIONS.md) - CI/CD 配置
-- [GitHub Actions 速查表](docs/GITHUB_ACTIONS_CHEATSHEET.md) - 快速参考
-
-### 总结文档
-
-- [完成总结](docs/COMPLETION_SUMMARY.md) - 已完成的工作
-- [Pre-commit 总结](docs/PRECOMMIT_SUMMARY.md) - 配置总结
-- [GitHub Actions 总结](docs/GITHUB_ACTIONS_SUMMARY.md) - 配置总结
+- [门禁 / CI / 发布](docs/CI.md) - 本地检查与 release 流程
+- [架构决策记录](docs/adr/) - 为什么这样设计
+- [移植指南](docs/PORTING.md) - 换板与跨芯片移植
+- [路线图](docs/ROADMAP.md) - 阶段计划与验收清单
 
 ## 下一步
 
@@ -237,8 +233,12 @@ git submodule update --init --recursive
 
 ## 贡献
 
-欢迎提交 Issue 和 Pull Request！
+欢迎提交 Issue 和 Pull Request！请先阅读：
+
+- [贡献指南](CONTRIBUTING.md)（含子模块工作流与门禁）
+- [行为准则](CODE_OF_CONDUCT.md)
+- [安全策略](SECURITY.md)（漏洞请走私密渠道，勿公开 issue）
 
 ## 许可证
 
-MIT License
+[MIT](LICENSE)

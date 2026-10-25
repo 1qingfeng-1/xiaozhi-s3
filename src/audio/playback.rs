@@ -61,6 +61,12 @@ pub struct Playback {
     ts: PlayoutTimestamps,
 }
 
+impl Default for Playback {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Playback {
     pub fn new() -> Self {
         let (buf, cap) = alloc_ring(QUEUE_MAX);

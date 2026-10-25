@@ -1,0 +1,22 @@
+version: 2
+updates:
+  # Rust 依赖 (父仓库)
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      esp-rs:
+        patterns:
+          - "esp-*"
+      embassy:
+        patterns:
+          - "embassy-*"
+
+  # GitHub Actions
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

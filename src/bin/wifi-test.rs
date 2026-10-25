@@ -207,24 +207,7 @@ async fn station_mode(
         let _ = socket.flush().await;
 
         let mut response = heapless::String::<512>::new();
-        loop {
-            let mut buf = [0u8; 512];
-            match socket.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    for b in &buf[..n] {
-                        let _ = response.push(*b as char);
-                    }
-                    if response.len() >= response.capacity() {
-                        break;
-                    }
-                },
-                Err(_) => {
-                    error!("接收失败");
-                    break;
-                },
-            }
-        }
+        read_http_response(&mut socket, &mut response).await;
         let head = response.lines().next().unwrap_or("");
         let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
         info!("服务器响应: {} | {}", head, body);
@@ -236,5 +219,29 @@ async fn station_mode(
     // 保持运行
     loop {
         embassy_time::Timer::after(embassy_time::Duration::from_secs(10)).await;
+    }
+}
+
+/// 逐字节追加到定长字符串；容量不足时提前返回 false。
+fn push_ascii(dst: &mut heapless::String<512>, bytes: &[u8]) -> bool {
+    bytes.iter().all(|&b| dst.push(b as char).is_ok())
+}
+
+/// 读取 HTTP 响应直到对端关闭或缓冲写满。
+async fn read_http_response(socket: &mut tcp::TcpSocket<'_>, response: &mut heapless::String<512>) {
+    loop {
+        let mut buf = [0u8; 512];
+        match socket.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if !push_ascii(response, &buf[..n]) || response.len() >= response.capacity() {
+                    break;
+                }
+            },
+            Err(_) => {
+                error!("接收失败");
+                break;
+            },
+        }
     }
 }

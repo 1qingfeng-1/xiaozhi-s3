@@ -59,6 +59,9 @@ const BLOCK_BYTES: usize = 4092;
 
 use xiaozhi_s3::mem::{psram_bytes, psram_i16, psram_static};
 
+// ota-selftest-crash 在启动后无条件 panic, 后续初始化代码在编译期不可达;
+// 这是自测 feature 的预期形态, 显式允许相关 lint。
+#[cfg_attr(feature = "ota-selftest-crash", allow(unreachable_code, unused_variables))]
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
@@ -257,12 +260,11 @@ async fn main(spawner: Spawner) -> ! {
     };
     // UDP 通道恒带时间戳, 服务端 AEC 可用 → 播报中持续上行。
     // 仅 v2 帧带 timestamp; v3 头没有。
-    #[cfg(not(feature = "aec-off"))]
-    let server_aec = ws_version == 2 || mqtt_cfg.is_some();
-    #[cfg(feature = "aec-off")]
-    let server_aec = false;
-    #[cfg(feature = "aec-off")]
-    info!("诊断 aec-off: 播报中不上行");
+    let aec_off = cfg!(feature = "aec-off");
+    let server_aec = !aec_off && (ws_version == 2 || mqtt_cfg.is_some());
+    if aec_off {
+        info!("诊断 aec-off: 播报中不上行");
+    }
     if server_aec {
         info!("服务端 AEC: 开 (上行帧携带时间戳)");
     }

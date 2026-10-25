@@ -336,3 +336,21 @@ M1 音频通路 ── M2 WiFi/配网 ── M4.1 WS 协议 ── M4.2 opus 全
 - 无真人说话时不能自动进入会话（自测 feature 可绕过）；
 - 主动语音注入受设备/主机物理距离限制未能完成，播报中打断（barge-in）的主观音质仍需真人复测；
 - 高音量（>80%）掉压、过夜稳定仍未测（见上表）。
+
+## 工程化 backlog（2026-10-25）
+
+本轮已完成：真实 clippy 门禁（去掉 `--cap-lints allow`）、LICENSE 与社区文件、
+CI 加入 typos/markdownlint、发布产出真实镜像 + SHA256、core 属性测试、
+文档归档与 ADR。以下事项需要外部资源或单独的真机回归窗口：
+
+| 事项 | 说明 | 关联 |
+|---|---|---|
+| OTA 签名验签 | 当前仅 CRC + 可选 SHA256，未防伪造；需服务端清单格式升级 | [ADR-0004](adr/0004-no-ota-signature-yet.md) |
+| HIL 自动化 | 用例与落地步骤已设计，需常连设备与脚本工程 | [`HIL.md`](HIL.md) |
+| port trait + host 编排测试 | `run()` 目前依赖 esp-hal，无法 host 回归 | [ADR-0005](adr/0005-port-traits-plan.md) |
+| `LoopPhase` 拆分 | 收敛布尔标志，消除 `excessive_nesting` 的根因 | ADR-0005 |
+| core 发布 crates.io | 元数据与 LICENSE 已就绪，需维护者执行 `cargo publish` | `CONTRIBUTING.md` |
+| 上游回馈 | wakenet FFI / esp-radio 踩坑整理成 issue/PR | — |
+| TLS (MQTT) | 目前明文 1883，仅受信内网 | 已知限制 |
+
+验收时请以本表为准：前六项为已落地的工程化改动，后三项需要维护者决策或硬件。

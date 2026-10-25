@@ -12,7 +12,7 @@ echo "== 固件 fmt =="
 cargo fmt --all -- --check
 
 echo "== 固件 clippy =="
-cargo clippy --all-features -- -D warnings --cap-lints allow
+cargo clippy --all-features -- -D warnings
 
 echo "== 固件 check =="
 cargo check --all
@@ -44,7 +44,7 @@ if [ "${1:-}" = "--with-docs" ]; then
     fi
     echo "== Markdown =="
     if command -v markdownlint-cli2 >/dev/null 2>&1; then
-        markdownlint-cli2 "**/*.md" "#target" "#vendor" "#CHANGELOG.md"
+        markdownlint-cli2 "**/*.md" "#target" "#vendor" "#CHANGELOG.md" "#docs/archive"
     else
         echo "跳过: 未安装 markdownlint-cli2" >&2
     fi

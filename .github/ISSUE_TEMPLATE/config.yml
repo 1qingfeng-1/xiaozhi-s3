@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全问题
+    url: https://github.com/1qingfeng-1/xiaozhi-s3/security/advisories/new
+    about: 请勿公开提交安全漏洞
+  - name: 硬件与移植文档
+    url: https://github.com/1qingfeng-1/xiaozhi-s3/blob/main/docs/PORTING.md
+    about: 新板移植前先阅读

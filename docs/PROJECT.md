@@ -46,19 +46,23 @@ xiaozhi-s3/
 ├── Cargo.toml
 ├── rust-toolchain.toml
 ├── README.md
-├── DEVELOPMENT.md
-├── HARDWARE.md
-├── QUICK_START.md
-└── COMPLETION_SUMMARY.md
+├── CONTRIBUTING.md
+├── SECURITY.md
+├── docs/
+│   ├── DEVELOPMENT.md
+│   ├── QUICK_START.md
+│   ├── CI.md
+│   └── adr/
+└── xiaozhi-core/           # 纯逻辑层 (submodule)
 ```
 
 ## 📚 文档
 
-- [README.md](README.md) - 项目文档
+- [README.md](../README.md) - 硬件规格、引脚映射、快速上手
 - [QUICK_START.md](QUICK_START.md) - 快速开始
 - [DEVELOPMENT.md](DEVELOPMENT.md) - 开发指南
-- [HARDWARE.md](../HARDWARE.md) - 硬件文档
-- [COMPLETION_SUMMARY.md](COMPLETION_SUMMARY.md) - 完成总结
+- [CI.md](CI.md) - 门禁、CI 与发布
+- [历史归档](archive/) - 早期完成记录（不再维护）
 
 ## 🛠️ 技术栈
 
