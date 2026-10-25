@@ -569,6 +569,8 @@ fn encode_uplink(
 ///
 /// 返回 [`RunOutcome::CaptureFault`] 时调用方需重建采集句柄后重新进入
 /// (esp-hal RX 饱和后只能整体重建, 且重建必须在直线路径上做, 见 AGENTS.md)。
+// `unused_variables/unused_assignments`: 诊断计数器只在 `debug-diag` 构建
+// 里被 `diag!` 读取; 默认构建下日志整段消除, 这些赋值会触发告警。
 #[allow(clippy::too_many_arguments, unused_variables, unused_assignments)]
 pub async fn run(
     args: AppArgs<'_, '_>,
