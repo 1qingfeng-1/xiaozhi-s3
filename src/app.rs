@@ -17,6 +17,7 @@ use esp_hal::{Blocking, dma::DmaTransferRxCircular, i2s::master::I2sRx};
 use defmt::{error, info, warn};
 
 use xiaozhi_core::audio::capture::{condition_for_uplink, extract_slot, level_stats};
+use xiaozhi_core::audio::encode::FrameQueue;
 use xiaozhi_core::audio::listen::{ListenTurn, ListenTurnConfig, voiced_ms as measure_voiced_ms};
 use xiaozhi_core::audio::preroll::PrerollRing;
 use xiaozhi_core::audio::wake::{
@@ -521,8 +522,6 @@ pub struct AppArgs<'a, 'b> {
 ///
 /// 返回本轮成功入队的帧数。时间戳取自 [`AecClock`] (服务端 AEC 对齐);
 /// 协议版本 1 时该队列始终为空, 时间戳恒为 0。
-// 编码热路径保持单函数: 拆分会引入额外的状态传递; 嵌套深度接受。
-#[allow(clippy::excessive_nesting)]
 fn encode_uplink(
     pcm: &[i16],
     acc_buf: &mut [i16],
@@ -533,41 +532,33 @@ fn encode_uplink(
     uplink_frames: &mut u64,
 ) -> usize {
     let mut sent = 0usize;
-    let mut src = pcm;
-    while !src.is_empty() {
-        let take = usize::min(acc_buf.len() - *acc_len, src.len());
-        acc_buf[*acc_len..*acc_len + take].copy_from_slice(&src[..take]);
-        *acc_len += take;
-        src = &src[take..];
-        while *acc_len >= FRAME_SAMPLES {
-            let mut raw = [0u8; MAX_PACKET_BYTES];
-            match encoder.encode(&acc_buf[..FRAME_SAMPLES], &mut raw) {
-                Ok(len) => {
-                    *uplink_frames += 1;
-                    if uplink_frames.is_multiple_of(100) {
-                        crate::diag!("上行心跳: {} 帧", uplink_frames);
-                    }
-                    let mut data: OpusPacket = heapless::Vec::new();
-                    if data.extend_from_slice(&raw[..len]).is_ok()
-                        && channels
-                            .uplink
-                            .try_send(UplinkPacket {
-                                timestamp: aec_clock.pop(),
-                                data,
-                            })
-                            .is_err()
-                    {
-                        warn!("上行通道满, 丢弃一帧");
-                    } else {
-                        sent += 1;
-                    }
-                },
-                Err(e) => warn!("opus 编码失败: {}", e),
-            }
-            acc_buf.copy_within(FRAME_SAMPLES..*acc_len, 0);
-            *acc_len -= FRAME_SAMPLES;
+    let mut queue = FrameQueue::new(acc_buf, acc_len, FRAME_SAMPLES);
+    queue.push(pcm, |frame| {
+        let mut raw = [0u8; MAX_PACKET_BYTES];
+        match encoder.encode(frame, &mut raw) {
+            Ok(len) => {
+                *uplink_frames += 1;
+                if uplink_frames.is_multiple_of(100) {
+                    crate::diag!("上行心跳: {} 帧", uplink_frames);
+                }
+                let mut data: OpusPacket = heapless::Vec::new();
+                if data.extend_from_slice(&raw[..len]).is_ok()
+                    && channels
+                        .uplink
+                        .try_send(UplinkPacket {
+                            timestamp: aec_clock.pop(),
+                            data,
+                        })
+                        .is_err()
+                {
+                    warn!("上行通道满, 丢弃一帧");
+                } else {
+                    sent += 1;
+                }
+            },
+            Err(e) => warn!("opus 编码失败: {}", e),
         }
-    }
+    });
     sent
 }
 

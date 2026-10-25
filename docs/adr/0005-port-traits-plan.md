@@ -53,6 +53,8 @@
   重复判定循环，该规则现在有 host 测试覆盖。
 - 上行前处理（增益 + 限幅）统一为 `capture::condition_for_uplink`，
   聆听 / 播报 AEC / 预录补发三条路径共用同一顺序。
+- 定长帧组装迁入 `encode::FrameQueue`；`encode_uplink` 不再需要
+  `excessive_nesting` allow，跨轮余量/多帧行为有 host 测试。
 - 已消除可安全修复的 lint；`run()` / `encode_uplink()` 仍保留带说明的
   `#[allow(clippy::excessive_nesting)]`。
 - 步骤 2 **部分落地**：`core::port` 提供 `PcmSource` / `PcmSink` /
