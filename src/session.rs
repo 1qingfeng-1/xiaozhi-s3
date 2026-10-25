@@ -144,7 +144,22 @@ impl WsClient<'_> {
         read_exact(self.socket, &mut hdr, timeout)
             .await
             .map_err(|_| "读取帧头失败")?;
+        let fin = hdr[0] & 0x80 != 0;
         let opcode = hdr[0] & 0x0F;
+        // 协议正确性: RSV 必须为 0, 不支持分片/continuation,
+        // 控制帧必须 FIN=1 且 ≤125B (RFC 6455 §5.5)。
+        if hdr[0] & 0x70 != 0 {
+            return Err("WS RSV 非零");
+        }
+        if !fin {
+            return Err("WS 分片帧不支持");
+        }
+        if opcode == 0 {
+            return Err("WS continuation 不支持");
+        }
+        if matches!(opcode, 3..=7 | 11..=15) {
+            return Err("WS 保留 opcode");
+        }
         let masked = hdr[1] & 0x80 != 0;
         let len0 = (hdr[1] & 0x7F) as usize;
         let len = match len0 {
@@ -158,6 +173,9 @@ impl WsClient<'_> {
             127 => return Err("64 位长度不支持"),
             n => n,
         };
+        if opcode >= 8 && len > 125 {
+            return Err("WS 控制帧过长");
+        }
         if len > RECV_BUF {
             return Err("帧过长");
         }

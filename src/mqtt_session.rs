@@ -339,8 +339,7 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
     let mut down_pkts: u32 = 0;
     let mut down_bytes: u64 = 0;
     // 下行序列连续性: 丢包会让 opus 解码出现断点 (长句卡顿/杂音)
-    let mut have_seq = false;
-    let mut max_seq: u32 = 0;
+    let mut seq_tracker = udp_proto::SequenceTracker::new();
     let mut seq_gaps: u32 = 0;
     // 迟到/重复包: 序号不新于已见最大值的包
     let mut late_pkts: u32 = 0;
@@ -540,8 +539,7 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                     match server_msg::parse(text) {
                         ServerMessage::Hello => {
                             awaiting_hello = false;
-                            have_seq = false;
-                            max_seq = 0;
+                            seq_tracker.reset();
                             seq_gaps = 0;
                             late_pkts = 0;
                             session_id.clear();
@@ -589,7 +587,12 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                         ServerMessage::TtsStop => {
                             info!(
                                 "服务器: tts stop (下行 {} 包 {}B, 断序 {}, 迟到 {}, 非法源 {}, max_seq {})",
-                                down_pkts, down_bytes, seq_gaps, late_pkts, bad_src, max_seq
+                                down_pkts,
+                                down_bytes,
+                                seq_gaps,
+                                late_pkts,
+                                bad_src,
+                                seq_tracker.max()
                             );
                             channels.event.send(SessionEvent::TtsStop).await;
                         },
@@ -751,23 +754,21 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                     bad_src = bad_src.saturating_add(1);
                     continue;
                 }
-                // 序号: 用序号回绕比较, 先丢弃迟到/重复包, 再算缺口。
-                // 旧实现先按 last_seq 算缺口, 一个迟到包会污染后续判断并
-                // 凭空插入 PLC 帧 (杂音)。
+                // 序号: 回绕安全跟踪, 迟到/重复包不推进基线 (由 core 单测覆盖)
                 let seq = hdr.sequence;
-                if have_seq {
-                    let diff = seq.wrapping_sub(max_seq);
-                    if diff == 0 || diff >= 0x8000_0000 {
+                let prev = seq_tracker.max();
+                match seq_tracker.observe(seq) {
+                    udp_proto::SeqOutcome::First | udp_proto::SeqOutcome::InOrder => {},
+                    udp_proto::SeqOutcome::LateOrDup => {
                         late_pkts = late_pkts.saturating_add(1);
                         continue;
-                    }
-                    if diff > 1 {
+                    },
+                    udp_proto::SeqOutcome::Gap { missing } => {
                         seq_gaps += 1;
-                        let missing = diff - 1;
                         if seq_gaps <= 5 || seq_gaps.is_multiple_of(50) {
                             warn!(
                                 "UDP 下行不连续: seq {} → {} (缺 {}) 累计 {}",
-                                max_seq, seq, missing, seq_gaps
+                                prev, seq, missing, seq_gaps
                             );
                         }
                         // 丢包隐藏: 通知音频侧补 PLC 帧 (最多 4 帧, 防通道拥塞)
@@ -781,11 +782,8 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                                 warn!("下行通道拥塞, 丢弃 PLC");
                             }
                         }
-                    }
-                } else {
-                    have_seq = true;
+                    },
                 }
-                max_seq = seq;
                 if DROP_DOWNLINK.load(core::sync::atomic::Ordering::Relaxed) {
                     continue;
                 }
