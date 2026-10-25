@@ -166,6 +166,37 @@ jobs:
       - name: Run markdownlint
         run: npx --yes markdownlint-cli2@0.17.2
 
+  # core 覆盖率 (host, 仅报告不设阈值)
+  core-coverage:
+    name: Core coverage (host)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (with submodule)
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Run coverage
+        working-directory: xiaozhi-core
+        run: cargo llvm-cov nextest --locked --lcov --output-path lcov.info
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: core-lcov
+          path: xiaozhi-core/lcov.info
+          retention-days: 30
+
   # 依赖安全/许可证审计 (与 pre-commit 的 cargo-deny 对齐)
   deny:
     name: Dependency audit

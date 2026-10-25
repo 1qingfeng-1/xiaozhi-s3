@@ -1,7 +1,7 @@
 # 真机在环测试 (HIL) 方案
 
-本仓库的 host 测试覆盖 `xiaozhi-core`（188 个用例），但音频时序、DMA、
-WiFi 与 OTA 只能在真机验证。本文描述把"烧录后手测"变成可重复 HIL 的最小方案。
+本仓库的 host 测试覆盖 `xiaozhi-core`（206 个用例），但音频时序、DMA、
+WiFi 与 OTA 只能在真机验证。本文描述把"烧录后手测"变成可重复 HIL 的方案。
 
 ## 现状
 
@@ -10,39 +10,139 @@ WiFi 与 OTA 只能在真机验证。本文描述把"烧录后手测"变成可�
 - 诊断 feature（`debug-diag`、`*-selftest`）已能输出结构化 defmt 日志，
   可直接作为 HIL 的断言来源。
 
-## 目标
+## 总体思路
 
-1. 一台常连 USB 的 ESP32-S3 + 一个测试服务器；
-2. `cargo test` 风格的用例：烧录 → 等日志/状态 → 断言 → 复位；
-3. 失败时保留串口日志与复位原因；
-4. 先本地手动跑，稳定后再考虑 self-hosted runner。
+不做一个大 E2E，而是三层递进：
 
-## 推荐工具
+1. **目标侧 `embedded-test`**：驱动/资源级用例（PSRAM、I2C codec、
+   I2S 时钟、看门狗、otadata），快且稳定；
+2. **主机侧 HIL runner**：烧录 → 注入激励 → 收集事件 → 断言 → 归档；
+3. **CI self-hosted runner**：label/定时触发与 artifact 归档。
 
-| 工具 | 用途 |
-|---|---|
-| `espflash` | 烧录、`--monitor` 输出 defmt |
-| `probe-rs` | 备选调试/烧录通道（USB-JTAG） |
-| `embedded-test` 或 `defmt-test` | 目标侧测试框架（在设备上跑 `#[test]`） |
-| `defmt-test` + `probe-rs run` | 无人值守执行并回收结果 |
+被测控制通道必须与业务链路隔离：不能复用 MCP/WS 当控制面，
+否则链路本身故障时无法区分原因。
 
-## 用例清单（按收益排序）
+## 1. 设备侧
 
-1. **启动自检**：复位原因、PSRAM 大小、内部堆水位、codec I2C 应答；
-2. **音频环回**：`audio-loopback` bin 播放正弦，检查 TX 速率与欠载计数；
-3. **唤醒门控**（`session-selftest`）：注入唤醒 → 检查关键词确认/静默挂断；
-4. **会话链路**：hello → listen start → TTS 下行 → tts stop，断言状态迁移；
-5. **看门狗**（`watchdog-selftest`）：阻塞主循环，断言复位原因为 TG0WDT；
-6. **OTA 回滚**（`ota-selftest-crash`）：确认前 panic，断言回滚到旧镜像；
-7. **低电保护**：模拟电量 <20%，断言跳过升级。
+新增 `hil` feature 与独立 `src/bin/hil-agent.rs`（不复用主固件流程）：
 
-## 落地步骤
+```text
+PING / VERSION / GET_COUNTERS / RESET_COUNTERS
+SET_VOLUME 60 / PLAY_TONE 1k 3000 / CAPTURE 2000
+WAKE / BARGE_IN / SIM_LOW_BATTERY 15 / REBOOT
+```
 
-1. 在仓库外建 `hil/` 测试工程（避免污染固件 crate 与 CI 缓存）；
-2. 用 `espflash save-image` 产出镜像，测试脚本负责烧录与日志匹配；
-3. 断言只依赖 defmt 的稳定字段，不解析自由文本；
-4. 每个用例复位后重新烧录，避免状态串扰；
-5. 真机回归记录写回 `ROADMAP.md`（保留日期、板型、固件版本）。
+- 走第二路 UART 或 USB Serial/JTAG，与音频/网络链路物理隔离；
+- `CAPTURE` 回传 PCM 统计（RMS/峰值/ZCR/削顶数），必要时才回传原始数据；
+- 开启 `hil` feature 后只输出稳定 `key=value`：
+
+```text
+HIL boot version=1.2.3 sha=ab12cd34 psram=8388608 reset=POWER_ON
+HIL dma underruns=0 late=0 overflow=0
+HIL wake latency_ms=820 source=vad
+HIL session state=Listening frames=42
+HIL tts bytes=184320 duration_ms=3000 drop=0
+HIL heap internal_used=81234 internal_total=131072
+```
+
+自由文本只作为失败附件。每个用例开始前固定 NVS/`FACTORY_RESET`，
+结束时记录 `reset_reason`；设备看门狗保持开启，主机再加超时，双层兜底。
+
+## 2. 硬件夹具
+
+- **电气回环（首选）**：DAC → π 衰减/分压 → ADC，继电器在
+  「回环/真实麦克风」间切换。必须衰减，ES8311 直连 ES7210 会削顶。
+- **声学回环（夜间长稳）**：隔音箱 + USB 声卡；不要用作 PR 门禁。
+- **按键/电源**：USB 继电器或光耦模拟 BOOT/音量键；可编程电源做
+  低电/掉电/挂死重启；INA219/PPK2 采电流。
+- **网络**：专用 AP（固定信道、关漫游、隔离外网）+ 本地测试服务器，
+  ASR/LLM/TTS 返回固定可预期内容（固定时长音频），便于断言。
+
+## 3. 主机侧 runner
+
+独立 `hil/` crate（不污染固件 crate 与 CI 缓存）：
+
+```text
+hil/
+├── src/main.rs      # 用例编排
+├── src/device.rs    # espflash/probe-rs 烧录、串口、事件解析、复位
+├── src/server.rs    # 固定响应的 WS/OTA/MQTT 服务
+├── src/fixture.rs   # 继电器/电源/音频注入
+└── src/cases/       # 每个用例一个模块
+```
+
+单用例生命周期：
+
+```text
+构建(hil feature) → 烧录 → 读 HIL boot/SHA → FACTORY_RESET →
+注入激励 → 收集事件(超时) → 断言 → 保存 artifacts → 硬复位
+```
+
+断言用容差，不逐样本比对：
+
+- DMA `underrun/late/overflow == 0`；
+- 播放时长误差 < ±5%，`drop == 0`；
+- 唤醒延迟、关键词确认率、固定噪声下误唤醒数；
+- 状态迁移序列（hello → listen start → tts start → tts stop）；
+- 堆水位峰值、栈余量、OTA 回滚复位原因。
+
+失败分类：断言失败 = 真回归；USB 枚举/WiFi 未连 = 基础设施失败，
+重试一次；挂死 = 断电重启重跑一次，仍失败保留现场。
+
+## 4. 目标侧 embedded-test
+
+用 `embedded-test` + `probe-rs run` 跑驱动级用例：PSRAM/堆分配、
+I2C codec ACK、I2S 时钟/静音回环、看门狗复位、otadata 读写。
+作为 HIL 的第一道门禁，失败时无需进入完整链路。
+
+## 5. CI 闭环
+
+GitHub 托管 runner 连不了真实设备，需 self-hosted：
+
+```yaml
+hil:
+  runs-on: [self-hosted, esp32s3, audio-fixture]
+  if: workflow_dispatch || contains(github.event.pull_request.labels.*.name, 'hil')
+  concurrency: hil-device
+  timeout-minutes: 30
+  steps:
+    - uses: actions/checkout@v7
+      with: { submodules: recursive }
+    - run: just image
+    - run: cargo run --manifest-path hil/Cargo.toml -- --all --junit hil.xml
+    - uses: actions/upload-artifact@v7
+      if: always()
+      with: { name: hil-artifacts, path: hil/artifacts/ }
+```
+
+- `concurrency` 保证同一设备串行；
+- **fork PR 不直接进自托管 runner**（安全），用 label 或合并后
+  `workflow_run` 触发；
+- PR 只跑 5 分钟冒烟（启动/音频回环/会话自测），main 每晚全量 + 长稳。
+
+## 6. 复用现有资产
+
+`audio-loopback`、`session-selftest`、`watchdog-selftest`、
+`ota-selftest-crash`、`idle-selftest`、`just image` 与本文用例清单
+可直接转成第一批 HIL case。HIL 构建关闭 `debug-diag`，避免高频日志
+破坏实时性。
+
+## 7. 落地顺序
+
+1. 第 1 周：`hil-agent` + 结构化事件 + 烧录/读版本/复位脚本；
+2. 第 2 周：电气音频回环夹具，跑通启动、codec、I2S 回环、会话自测；
+3. 第 3 周：self-hosted runner + JUnit/artifact + label 触发；
+4. 第 4 周：OTA 回滚、看门狗、低电、MQTT 半开重连；
+5. 之后：夜间长稳、声学回环、多板矩阵、功耗曲线。
+
+## 8. 关键坑
+
+- 音频电平失配（必须衰减）；
+- USB 串口枚举/占用；WiFi 环境不可控；
+- OTA 变砖——保留继电器模拟 BOOT+RST 的 USB 恢复路径；
+- 日志影响实时性（HIL 构建关闭高频日志）；
+- 断言过严（用容差）；
+- fork PR 在带设备 runner 上执行（安全风险）。
 
 > 当前 CI 不包含 HIL：GitHub 托管 runner 无法连接真实设备。
-> 若后续接入 self-hosted runner，可把本文用例 1/3/5 作为 PR 门禁。
+> 若后续接入 self-hosted runner，可把启动/音频回环/看门狗作为 PR 门禁。

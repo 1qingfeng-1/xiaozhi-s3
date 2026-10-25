@@ -27,6 +27,19 @@ cargo +stable nextest run
 
 > `--locked` 只在 CI 使用，保证 Cargo.lock 与依赖一致；本地升级依赖时可省略。
 
+### 快捷命令（just）
+
+安装 `cargo install just` 后，在仓库根使用：
+
+```bash
+just              # = just check
+just check-docs   # 额外跑 typos / markdownlint / cargo-deny
+just core-test    # core host 测试
+just image        # 生成 dist/xiaozhi-s3.bin 与 merged 镜像
+just stack        # 主任务栈预算
+just fuzz parse_ws 20000
+```
+
 ### 资源门禁
 
 ```bash
@@ -93,6 +106,7 @@ CI 不跑 fuzz（需要 nightly sanitizer 且耗时）。
 | `clippy` | `cargo clippy --locked --all-features -- -D warnings`（真实门禁） |
 | `check` | `cargo check --locked --all` |
 | `core-test` | core fmt / clippy / nextest（host） |
+| `core-coverage` | `cargo llvm-cov nextest`，上传 `core-lcov` artifact（不设阈值） |
 | `docs-lint` | `typos` + `markdownlint-cli2@0.17.2` |
 | `deny` | `cargo deny check advisories licenses` |
 | `build` | feature 矩阵编译 → release 构建 → 栈预算 → 镜像生成与大小门禁 → 上传产物 |

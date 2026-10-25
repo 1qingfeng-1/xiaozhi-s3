@@ -20,6 +20,10 @@ git submodule update --init --recursive
 
 # 4. 门禁 (与 CI 完全一致)
 ./scripts/check.sh --with-docs
+
+# 可选: 安装 just 后使用快捷命令
+cargo install just
+just check-docs
 ```
 
 host 侧命令（core 测试）必须显式使用 `+stable`：
