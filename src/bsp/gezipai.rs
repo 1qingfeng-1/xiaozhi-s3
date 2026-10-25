@@ -103,8 +103,19 @@ use esp_hal::{
 use super::components::{self, Board};
 use alloc::boxed::Box;
 
+/// create_board 未消耗、由 bin 自行使用的外设 (避免 `Peripherals::steal`)
+pub struct BoardExtras {
+    pub timg0: esp_hal::peripherals::TIMG0<'static>,
+    pub sw_interrupt: esp_hal::peripherals::SW_INTERRUPT<'static>,
+    pub flash: esp_hal::peripherals::FLASH<'static>,
+    pub wifi: esp_hal::peripherals::WIFI<'static>,
+}
+
 /// 组装 gezipai 板子运行时对象
-pub fn create_board(peripherals: Peripherals) -> Board {
+///
+/// 返回 (board, 剩余外设); bin 用 `extras` 启动调度器/存储/网络,
+/// 不再需要 `unsafe { Peripherals::steal() }`。
+pub fn create_board(peripherals: Peripherals) -> (Board, BoardExtras) {
     // 内部堆必须先于任何分配注册 (所有 bin 共用本工厂):
     // 音频 DMA 缓冲必须落内部 RAM (S3 GDMA 访问不了 PSRAM)。
     // 128KB = DMA ~48KB + 音频大数组 ~56KB (main 泄漏, 勿 mk_static 挤 bss)
@@ -253,7 +264,7 @@ pub fn create_board(peripherals: Peripherals) -> Board {
     // 先注册 PSRAM 会让 I2S 缓冲落进外部 RAM 导致 DmaError(UnsupportedMemoryRegion)。
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
 
-    Board {
+    let board = Board {
         name: BOARD.name,
         audio,
         capture,
@@ -262,5 +273,12 @@ pub fn create_board(peripherals: Peripherals) -> Board {
         power,
         battery,
         display,
-    }
+    };
+    let extras = BoardExtras {
+        timg0: peripherals.TIMG0,
+        sw_interrupt: peripherals.SW_INTERRUPT,
+        flash: peripherals.FLASH,
+        wifi: peripherals.WIFI,
+    };
+    (board, extras)
 }

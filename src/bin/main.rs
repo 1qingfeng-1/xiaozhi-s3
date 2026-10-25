@@ -22,8 +22,7 @@
 use embassy_executor::Spawner;
 use embassy_sync::channel::Channel;
 use esp_hal::{
-    clock::CpuClock, interrupt::software::SoftwareInterruptControl, peripherals::Peripherals,
-    timer::timg::TimerGroup,
+    clock::CpuClock, interrupt::software::SoftwareInterruptControl, timer::timg::TimerGroup,
 };
 use esp_storage::FlashStorage;
 
@@ -77,7 +76,7 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     // 板子工厂: 内部堆第一行注册 → 音频 DMA 缓冲 → PSRAM 最后注册
-    let mut board = create_board(peripherals);
+    let (mut board, extras) = create_board(peripherals);
     info!("板子 [{}] 初始化完成", board.name);
     // 音频大缓冲 (PCM 环 512KB + 预录/MQTT 等) 必须落 PSRAM; 没有 PSRAM
     // 时内部堆 128KB 必然 OOM。与其随机崩溃, 不如明确报错重启 (硬件故障)。
@@ -103,15 +102,13 @@ async fn main(spawner: Spawner) -> ! {
         core::sync::atomic::Ordering::Relaxed,
     );
 
-    // create_board 按值消耗了 Peripherals; 音频不用的 WIFI/FLASH/TIMG0 经 steal 再取
-    let p = unsafe { Peripherals::steal() };
-    let timg0 = TimerGroup::new(p.TIMG0);
+    let timg0 = TimerGroup::new(extras.timg0);
     // MWDT 与 timer0 同组: 先取出看门狗句柄, timer0 交给 embassy 时基
     let mwdt = timg0.wdt;
-    let sw_interrupt = SoftwareInterruptControl::new(p.SW_INTERRUPT);
+    let sw_interrupt = SoftwareInterruptControl::new(extras.sw_interrupt);
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
-    let flash = xiaozhi_s3::mk_static!(FlashStorage<'static>, FlashStorage::new(p.FLASH));
+    let flash = xiaozhi_s3::mk_static!(FlashStorage<'static>, FlashStorage::new(extras.flash));
 
     // 音量恢复 (NVS 0xD000; 无记录 → 默认 60): 原子量 + ES8311 硬件同步
     let saved_vol = xiaozhi_s3::wifi::store::load_volume(flash);
@@ -154,36 +151,38 @@ async fn main(spawner: Spawner) -> ! {
     // WiFi: 有凭据连 STA; 无凭据/连接失败 → 配网模式 (SoftAP 表单, 保存后重启)
     // controller 必须活到 main 结束 (保活射频状态), 勿提前 drop
     let (stack, server, controller, mac) = match wifi::boot_mode(flash) {
-        Mode::Station(config) => match wifi::connect_station(&spawner, &config, p.WIFI).await {
-            Ok((stack, controller, mac)) => {
-                let server = match config.server.as_str().parse() {
-                    Ok(ip) => ip,
-                    Err(_) => {
-                        // 旧配置/手误写入非法地址: 复位但不改配置会形成无限
-                        // 重启循环, 这里清凭据回到配网。
-                        error!(
-                            "服务器地址无效: {} — 清除凭据进入配网",
-                            config.server.as_str()
-                        );
-                        let _ = store::clear(flash);
-                        esp_hal::system::software_reset();
-                    },
-                };
-                (stack, server, controller, mac)
-            },
-            Err(wifi::ConnectError::Association) => {
-                error!("WiFi 关联/认证失败, 清除凭据重启进入配网");
-                let _ = store::clear(flash);
-                esp_hal::system::software_reset();
-            },
-            Err(wifi::ConnectError::DhcpTimeout) => {
-                // DHCP 池满/路由器异常: 保留凭据, 稍后重启重试
-                error!("DHCP 超时, 保留凭据, 10s 后重启重试");
-                embassy_time::Timer::after(embassy_time::Duration::from_secs(10)).await;
-                esp_hal::system::software_reset();
-            },
+        Mode::Station(config) => {
+            match wifi::connect_station(&spawner, &config, extras.wifi).await {
+                Ok((stack, controller, mac)) => {
+                    let server = match config.server.as_str().parse() {
+                        Ok(ip) => ip,
+                        Err(_) => {
+                            // 旧配置/手误写入非法地址: 复位但不改配置会形成无限
+                            // 重启循环, 这里清凭据回到配网。
+                            error!(
+                                "服务器地址无效: {} — 清除凭据进入配网",
+                                config.server.as_str()
+                            );
+                            let _ = store::clear(flash);
+                            esp_hal::system::software_reset();
+                        },
+                    };
+                    (stack, server, controller, mac)
+                },
+                Err(wifi::ConnectError::Association) => {
+                    error!("WiFi 关联/认证失败, 清除凭据重启进入配网");
+                    let _ = store::clear(flash);
+                    esp_hal::system::software_reset();
+                },
+                Err(wifi::ConnectError::DhcpTimeout) => {
+                    // DHCP 池满/路由器异常: 保留凭据, 稍后重启重试
+                    error!("DHCP 超时, 保留凭据, 10s 后重启重试");
+                    embassy_time::Timer::after(embassy_time::Duration::from_secs(10)).await;
+                    esp_hal::system::software_reset();
+                },
+            }
         },
-        Mode::Provision => wifi::provision::run(spawner, p.WIFI, flash).await,
+        Mode::Provision => wifi::provision::run(spawner, extras.wifi, flash).await,
     };
     // WiFi 省电: UDP 音频对丢包/抖动敏感, modem sleep 会让 AP 缓存并突发
     // 投递下行包 (实测长句 TTS 断序 ~18% → 卡顿/杂音), 会话设备必须关闭。

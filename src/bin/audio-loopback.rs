@@ -64,12 +64,12 @@ async fn main(_spawner: Spawner) -> ! {
 
     info!("=== 音频回环调试 (M1) ===");
 
-    let mut board = create_board(peripherals);
+    let (mut board, extras) = create_board(peripherals);
 
-    // esp-radio 已无条件入链: 调度器必须启动 (外设经 steal 重取)
-    let p = unsafe { esp_hal::peripherals::Peripherals::steal() };
-    let timg0 = esp_hal::timer::timg::TimerGroup::new(p.TIMG0);
-    let sw_interrupt = esp_hal::interrupt::software::SoftwareInterruptControl::new(p.SW_INTERRUPT);
+    // esp-radio 已无条件入链: 调度器必须启动 (create_board 返回剩余外设)
+    let timg0 = esp_hal::timer::timg::TimerGroup::new(extras.timg0);
+    let sw_interrupt =
+        esp_hal::interrupt::software::SoftwareInterruptControl::new(extras.sw_interrupt);
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
     info!("板子 [{}] 初始化完成", board.name);
 
