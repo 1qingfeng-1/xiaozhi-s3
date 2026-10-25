@@ -16,14 +16,12 @@ use esp_hal::{Blocking, dma::DmaTransferRxCircular, i2s::master::I2sRx};
 
 use defmt::{error, info, warn};
 
-use xiaozhi_core::audio::capture::{
-    apply_gain_percent, extract_slot, is_voice_active, level_stats, limit_peak,
-};
-use xiaozhi_core::audio::listen::{ListenTurn, ListenTurnConfig};
+use xiaozhi_core::audio::capture::{apply_gain_percent, extract_slot, level_stats, limit_peak};
+use xiaozhi_core::audio::listen::{ListenTurn, ListenTurnConfig, voiced_ms as measure_voiced_ms};
 use xiaozhi_core::audio::preroll::PrerollRing;
 use xiaozhi_core::audio::wake::{
     MAX_ZCR_PERMILLE, VadWakeDetector, WakeEngine, WakeEvent, WakePolicy, WakePolicyConfig,
-    adaptive_threshold, update_noise_floor, zero_crossing_permille,
+    adaptive_threshold, update_noise_floor,
 };
 use xiaozhi_core::dialog::{
     Action, DialogEvent, DialogSm, DialogState, ListenMode, LoopPhase, stt_has_keyword,
@@ -1371,19 +1369,19 @@ pub async fn run(
                     let frame_ms = ns as u64 * 1000 / SAMPLE_RATE as u64;
                     let warmup = listen_turn.total_ms() <= LISTEN_WARMUP_MS;
                     // 按 60ms 子块做 VAD: pop 块可能长达 ~448ms, 整块判定会
-                    // 让短语音 (<400ms) 永远累计不够、噪声块却能一票置 heard
-                    let mut voiced_ms = 0u64;
-                    if !warmup {
-                        for chunk in mono_buf[..ns].chunks(FRAME_SAMPLES) {
-                            // 低阈值能量 + 人声 ZCR: 键盘/宽带瞬态不记为"说过话",
-                            // 避免误唤醒后键盘声把回合卡在 WaitingReply。
-                            if is_voice_active(chunk, LISTEN_VAD_THRESHOLD)
-                                && zero_crossing_permille(chunk) <= MAX_ZCR_PERMILLE
-                            {
-                                voiced_ms += chunk.len() as u64 * 1000 / SAMPLE_RATE as u64;
-                            }
-                        }
-                    }
+                    // 让短语音 (<400ms) 永远累计不够、噪声块却能一票置 heard。
+                    // 能量 + ZCR 的组合判定在 core (host 可测)。
+                    let voiced_ms = if warmup {
+                        0
+                    } else {
+                        measure_voiced_ms(
+                            &mono_buf[..ns],
+                            FRAME_SAMPLES,
+                            LISTEN_VAD_THRESHOLD,
+                            MAX_ZCR_PERMILLE,
+                            SAMPLE_RATE,
+                        )
+                    };
                     let in_grace = now_ms < listen_grace_until_ms;
                     let voiced = voiced_ms > 0 && now_ms >= mic_mute_until_ms && !in_grace;
                     // 一次性原始 I2S 转储 (排查字节序/槽位): 首个有声帧的前 512 帧

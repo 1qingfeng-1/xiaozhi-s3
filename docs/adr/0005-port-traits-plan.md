@@ -49,6 +49,8 @@
 - 步骤 1 **已落地**：`dialog::LoopPhase`（门控优先、低功耗只影响 Idle）
   提供 host 测试；固件灯语改为单一 `match phase`，删除布尔组合。
 - `stt_has_keyword` 已从固件移到 core，并补了误识别变体测试。
+- 聆听回合的「能量 + ZCR」统计迁入 `listen::voiced_ms`，固件不再保留
+  重复判定循环，该规则现在有 host 测试覆盖。
 - 已消除可安全修复的 lint；`run()` / `encode_uplink()` 仍保留带说明的
   `#[allow(clippy::excessive_nesting)]`。
 - 步骤 2 **部分落地**：`core::port` 提供 `PcmSource` / `PcmSink` /
