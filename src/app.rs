@@ -1143,7 +1143,6 @@ pub async fn run(
                 Action::SendListenStart => SessionCommand::SendListenStart(*mode),
                 Action::SendListenStop => SessionCommand::SendListenStop,
                 Action::SendTtsAbort => SessionCommand::SendTtsAbort,
-                _ => continue,
             };
             if channels.command.try_send(cmd).is_err() {
                 warn!("命令通道满, 丢弃 {:?} (罕见)", cmd);
@@ -1681,12 +1680,7 @@ fn dispatch(
     let actions: heapless::Vec<Action, 8> = actions_ref.iter().copied().collect();
     let mode = sm.mode();
     for &a in &actions {
-        match a {
-            Action::PlayWakeChime => {}, // 提示音在唤醒注入点同步执行
-            _ => {
-                let _ = pending.push((a, mode));
-            },
-        }
+        let _ = pending.push((a, mode));
     }
     // 打印触发事件, 便于确认唤醒来源 (VAD 唤醒 vs 按键 vs 会话生命周期)
     info!("状态: {} (事件: {})", state_label(state), event_label(ev));

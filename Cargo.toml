@@ -98,9 +98,12 @@ wakenet = []
 # The default debug profile is too slow and too big for resource-constrained devices.
 # Always build with some optimizations enabled.
 opt-level = "s"
+# no_std + panic handler: 明确 abort, 不尝试栈展开
+panic = "abort"
 
 [profile.release]
 codegen-units = 1     # LLVM can perform better optimizations using a single thread
 debug         = 2     # prefer slower builds but better debugging experience
 lto           = 'fat'
 opt-level     = 's'
+panic         = "abort"

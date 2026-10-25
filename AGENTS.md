@@ -19,7 +19,7 @@ cargo fmt --all -- --check
 cargo clippy --all-features -- -D warnings --cap-lints allow   # 与 CI/pre-commit 一致
 cargo check --all
 
-# 核心层 177 个 host 单测 — 必须在 xiaozhi-core/ 目录内跑
+# 核心层 178 个 host 单测 — 必须在 xiaozhi-core/ 目录内跑
 cd xiaozhi-core && cargo +stable nextest run
 # 单测过滤: cargo +stable nextest run ota_crc
 # 或 cargo +stable test
@@ -39,7 +39,7 @@ xtensa；从根目录跑 `cargo +stable nextest run -p xiaozhi-core` 会拿父�
 - **不要在仓库根目录跑 `cargo test`**（作用于 xtensa target，必失败）；
 - xiaozhi-core 是独立 workspace 根（空 `[workspace]` + 自带 `.cargo/config.toml` 覆盖回 host target），
   不继承父目录的 esp target/-nostartfiles；
-- 只有 xiaozhi-core 有单测，且只能在 host 上跑（177 个，当前全绿）。
+- 只有 xiaozhi-core 有单测，且只能在 host 上跑（178 个，当前全绿）。
 
 ## 架构与分层
 
@@ -61,7 +61,7 @@ xiaozhi-s3/          固件 crate (no_std, esp-rtos 双任务)
 ├── vendor/          libopus (v1.6.1 裁剪) / esp-sr / esp-dsp 子集 / cjson (均 build.rs 编译或链接)
 xiaozhi-core/        git submodule, 纯逻辑层: audio (音量映射/时钟/codec 序列/唤醒 VAD/播放流程) +
                      dialog (对话状态机) + mcp (JSON-RPC 解析) + ota (清单/版本/e9 头/otadata 条目) +
-                     display + board 规则 + protocol/aes/mqtt/udp 编解码; host 可单测 (177 个), #![deny(unsafe_code)]
+                     display + board 规则 + protocol/aes/mqtt/udp 编解码; host 可单测 (178 个), #![deny(unsafe_code)]
 ```
 
 分层规则（改代码前必读）：
@@ -105,7 +105,8 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量映射/时钟/cod
 - xiaozhi-core 是 git submodule：克隆需 `--recurse-submodules`；core 改动后要在父仓库提交 submodule 指针
   （core 是独立仓库，改动先提交/推送 core 本身）。
 - 日志用 defmt（`.cargo/config.toml` `[env] DEFMT_LOG=info`），打印走 esp-println。
-- edition 2024，rust-version 1.88；`profile.dev` 也开 `opt-level = "s"`（勿改回）。
+- edition 2024，rust-version 1.88；`profile.dev` 也开 `opt-level = "s"`（勿改回）；
+  release/dev 均显式 `panic = "abort"`（no_std，无栈展开）。
 - 内部堆 **128KB**（`create_board` 第一行注册，先于任何分配，各 bin 共用）；
   主任务栈 = RWDATA 剩余（Channels 迁 PSRAM 后实测 **约 100KB（100,268B）**，CI 守卫 `scripts/check_stack.sh` 下限 96KiB）。**opus 编码 60ms 帧需 ~87KB 栈**（SILK VLA 随帧长线性，
   `VAR_ARRAYS` 走任务栈）——缩堆或加长帧前必须重估，否则栈溢出。

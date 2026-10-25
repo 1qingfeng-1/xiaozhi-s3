@@ -349,24 +349,9 @@ fn parse_query(
     heapless::String<64>,
     heapless::String<64>,
 ) {
-    let mut ssid = heapless::String::<32>::new();
-    let mut pass = heapless::String::<64>::new();
-    let mut server = heapless::String::<64>::new();
-
-    for pair in query.split('&') {
-        let (k, v) = match pair.split_once('=') {
-            Some(x) => x,
-            None => continue,
-        };
-        let full = xiaozhi_core::http::url_decode::<64>(v);
-        let decoded = heapless::String::<64>::try_from(full.trim()).unwrap_or_default();
-        match k {
-            "ssid" => ssid = heapless::String::try_from(decoded.as_str()).unwrap_or_default(),
-            "pass" => pass = decoded,
-            "server" => server = decoded,
-            _ => {},
-        }
-    }
+    let ssid = xiaozhi_core::http::form_field::<32>(query, "ssid").unwrap_or_default();
+    let pass = xiaozhi_core::http::form_field::<64>(query, "pass").unwrap_or_default();
+    let mut server = xiaozhi_core::http::form_field::<64>(query, "server").unwrap_or_default();
     if server.is_empty() {
         server = heapless::String::try_from(DEFAULT_SERVER).unwrap_or_default();
     }
