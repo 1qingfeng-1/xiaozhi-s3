@@ -140,6 +140,7 @@ impl Leds {
         }
         self.mode = mode;
         let (d_dark, d_bright) = (self.duty_pct(0), self.duty_pct(100));
+        let active_low = self.active_low;
         match (&mut self.inner, mode) {
             (Inner::Pwm { channel, .. }, LedMode::Breathing(speed)) => {
                 let _ = channel.start_duty_fade(d_dark, d_bright, speed.half_cycle_ms());
@@ -152,8 +153,17 @@ impl Leds {
                 };
                 let _ = channel.set_duty(d);
             },
-            (Inner::Plain { lit, .. }, LedMode::On) => *lit = true,
-            (Inner::Plain { lit, .. }, _) => *lit = false,
+            (Inner::Plain { out, lit }, target) => {
+                // 普通 IO 板子也必须真正驱动引脚 (旧实现只改字段, 灯永远不亮)
+                let on = matches!(target, LedMode::On);
+                *lit = on;
+                let high = if on { !active_low } else { active_low };
+                if high {
+                    out.set_high();
+                } else {
+                    out.set_low();
+                }
+            },
         }
     }
 

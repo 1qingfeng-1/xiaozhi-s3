@@ -41,6 +41,19 @@ xiaozhi-s3/
 - esp-generate v1.3.0
 - espup v0.17.1
 
+### 提交前门禁
+
+```bash
+# 一键门禁: 固件 fmt/clippy/check + core fmt/clippy/nextest
+./scripts/check.sh
+
+# 追加 cargo-deny / typos / markdownlint
+./scripts/check.sh --with-docs
+
+# 主任务栈预算 (需先 cargo build --release)
+./scripts/check_stack.sh target/xtensa-esp32s3-none-elf/release/xiaozhi-s3
+```
+
 ### 构建命令
 
 ```bash

@@ -7,23 +7,33 @@
 use embassy_net::{Ipv4Address, tcp::TcpSocket};
 use esp_hal::rng::Rng;
 
-use alloc::format;
-
 use crate::audio::opus::MAX_PACKET_BYTES;
 
 /// WebSocket 服务器端口与路径 (xiaozhi 协议)
 pub const WS_PORT: u16 = 8000;
 pub const WS_PATH: &str = "/xiaozhi/v1/";
 
-/// WS 帧载荷上限 (服务器 TTS 单帧可达 opus 最大包 1276B)
-const RECV_BUF: usize = 2048;
+/// WS Bearer token: 默认兼容官方测试值, 可用构建期
+/// `XIAOZHI_WS_TOKEN=... cargo build` 覆盖 (不把部署 token 写进源码)
+const WS_TOKEN: &str = match option_env!("XIAOZHI_WS_TOKEN") {
+    Some(t) => t,
+    None => "xiaozhi-test",
+};
+
+/// WS 帧载荷上限: opus 最大包 1276B, 但 MCP/tools 文本可达数 KB
+const RECV_BUF: usize = 4096;
+/// 单帧读/写上限: 防止一条慢帧把会话任务卡住 10s (上行通道只有 ~1.4s)
+const FRAME_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_millis(1_500);
 
 /// listen/tts 消息模板 (xiaozhi 协议; mode 语义对齐 C++ protocol.cc)
 pub const LISTEN_START_MANUAL: &str =
     "{\"type\":\"listen\",\"state\":\"start\",\"mode\":\"manual\"}";
 pub const LISTEN_START_AUTO: &str = "{\"type\":\"listen\",\"state\":\"start\",\"mode\":\"auto\"}";
 pub const LISTEN_STOP: &str = "{\"type\":\"listen\",\"state\":\"stop\"}";
-pub const TTS_ABORT: &str = "{\"type\":\"tts\",\"state\":\"abort\"}";
+/// 打断播报: 协议里是独立的 `abort` 类型 (对齐 C++ protocol.cc / 服务端
+/// textMessageHandlerRegistry), **不是** `tts` 的 state=abort —— 后者服务端
+/// 会当成未知消息忽略, TTS 不会真正停止。
+pub const TTS_ABORT: &str = "{\"type\":\"abort\"}";
 /// 设备主动结束会话 (MQTT 网关据此关闭 bridge; WS 服务端忽略)
 pub const GOODBYE: &str = "{\"type\":\"goodbye\"}";
 
@@ -101,25 +111,37 @@ impl WsClient<'_> {
             (rng.random() >> 24) as u8,
         ];
         let mut frame: heapless::Vec<u8, 2048> = heapless::Vec::new();
-        frame.push(0x80 | opcode).ok();
+        // 容量经 payload 上限保证; 仍显式返回错误而不是静默截断
+        const FULL: &str = "帧组包失败";
+        frame.push(0x80 | opcode).map_err(|_| FULL)?;
         let len = payload.len();
         if len < 126 {
-            frame.push(0x80 | len as u8).ok();
+            frame.push(0x80 | len as u8).map_err(|_| FULL)?;
         } else {
-            frame.push(0x80 | 126).ok();
-            frame.extend_from_slice(&(len as u16).to_be_bytes()).ok();
+            frame.push(0x80 | 126).map_err(|_| FULL)?;
+            frame
+                .extend_from_slice(&(len as u16).to_be_bytes())
+                .map_err(|_| FULL)?;
         }
-        frame.extend_from_slice(&key).ok();
+        frame.extend_from_slice(&key).map_err(|_| FULL)?;
         for (i, b) in payload.iter().enumerate() {
-            frame.push(b ^ key[i % 4]).ok();
+            frame.push(b ^ key[i % 4]).map_err(|_| FULL)?;
         }
-        write_all(self.socket, &frame).await
+        write_all(self.socket, &frame, FRAME_TIMEOUT).await
     }
 
     /// 接收一帧 (服务端帧不掩码), 返回 (opcode, payload)
     pub async fn recv_frame(&mut self) -> Result<(u8, heapless::Vec<u8, RECV_BUF>), &'static str> {
+        self.recv_frame_timeout(FRAME_TIMEOUT).await
+    }
+
+    /// 带自定义超时的接收 (握手/hello 用较长超时)
+    async fn recv_frame_timeout(
+        &mut self,
+        timeout: embassy_time::Duration,
+    ) -> Result<(u8, heapless::Vec<u8, RECV_BUF>), &'static str> {
         let mut hdr = [0u8; 2];
-        read_exact(self.socket, &mut hdr)
+        read_exact(self.socket, &mut hdr, timeout)
             .await
             .map_err(|_| "读取帧头失败")?;
         let opcode = hdr[0] & 0x0F;
@@ -128,7 +150,7 @@ impl WsClient<'_> {
         let len = match len0 {
             126 => {
                 let mut ext = [0u8; 2];
-                read_exact(self.socket, &mut ext)
+                read_exact(self.socket, &mut ext, timeout)
                     .await
                     .map_err(|_| "读取长度失败")?;
                 u16::from_be_bytes(ext) as usize
@@ -141,14 +163,14 @@ impl WsClient<'_> {
         }
         let mut mask = [0u8; 4];
         if masked {
-            read_exact(self.socket, &mut mask)
+            read_exact(self.socket, &mut mask, timeout)
                 .await
                 .map_err(|_| "读取掩码失败")?;
         }
         let mut payload = heapless::Vec::<u8, RECV_BUF>::new();
         payload.resize(len, 0).map_err(|_| "帧过长")?;
         if len > 0 {
-            read_exact(self.socket, &mut payload)
+            read_exact(self.socket, &mut payload, timeout)
                 .await
                 .map_err(|_| "读取负载失败")?;
             if masked {
@@ -186,11 +208,15 @@ pub fn decode_audio(version: u16, payload: &[u8]) -> Result<(u32, &[u8]), &'stat
 /// 单次网络读/写等待上限: 半开连接时让会话任务能退出重连
 const IO_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_secs(10);
 
-/// TCP 精确读取 N 字节
-async fn read_exact(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> Result<(), ()> {
+/// TCP 精确读取 N 字节 (每次 read 的等待上限由调用方指定)
+async fn read_exact(
+    socket: &mut TcpSocket<'_>,
+    buf: &mut [u8],
+    timeout: embassy_time::Duration,
+) -> Result<(), ()> {
     let mut done = 0;
     while done < buf.len() {
-        let n = embassy_time::with_timeout(IO_TIMEOUT, socket.read(&mut buf[done..]))
+        let n = embassy_time::with_timeout(timeout, socket.read(&mut buf[done..]))
             .await
             .map_err(|_| ())?
             .map_err(|_| ())?;
@@ -202,11 +228,15 @@ async fn read_exact(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> Result<(), ()
     Ok(())
 }
 
-/// 循环写入全部字节
-async fn write_all(socket: &mut TcpSocket<'_>, mut data: &[u8]) -> Result<(), &'static str> {
+/// 循环写入全部字节 (每次 write 的等待上限由调用方指定)
+async fn write_all(
+    socket: &mut TcpSocket<'_>,
+    mut data: &[u8],
+    timeout: embassy_time::Duration,
+) -> Result<(), &'static str> {
     while !data.is_empty() {
         let n = embassy_time::with_timeout(
-            IO_TIMEOUT,
+            timeout,
             socket.write_with(|buf| {
                 let n = usize::min(buf.len(), data.len());
                 buf[..n].copy_from_slice(&data[..n]);
@@ -253,7 +283,10 @@ pub async fn connect(
     let mut ws = WsClient { socket };
     let hello = hello_message(version);
     ws.send_text(hello.as_bytes()).await?;
-    let (opcode, payload) = ws.recv_frame().await.map_err(|_| "服务器 hello 接收失败")?;
+    let (opcode, payload) = ws
+        .recv_frame_timeout(IO_TIMEOUT)
+        .await
+        .map_err(|_| "服务器 hello 接收失败")?;
     if opcode != 1 {
         return Err("服务器首帧非文本");
     }
@@ -291,7 +324,7 @@ async fn handshake(
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: {}\r\n\
              Sec-WebSocket-Version: 13\r\n\
-             Authorization: Bearer xiaozhi-test\r\n\
+             Authorization: Bearer {}\r\n\
              Protocol-Version: {}\r\n\
              Device-Id: {}\r\n\
              Client-Id: {}\r\n\
@@ -300,13 +333,14 @@ async fn handshake(
             server,
             WS_PORT,
             key_b64.as_str(),
+            WS_TOKEN,
             version,
             mac,
             mac
         ),
     );
 
-    write_all(socket, req.as_bytes())
+    write_all(socket, req.as_bytes(), IO_TIMEOUT)
         .await
         .map_err(|_| "握手请求发送失败")?;
 
@@ -333,43 +367,44 @@ async fn handshake(
         }
     }
     let head = core::str::from_utf8(&resp).unwrap_or("");
-    if !head.contains("101") {
-        return Err("WS 升级失败");
+
+    // 严格校验状态行 (不能只 contains("101"))
+    let status = head.lines().next().unwrap_or("");
+    let mut parts = status.split_whitespace();
+    let proto = parts.next().unwrap_or("");
+    let code = parts.next().unwrap_or("");
+    if !proto.starts_with("HTTP/1.") || code != "101" {
+        return Err("WS 升级失败 (非 101)");
+    }
+
+    // Sec-WebSocket-Accept = base64(SHA1(key || GUID)), 防中间人/错误端点
+    let mut src = heapless::String::<64>::new();
+    src.push_str(key_b64.as_str()).map_err(|_| "WS key 过长")?;
+    src.push_str("258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+        .map_err(|_| "WS key 过长")?;
+    let mut expected = heapless::String::<32>::new();
+    base64_encode(&xiaozhi_core::sha1::sha1(src.as_bytes()), &mut expected);
+    match header_value(head, "Sec-WebSocket-Accept") {
+        Some(v) if v == expected.as_str() => {},
+        _ => return Err("WS Accept 校验失败"),
     }
     Ok(())
 }
 
-/// 从 JSON 文本提取 `"key":<数字>` 字段值 (服务器 hello 的 audio_params 用)
-pub fn json_num_field(json: &str, key: &str) -> Option<u32> {
-    let pat = format!("\"{key}\":");
-    let mut rest = json;
-    while let Some(i) = rest.find(&pat) {
-        let after = rest[i + pat.len()..].trim_start();
-        let digits = after.chars().take_while(|c| c.is_ascii_digit()).count();
-        if digits > 0 {
-            return after[..digits].parse().ok();
+/// 从 HTTP 响应头取字段值 (大小写不敏感; 跳过状态行)
+fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        if k.trim().eq_ignore_ascii_case(name) {
+            Some(v.trim())
+        } else {
+            None
         }
-        rest = &rest[i + pat.len()..];
-    }
-    None
+    })
 }
 
-/// 从 JSON 文本提取 `"key":"字符串"` 字段值 (服务器消息的 type/state 用)
-pub fn json_str_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
-    let pat = format!("\"{key}\":");
-    let mut rest = json;
-    while let Some(i) = rest.find(&pat) {
-        let after = rest[i + pat.len()..].trim_start();
-        if let Some(v) = after
-            .strip_prefix('"')
-            .and_then(|v| v.split_once('"').map(|(s, _)| s))
-        {
-            return Some(v);
-        }
-        rest = &rest[i + pat.len()..];
-    }
-    None
-}
+// JSON 字段扫描已下沉到 core (host 可测); 这里保持原路径兼容调用方
+pub use xiaozhi_core::json_scan::{num_field as json_num_field, str_field as json_str_field};
 
 /// base64 编码 (标准字母表, 带填充)
 fn base64_encode(input: &[u8], out: &mut heapless::String<32>) {
@@ -393,33 +428,5 @@ fn base64_encode(input: &[u8], out: &mut heapless::String<32>) {
         } else {
             '='
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn json_num_field_finds_audio_params() {
-        let hello = r#"{"type": "hello", "audio_params": {"format": "opus", "sample_rate": 16000, "frame_duration": 60}}"#;
-        assert_eq!(json_num_field(hello, "sample_rate"), Some(16000));
-        assert_eq!(json_num_field(hello, "frame_duration"), Some(60));
-        assert_eq!(json_num_field(hello, "missing"), None);
-    }
-
-    #[test]
-    fn json_num_field_takes_first_match() {
-        let s = r#"{"a":1,"b":{"a":2}}"#;
-        assert_eq!(json_num_field(s, "a"), Some(1));
-    }
-
-    #[test]
-    fn json_str_field_extracts_value() {
-        let msg = r#"{"type":"tts","state":"start","session_id":"abc"}"#;
-        assert_eq!(json_str_field(msg, "type"), Some("tts"));
-        assert_eq!(json_str_field(msg, "state"), Some("start"));
-        assert_eq!(json_str_field(msg, "session_id"), Some("abc"));
-        assert_eq!(json_str_field(msg, "nope"), None);
     }
 }

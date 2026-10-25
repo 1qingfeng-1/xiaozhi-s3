@@ -5,11 +5,43 @@
 
 use embassy_executor::Spawner;
 use embassy_net::{Ipv4Address, Ipv4Cidr, Stack, StackResources, tcp, udp};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::{Channel, Sender};
+use embassy_time::{Duration, with_timeout};
 use esp_storage::FlashStorage;
 
-use defmt::{error, info};
+use defmt::{error, info, warn};
 
 use alloc::format;
+
+/// 配网 HTTP 单次读写上限: 防止恶意/异常客户端永久占住 socket
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// accept 等待上限: 超时后回收 socket, 避免半死监听
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+/// 并发 HTTP 资源任务数与 socket 池大小 (必须一致)
+const POOL_SIZE: usize = 4;
+type SocketPool = Channel<CriticalSectionRawMutex, tcp::TcpSocket<'static>, POOL_SIZE>;
+
+/// 从 PSRAM 分配 socket 缓冲 (失败回退内部堆)
+///
+/// 配网模式在音频启动前运行, 内部堆余量充足; 仍优先 PSRAM 以免占用
+/// 后续会话所需的内部 RAM。
+fn alloc_socket_buf(len: usize) -> &'static mut [u8] {
+    use core::alloc::Layout;
+    let layout = Layout::from_size_align(len, 4).expect("bad layout");
+    // SAFETY: 非零布局, 分配块常驻
+    let p =
+        unsafe { esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::External.into(), layout) };
+    if p.is_null() {
+        alloc::vec![0u8; len].leak()
+    } else {
+        // SAFETY: 可写 len 字节; 清零避免脏数据
+        unsafe {
+            core::ptr::write_bytes(p, 0, len);
+            core::slice::from_raw_parts_mut(p, len)
+        }
+    }
+}
 
 /// 配网 AP 的 IP
 const AP_ADDR: [u8; 4] = [192, 168, 4, 1];
@@ -24,8 +56,14 @@ pub async fn run(
     wifi_peri: esp_hal::peripherals::WIFI<'static>,
     flash: &'static mut FlashStorage<'static>,
 ) -> ! {
+    // 配网热点不再开放: 旁观者可被动抓包拿到家庭 WiFi 密码。
+    // 密码为固定出厂值, 文档/启动日志会打印; 需要更强隔离时改为一次性 PIN。
+    const AP_PASSWORD: &str = "xiaozhi-setup";
     let ap_config = esp_radio::wifi::Config::AccessPoint(
-        esp_radio::wifi::ap::AccessPointConfig::default().with_ssid("xiaozhi-gezipai"),
+        esp_radio::wifi::ap::AccessPointConfig::default()
+            .with_ssid("xiaozhi-gezipai")
+            .with_password(alloc::string::String::from(AP_PASSWORD))
+            .with_auth_method(esp_radio::wifi::AuthenticationMethod::Wpa2Personal),
     );
     let interface = esp_radio::wifi::Interface::access_point();
     let _controller = match esp_radio::wifi::WifiController::new(
@@ -54,9 +92,20 @@ pub async fn run(
     );
     spawner.spawn(net_task(runner).unwrap());
 
-    info!("配网模式: 热点 xiaozhi-gezipai, 配置页 http://192.168.4.1:8080/");
+    info!(
+        "配网模式: 热点 xiaozhi-gezipai (密码 {}), 配置页 http://192.168.4.1:8080/",
+        AP_PASSWORD
+    );
     spawner.spawn(dhcp_server(stack).unwrap());
-    http_accept_loop(spawner, stack, flash).await
+
+    // socket 池: 一次分配、跨连接复用; 每个连接不再 leak 缓冲
+    let pool = crate::mk_static!(SocketPool, SocketPool::new());
+    for _ in 0..POOL_SIZE {
+        let rx = alloc_socket_buf(2048);
+        let tx = alloc_socket_buf(2048);
+        let _ = pool.try_send(tcp::TcpSocket::new(stack, rx, tx));
+    }
+    http_accept_loop(spawner, stack, flash, pool).await
 }
 
 #[embassy_executor::task]
@@ -171,6 +220,27 @@ fn dhcp_option(req: &[u8], code: u8) -> Option<u8> {
 const VUE_JS: &str = include_str!("../../assets/wifi-config/vue.global.prod.js");
 const INDEX_HTML: &str = include_str!("../../assets/wifi-config/index.html");
 
+/// 带超时的分块写: 客户端不读/半开时最多阻塞 `IO_TIMEOUT`
+async fn write_all_bounded(socket: &mut tcp::TcpSocket<'_>, mut data: &[u8]) -> bool {
+    while !data.is_empty() {
+        let n = match with_timeout(
+            IO_TIMEOUT,
+            socket.write_with(|buf| {
+                let n = usize::min(buf.len(), data.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                (n, n)
+            }),
+        )
+        .await
+        {
+            Ok(Ok(n)) if n > 0 => n,
+            _ => return false,
+        };
+        data = &data[n..];
+    }
+    true
+}
+
 /// 发送完整 HTTP 响应 (头部 + 分块写 body + 官方验证过的关闭时序)
 async fn serve_bytes(socket: &mut tcp::TcpSocket<'_>, ctype: &str, body: &[u8]) {
     let head = format!(
@@ -178,66 +248,56 @@ async fn serve_bytes(socket: &mut tcp::TcpSocket<'_>, ctype: &str, body: &[u8]) 
         ctype,
         body.len()
     );
-    // 零拷贝分块写: 头部与正文直接从源切片写出 (大文件不进堆,
-    // WiFi 协议栈已占用内部堆大部分, 158KB 级 Vec 会 OOM panic)
-    let mut head_slice = head.as_str();
-    while !head_slice.is_empty() {
-        let n = socket
-            .write_with(|buf| {
-                let n = usize::min(buf.len(), head_slice.len());
-                buf[..n].copy_from_slice(&head_slice.as_bytes()[..n]);
-                (n, n)
-            })
-            .await
-            .unwrap_or(0);
-        if n == 0 {
-            break;
-        }
-        head_slice = &head_slice[n..];
+    // 零拷贝分块写: 头部与正文直接从源切片写出 (大文件不进堆)
+    if !write_all_bounded(socket, head.as_str().as_bytes()).await
+        || !write_all_bounded(socket, body).await
+    {
+        socket.abort();
+        return;
     }
-    let mut body_slice = body;
-    while !body_slice.is_empty() {
-        let n = socket
-            .write_with(|buf| {
-                let n = usize::min(buf.len(), body_slice.len());
-                buf[..n].copy_from_slice(&body_slice[..n]);
-                (n, n)
-            })
-            .await
-            .unwrap_or(0);
-        if n == 0 {
-            break;
-        }
-        body_slice = &body_slice[n..];
+    if !matches!(with_timeout(IO_TIMEOUT, socket.flush()).await, Ok(Ok(()))) {
+        socket.abort();
+        return;
     }
-    let _ = socket.flush().await;
     // 官方验证过的时序: flush 后延时, close 后延时, 再 abort
-    embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)).await;
+    embassy_time::Timer::after(Duration::from_millis(1000)).await;
     socket.close();
-    embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)).await;
+    embassy_time::Timer::after(Duration::from_millis(1000)).await;
     socket.abort();
 }
 
-/// HTTP 接受循环: 监听窗口最小化 — 连接一建立立即重建监听,
-/// 页面/JS 请求放入池化任务并行处理 (浏览器紧随 HTML 的 /vue.js 请求不会被 RST)
+/// HTTP 接受循环: socket 从池中取用, 处理完归还, 不再每连接泄漏 4KB。
+///
+/// 并发上限 = `POOL_SIZE`; 池空时 accept 循环等待, 由 TCP 栈对超额连接
+/// 反压/拒绝。任务池大小与 socket 池一致, 因此 `spawn` 不会 `Busy`。
 async fn http_accept_loop(
     spawner: Spawner,
-    stack: Stack<'static>,
+    _stack: Stack<'static>,
     flash: &'static mut FlashStorage<'static>,
+    pool: &'static SocketPool,
 ) -> ! {
     info!("HTTP 配置页就绪 (:8080)");
     loop {
-        let rx = alloc::vec![0u8; 2048].leak();
-        let tx = alloc::vec![0u8; 2048].leak();
-        let mut socket = tcp::TcpSocket::new(stack, rx, tx);
-        if socket.accept(8080).await.is_err() {
-            embassy_time::Timer::after(embassy_time::Duration::from_millis(50)).await;
-            continue;
+        let mut socket = pool.receive().await;
+        match with_timeout(ACCEPT_TIMEOUT, socket.accept(8080)).await {
+            Ok(Ok(())) => {},
+            _ => {
+                socket.abort();
+                let _ = pool.try_send(socket);
+                continue;
+            },
         }
         info!("HTTP: 已接受连接");
 
         let mut request = [0u8; 1024];
-        let n = socket.read(&mut request).await.unwrap_or(0);
+        let n = match with_timeout(IO_TIMEOUT, socket.read(&mut request)).await {
+            Ok(Ok(n)) => n,
+            _ => {
+                socket.abort();
+                let _ = pool.try_send(socket);
+                continue;
+            },
+        };
         let req = core::str::from_utf8(&request[..n]).unwrap_or("");
         let first_line = req.lines().next().unwrap_or("");
         let path = first_line.split_whitespace().nth(1).unwrap_or("/");
@@ -248,11 +308,17 @@ async fn http_accept_loop(
             "/save" => {
                 // 保存需要 Flash (独占借用), 走同步路径 (毫秒级, 不影响后续监听)
                 handle_save(&mut socket, query, flash).await;
+                socket.abort();
+                let _ = pool.try_send(socket);
             },
             _ => {
                 // 页面与 Vue 运行时: 无 Flash 访问, 放入池化任务并行服务
                 let path_owned = heapless::String::<32>::try_from(path_only).unwrap_or_default();
-                spawner.spawn(http_asset_task(socket, path_owned).unwrap());
+                match http_asset_task(socket, path_owned, pool.sender()) {
+                    Ok(token) => spawner.spawn(token),
+                    // 正常不可达 (socket 池大小 == 任务池大小); 不 panic
+                    Err(_) => warn!("配网: 资源任务池满, 丢弃连接"),
+                }
             },
         }
     }
@@ -260,7 +326,11 @@ async fn http_accept_loop(
 
 /// 静态资源任务: 配网页 / Vue3 运行时 / 404
 #[embassy_executor::task(pool_size = 4)]
-async fn http_asset_task(mut socket: tcp::TcpSocket<'static>, path: heapless::String<32>) {
+async fn http_asset_task(
+    mut socket: tcp::TcpSocket<'static>,
+    path: heapless::String<32>,
+    pool: Sender<'static, CriticalSectionRawMutex, tcp::TcpSocket<'static>, POOL_SIZE>,
+) {
     match path.as_str() {
         "/vue.js" => {
             serve_bytes(
@@ -282,6 +352,8 @@ async fn http_asset_task(mut socket: tcp::TcpSocket<'static>, path: heapless::St
             serve_bytes(&mut socket, "text/plain; charset=utf-8", b"404").await;
         },
     }
+    // 归还 socket (serve_bytes 已 abort), 供后续连接复用
+    let _ = pool.send(socket).await;
 }
 
 /// 处理 /save: 凭据写入 Flash 并优雅应答
@@ -292,6 +364,17 @@ async fn handle_save(socket: &mut tcp::TcpSocket<'_>, query: &str, flash: &mut F
             socket,
             "text/plain; charset=utf-8",
             "SSID 不能为空".as_bytes(),
+        )
+        .await;
+        return;
+    }
+    // 启动路径只接受 IPv4 字面量: 非法值会让 main 在 WiFi 连上后复位,
+    // 形成「连上→复位」的无限循环 (只能 BOOT 长按恢复)。
+    if server.parse::<Ipv4Address>().is_err() {
+        serve_bytes(
+            socket,
+            "text/plain; charset=utf-8",
+            "服务器地址必须是 IPv4, 例如 192.168.1.10".as_bytes(),
         )
         .await;
         return;
@@ -353,27 +436,49 @@ fn parse_query(
 }
 
 fn url_decode(s: &str) -> heapless::String<64> {
-    let mut out = heapless::String::<64>::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
+    // 先按字节解码, 最后一次性做 UTF-8 校验: 逐字节 `as char` 会把
+    // 中文/emoji 的 UTF-8 多字节序列拆成 Latin-1, 写进 NVS 后无法连接。
+    let mut bytes = [0u8; 64];
+    let mut n = 0usize;
+    let src = s.as_bytes();
+    let mut i = 0usize;
+    while i < src.len() && n < bytes.len() {
+        match src[i] {
             b'+' => {
-                let _ = out.push(' ');
+                bytes[n] = b' ';
+                n += 1;
                 i += 1;
             },
-            b'%' if i + 2 < bytes.len() => {
-                let hex = core::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("zz");
-                if let Ok(v) = u8::from_str_radix(hex, 16) {
-                    let _ = out.push(v as char);
-                }
-                i += 3;
+            b'%' if i + 2 < src.len() => match (hex_val(src[i + 1]), hex_val(src[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    bytes[n] = (hi << 4) | lo;
+                    n += 1;
+                    i += 3;
+                },
+                _ => {
+                    bytes[n] = src[i];
+                    n += 1;
+                    i += 1;
+                },
             },
             c => {
-                let _ = out.push(c as char);
+                bytes[n] = c;
+                n += 1;
                 i += 1;
             },
         }
     }
-    out
+    core::str::from_utf8(&bytes[..n])
+        .ok()
+        .and_then(|s| heapless::String::try_from(s).ok())
+        .unwrap_or_default()
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }

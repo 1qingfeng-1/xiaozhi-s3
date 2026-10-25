@@ -47,13 +47,14 @@ impl Battery {
     /// 单次采样。AdcCalCurve (basic+line+curve) 校准后返回值已是引脚电压 mV,
     /// 勿再按 12bit raw code 换算 (参考 esp-hal calibration/line.rs 文档)。
     fn read_raw_mv(&mut self) -> Option<u16> {
-        // 限次重试: ADC 持续错误时返回 None, 避免忙等卡死音频主循环
-        for _ in 0..20 {
+        // 限次重试: ADC 持续错误时返回 None, 避免忙等卡死音频主循环。
+        // 原 20×20k 自旋在异常时可达 10–30ms; 降到 5×2k (≈0.1ms)。
+        for _ in 0..5 {
             if let Ok(v) = self.adc.read_oneshot(&mut self.pin) {
                 return Some(v);
             }
             // 给 ADC/校准一点时间, 避免连续失败
-            for _ in 0..20_000 {
+            for _ in 0..2_000 {
                 core::hint::spin_loop();
             }
         }

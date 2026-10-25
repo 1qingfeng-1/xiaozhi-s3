@@ -32,7 +32,7 @@ cargo check --all
 ### 单元测试（只有 xiaozhi-core 有测试，且只能在 host 跑）
 
 ```bash
-cd xiaozhi-core && cargo +stable nextest run          # 136 个，全绿
+cd xiaozhi-core && cargo +stable nextest run          # 146 个，全绿
 cd xiaozhi-core && cargo +stable nextest run ota_crc  # 按名过滤单个测试
 cd xiaozhi-core && cargo +stable test                 # 无 nextest 时
 ```
@@ -108,8 +108,9 @@ OTA 在独立 `boot_ota_task` 中执行（不内联 main，否则 main future �
 
 ## 内存与资源硬约束
 
-- 内部堆 **128KB**，主任务栈 ≈ RWDATA 剩余（~107KB）；opus 编码 60ms 帧需 **~87KB 栈**
-  （SILK VLA 走任务栈）。改动堆大小或帧长前必须重估。
+- 内部堆 **128KB**，主任务栈 ≈ RWDATA 剩余（Channels 迁 PSRAM 后实测 ~100KB，
+  CI 下限 96KiB）；opus 编码 60ms 帧需 **~87KB 栈**（SILK VLA 走任务栈）。
+  改动堆大小或帧长前必须重估。
 - 音频 DMA 缓冲必须在**内部 RAM**；`psram_allocator!` 必须在 DMA 缓冲分配之后注册
   （`create_board` 末尾），否则 I2S 报 `DmaError(UnsupportedMemoryRegion)`。
 - embassy-net `StackResources` 按每张表计数，超容 `TcpSocket::new` 会 panic 重启：

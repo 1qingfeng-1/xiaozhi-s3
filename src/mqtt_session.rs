@@ -20,11 +20,12 @@ use embassy_time::{Duration, with_timeout};
 use defmt::{error, info, warn};
 
 use xiaozhi_core::mqtt::{self, ConnectParams, Packet};
+use xiaozhi_core::server_msg::{self, ServerMessage};
 use xiaozhi_core::udp as udp_proto;
 
 use crate::app::{
-    Channels, DROP_DOWNLINK, DownlinkPacket, OpusPacket, SessionCommand, SessionEvent, VOLUME_PCT,
-    mcp_handle,
+    Channels, DROP_DOWNLINK, DownlinkPacket, OpusPacket, SessionCommand, SessionEvent, UiMessage,
+    VOLUME_PCT, mcp_handle, ui_send, ui_text,
 };
 use crate::session::{LISTEN_START_AUTO, LISTEN_START_MANUAL, LISTEN_STOP, TTS_ABORT};
 use crate::wifi::store::MqttSettings;
@@ -45,26 +46,7 @@ pub struct MqttSessionArgs {
     pub channels: &'static Channels,
 }
 
-/// 从 PSRAM 分配字节缓冲 (失败回退内部堆)
-///
-/// 内部堆只有 128KB: MQTT/WS 两个会话任务不会同时存在, 但 20KB 网络缓冲
-/// 留在内部会把水位推到 95%+ (真机实测), 触发分配失败/panic。
-fn psram_bytes(len: usize) -> &'static mut [u8] {
-    use core::alloc::Layout;
-    let layout = Layout::from_size_align(len, 4).expect("bad layout");
-    // SAFETY: 非零布局; 分配块常驻 (泄漏至重启)
-    let p =
-        unsafe { esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::External.into(), layout) };
-    if p.is_null() {
-        alloc::vec![0u8; len].leak()
-    } else {
-        // SAFETY: alloc_caps 返回 len 字节可写内存; 清零避免脏数据
-        unsafe {
-            core::ptr::write_bytes(p, 0, len);
-            core::slice::from_raw_parts_mut(p, len)
-        }
-    }
-}
+use crate::mem::psram_bytes;
 
 fn now_ms() -> u64 {
     esp_hal::time::Instant::now()
@@ -73,19 +55,25 @@ fn now_ms() -> u64 {
 }
 
 /// 解析 `host:port` (OTA 下发的 MQTT endpoint)
-fn parse_endpoint(s: &str) -> Option<(Ipv4Address, u16)> {
+pub fn parse_endpoint(s: &str) -> Option<(Ipv4Address, u16)> {
     let (host, port) = s.rsplit_once(':')?;
     Some((host.parse().ok()?, port.parse().ok()?))
 }
 
 /// 单次网络读/写等待上限: 半开连接时让会话任务能退出重连
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// 会话主循环的单帧读上限: 慢帧不能把上行通道 (≈1.4s) 拖爆
+const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// TCP 精确读取 N 字节
-async fn read_exact(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> Result<(), &'static str> {
+/// TCP 精确读取 N 字节 (自定义单次读超时)
+async fn read_exact_timeout(
+    socket: &mut TcpSocket<'_>,
+    buf: &mut [u8],
+    timeout: Duration,
+) -> Result<(), &'static str> {
     let mut done = 0;
     while done < buf.len() {
-        let n = with_timeout(IO_TIMEOUT, socket.read(&mut buf[done..]))
+        let n = with_timeout(timeout, socket.read(&mut buf[done..]))
             .await
             .map_err(|_| "读取超时")?
             .map_err(|_| "读取失败")?;
@@ -127,8 +115,17 @@ async fn read_packet(
     socket: &mut TcpSocket<'_>,
     buf: &mut [u8],
 ) -> Result<Option<usize>, &'static str> {
+    read_packet_timeout(socket, buf, IO_TIMEOUT).await
+}
+
+/// 读一个完整 MQTT 报文, 单次读超时可配置 (主循环用 FRAME_TIMEOUT)
+async fn read_packet_timeout(
+    socket: &mut TcpSocket<'_>,
+    buf: &mut [u8],
+    timeout: Duration,
+) -> Result<Option<usize>, &'static str> {
     let mut hdr = [0u8; 5];
-    read_exact(socket, &mut hdr[..1]).await?;
+    read_exact_timeout(socket, &mut hdr[..1], timeout).await?;
     let mut remaining = 0usize;
     let mut mult = 1usize;
     let mut n = 1usize;
@@ -136,7 +133,7 @@ async fn read_packet(
         if n >= hdr.len() {
             return Err("剩余长度非法");
         }
-        read_exact(socket, &mut hdr[n..n + 1]).await?;
+        read_exact_timeout(socket, &mut hdr[n..n + 1], timeout).await?;
         let b = hdr[n];
         n += 1;
         remaining += (b & 0x7F) as usize * mult;
@@ -146,19 +143,30 @@ async fn read_packet(
         }
     }
     if n + remaining > buf.len() {
-        // 超长报文: 丢弃剩余字节
-        let mut left = remaining;
-        let mut scratch = [0u8; 256];
-        while left > 0 {
-            let take = left.min(scratch.len());
-            read_exact(socket, &mut scratch[..take]).await?;
-            left -= take;
+        // 超长报文: 设硬上限并限时丢弃。剩余长度字段最大可声明 268MB,
+        // 逐 256B 同步丢弃会被慢速对端拖住数分钟 (看门狗也监控不到)。
+        if remaining > 64 * 1024 {
+            return Err("MQTT 报文过大");
+        }
+        let drained = with_timeout(Duration::from_secs(10), async {
+            let mut left = remaining;
+            let mut scratch = [0u8; 256];
+            while left > 0 {
+                let take = left.min(scratch.len());
+                read_exact_timeout(socket, &mut scratch[..take], timeout).await?;
+                left -= take;
+            }
+            Ok::<(), &'static str>(())
+        })
+        .await;
+        if !matches!(drained, Ok(Ok(()))) {
+            return Err("丢弃超长报文超时");
         }
         warn!("MQTT 报文过长 ({}B), 已丢弃", remaining);
         return Ok(None);
     }
     buf[..n].copy_from_slice(&hdr[..n]);
-    read_exact(socket, &mut buf[n..n + remaining]).await?;
+    read_exact_timeout(socket, &mut buf[n..n + remaining], timeout).await?;
     Ok(Some(n + remaining))
 }
 
@@ -184,7 +192,6 @@ async fn connect_mqtt(
     port: u16,
     buf: &mut [u8],
     out: &mut [u8],
-    channels: &Channels,
 ) -> Result<(), &'static str> {
     socket.abort();
     socket
@@ -232,12 +239,29 @@ async fn connect_mqtt(
                 break;
             },
             Some((Packet::Publish(p), _)) => {
+                // QoS1 必须回 PUBACK, 否则 broker 会反复重发
+                // (MCP 的 set_volume/reboot 会被重复执行)
+                if let Some(id) = p.packet_id {
+                    if let Ok(n) = mqtt::encode_puback(id, out) {
+                        let _ = write_all(socket, &out[..n]).await;
+                    }
+                }
+                if p.topic != cfg.subscribe_topic.as_str() {
+                    continue;
+                }
                 let text = core::str::from_utf8(p.payload).unwrap_or("");
                 if crate::session::json_str_field(text, "type") == Some("mcp") {
                     let volume = VOLUME_PCT.load(core::sync::atomic::Ordering::Relaxed);
-                    if let Some(resp) = mcp_handle(text, volume, channels) {
-                        let _ =
-                            publish(socket, out, cfg.publish_topic.as_str(), resp.as_bytes()).await;
+                    if let Some(resp) = mcp_handle(text, volume) {
+                        if publish(socket, out, cfg.publish_topic.as_str(), resp.as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            crate::app::MCP_REBOOT
+                                .store(false, core::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            crate::app::mcp_maybe_reboot().await;
+                        }
                     }
                 }
             },
@@ -282,10 +306,10 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
     let udp_buf = psram_bytes(UDP_BUF);
     // UDP 收缓冲要能吸收 TTS 突发: 服务器/网关按 WS 到达节奏转发, 短缓冲
     // (2KB≈2 包) 会静默丢包 → opus 解码断点 → 长句卡顿/杂音 (真机复现)
-    let udp_rx_meta: &'static mut [PacketMetadata] = alloc::vec![PacketMetadata::EMPTY; 64].leak();
+    let udp_rx_meta: &'static mut [PacketMetadata] = alloc::vec![PacketMetadata::EMPTY; 128].leak();
     let udp_tx_meta: &'static mut [PacketMetadata] = alloc::vec![PacketMetadata::EMPTY; 8].leak();
-    // 32KB ≈ 30 包: TTS 合成快于实时, 服务器会成串下发, 缓冲不足会静默丢包
-    let udp_rx = psram_bytes(32 * 1024);
+    // 64KB ≈ 50 包: TTS 合成快于实时, 服务器会成串下发, 缓冲不足会静默丢包
+    let udp_rx = psram_bytes(64 * 1024);
     let udp_tx = psram_bytes(4096);
     let mut udp = UdpSocket::new(stack, udp_rx_meta, udp_rx, udp_tx_meta, udp_tx);
     if udp.bind(0).is_err() {
@@ -301,6 +325,10 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
     let mut udp_seq: u32 = 0;
     let mut last_ping = now_ms();
     let mut last_try = 0u64;
+    // 等 PINGRESP 的起点; Some 表示已发 PINGREQ 未收到响应
+    let mut awaiting_pong: Option<u64> = None;
+    // 指数退避重连间隔 (3s → 6s → … → 30s)
+    let mut retry_ms: u64 = RECONNECT_MS;
     // 当前会话 id: 网关关闭旧 bridge 时会补发一条带**旧 session_id** 的
     // goodbye, 设备必须按 id 过滤, 否则新会话刚建立就被判为关闭。
     let mut session_id: heapless::String<48> = heapless::String::new();
@@ -311,13 +339,16 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
     let mut down_pkts: u32 = 0;
     let mut down_bytes: u64 = 0;
     // 下行序列连续性: 丢包会让 opus 解码出现断点 (长句卡顿/杂音)
-    let mut last_seq: Option<u32> = None;
+    let mut have_seq = false;
     let mut max_seq: u32 = 0;
     let mut seq_gaps: u32 = 0;
-    // 迟到包: seq 小于已见最大值的包 (乱序证据)
+    // 迟到/重复包: 序号不新于已见最大值的包
     let mut late_pkts: u32 = 0;
+    // 来源不匹配的 UDP 包 (任意主机注入)
+    let mut bad_src: u32 = 0;
 
     loop {
+        crate::app::SESSION_HEARTBEAT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // ---- WiFi 掉线: 关闭连接, 等链路恢复后重连 ----
         if connected && !stack.is_link_up() {
             warn!("WiFi 链路断开 — 关闭 MQTT 会话");
@@ -400,32 +431,26 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                         .await;
                     }
                 },
-                Ok(SessionCommand::SetVolume(_)) => { /* 音频主循环执行 */ },
                 Err(_) => break,
             }
         }
 
-        // ---- 未连接: 定时重连 ----
+        // ---- 未连接: 指数退避重连 ----
         if !connected {
             let now = now_ms();
-            if now.saturating_sub(last_try) >= RECONNECT_MS {
+            if now.saturating_sub(last_try) >= retry_ms {
                 last_try = now;
+                let delay = retry_ms;
                 match with_timeout(
                     Duration::from_secs(15),
-                    connect_mqtt(
-                        &mut socket,
-                        &config,
-                        host,
-                        port,
-                        read_buf,
-                        out_buf,
-                        channels,
-                    ),
+                    connect_mqtt(&mut socket, &config, host, port, read_buf, out_buf),
                 )
                 .await
                 {
                     Ok(Ok(())) => {
                         connected = true;
+                        retry_ms = RECONNECT_MS;
+                        awaiting_pong = None;
                         last_ping = now_ms();
                         if want_connect {
                             want_connect = false;
@@ -444,10 +469,14 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                             }
                         }
                     },
-                    Ok(Err(e)) => info!("MQTT 连接失败: {} ({}ms 后重试)", e, RECONNECT_MS),
+                    Ok(Err(e)) => {
+                        info!("MQTT 连接失败: {} ({}ms 后重试)", e, delay);
+                        retry_ms = (retry_ms * 2).min(30_000);
+                    },
                     Err(_) => {
                         socket.abort();
-                        info!("MQTT 握手超时 (15s), {}ms 后重试", RECONNECT_MS)
+                        info!("MQTT 握手超时 (15s), {}ms 后重试", delay);
+                        retry_ms = (retry_ms * 2).min(30_000);
                     },
                 }
             }
@@ -477,7 +506,7 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
             if !socket.can_recv() {
                 break;
             }
-            let n = match read_packet(&mut socket, read_buf).await {
+            let n = match read_packet_timeout(&mut socket, read_buf, FRAME_TIMEOUT).await {
                 Ok(Some(n)) => n,
                 Ok(None) => continue, // 超长报文已丢弃
                 Err(e) => {
@@ -493,13 +522,25 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
             };
             match packet {
                 Packet::Publish(p) => {
+                    // QoS1: 立即回 PUBACK, 防止 broker 重发导致 MCP 重复执行
+                    if let Some(id) = p.packet_id {
+                        if let Ok(n) = mqtt::encode_puback(id, out_buf) {
+                            if write_all(&mut socket, &out_buf[..n]).await.is_err() {
+                                connected = false;
+                                channels.event.send(SessionEvent::Closed).await;
+                                break;
+                            }
+                        }
+                    }
+                    if p.topic != config.subscribe_topic.as_str() {
+                        crate::diag!("MQTT: 忽略非订阅 topic {}", p.topic);
+                        continue;
+                    }
                     let text = core::str::from_utf8(p.payload).unwrap_or("");
-                    let mtype = crate::session::json_str_field(text, "type");
-                    let state = crate::session::json_str_field(text, "state");
-                    match (mtype, state) {
-                        (Some("hello"), _) => {
+                    match server_msg::parse(text) {
+                        ServerMessage::Hello => {
                             awaiting_hello = false;
-                            last_seq = None;
+                            have_seq = false;
                             max_seq = 0;
                             seq_gaps = 0;
                             late_pkts = 0;
@@ -521,8 +562,9 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                                 #[cfg(feature = "tts-selftest")]
                                 {
                                     embassy_time::Timer::after(Duration::from_millis(3000)).await;
+                                    // mock LLM 对含「长/测试/讲」的文本返回长回复
                                     let req = "{\"type\":\"listen\",\"state\":\"detect\",\
-                                        \"text\":\"请详细介绍人工智能的发展历史，尽量详细一些。\"}";
+                                        \"text\":\"请讲一段长文本测试播放稳定性。\"}";
                                     if publish(
                                         &mut socket,
                                         out_buf,
@@ -537,21 +579,58 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                                 }
                             }
                         },
-                        (Some("tts"), Some("start")) => {
+                        ServerMessage::TtsStart => {
                             DROP_DOWNLINK.store(false, core::sync::atomic::Ordering::Relaxed);
                             down_pkts = 0;
                             down_bytes = 0;
                             info!("服务器: tts start");
                             channels.event.send(SessionEvent::TtsStart).await;
                         },
-                        (Some("tts"), Some("stop")) => {
+                        ServerMessage::TtsStop => {
                             info!(
-                                "服务器: tts stop (下行 {} 包 {}B, 断序 {}, 迟到 {}, max_seq {})",
-                                down_pkts, down_bytes, seq_gaps, late_pkts, max_seq
+                                "服务器: tts stop (下行 {} 包 {}B, 断序 {}, 迟到 {}, 非法源 {}, max_seq {})",
+                                down_pkts, down_bytes, seq_gaps, late_pkts, bad_src, max_seq
                             );
                             channels.event.send(SessionEvent::TtsStop).await;
                         },
-                        (Some("goodbye"), _) => {
+                        ServerMessage::TtsSentenceStart(t) => {
+                            info!("服务器: 朗读 \"{}\"", t);
+                            ui_send(channels, UiMessage::AssistantText(ui_text::<160>(t)));
+                        },
+                        ServerMessage::Stt(t) => {
+                            info!("服务器: 识别 \"{}\"", t);
+                            ui_send(channels, UiMessage::UserText(ui_text::<160>(t)));
+                        },
+                        ServerMessage::Llm { emotion } => {
+                            info!("服务器: 情绪 {}", emotion);
+                            ui_send(channels, UiMessage::Emotion(ui_text::<24>(emotion)));
+                        },
+                        ServerMessage::Alert {
+                            status,
+                            message,
+                            emotion,
+                        } => {
+                            warn!("服务器 alert: {} / {}", status, message);
+                            ui_send(
+                                channels,
+                                UiMessage::Alert {
+                                    status: ui_text::<32>(status),
+                                    message: ui_text::<96>(message),
+                                    emotion: ui_text::<24>(emotion),
+                                },
+                            );
+                        },
+                        ServerMessage::System { command } => {
+                            if command == "reboot" {
+                                info!("服务器: 远程重启");
+                                crate::app::MCP_REBOOT
+                                    .store(true, core::sync::atomic::Ordering::Relaxed);
+                                crate::app::mcp_maybe_reboot().await;
+                            } else {
+                                warn!("服务器: 未知 system 命令 {}", command);
+                            }
+                        },
+                        ServerMessage::Goodbye => {
                             let sid =
                                 crate::session::json_str_field(text, "session_id").unwrap_or("");
                             if awaiting_hello {
@@ -570,13 +649,14 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                                 channels.event.send(SessionEvent::Closed).await;
                             }
                         },
-                        (Some("error"), _) => {
-                            warn!("服务器错误: {}", text);
-                            channels.event.send(SessionEvent::Closed).await;
+                        ServerMessage::Error { message } => {
+                            warn!("服务器错误: {}", message);
+                            udp_ready = false;
+                            channels.event.send(SessionEvent::Error).await;
                         },
-                        (Some("mcp"), _) => {
+                        ServerMessage::Mcp => {
                             let volume = VOLUME_PCT.load(core::sync::atomic::Ordering::Relaxed);
-                            if let Some(resp) = mcp_handle(text, volume, channels) {
+                            if let Some(resp) = mcp_handle(text, volume) {
                                 info!("MCP 应答: {}", resp.as_str());
                                 if publish(
                                     &mut socket,
@@ -587,17 +667,23 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                                 .await
                                 .is_err()
                                 {
+                                    crate::app::MCP_REBOOT
+                                        .store(false, core::sync::atomic::Ordering::Relaxed);
                                     connected = false;
                                     channels.event.send(SessionEvent::Closed).await;
+                                } else {
+                                    crate::app::mcp_maybe_reboot().await;
                                 }
                             }
                         },
-                        _ => {
+                        ServerMessage::Custom | ServerMessage::Unknown(_) => {
                             crate::diag!("服务器: {}", text);
                         },
                     }
                 },
-                Packet::PingResp => {},
+                Packet::PingResp => {
+                    awaiting_pong = None;
+                },
                 Packet::Other { kind } => {
                     crate::diag!("MQTT 报文 type={}", kind);
                     let _ = kind;
@@ -635,46 +721,71 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
             let Some(aes) = aes_key.as_ref() else {
                 continue;
             };
-            for _ in 0..32 {
+            for _ in 0..64 {
                 let recv = with_timeout(Duration::from_millis(1), udp.recv_from(udp_buf)).await;
-                let Ok(Ok((n, _meta))) = recv else {
+                let Ok(Ok((n, meta))) = recv else {
                     break;
                 };
+                // 只接受 hello 下发的服务器地址/端口: 同 LAN 任意主机都能
+                // 向本机 UDP 端口发包, 不校验会把随机数据送进 opus 解码。
+                let Some((addr, port)) = udp_addr else {
+                    continue;
+                };
+                if !matches!(meta.endpoint.addr, embassy_net::IpAddress::Ipv4(ip) if ip == addr)
+                    || meta.endpoint.port != port
+                {
+                    bad_src = bad_src.saturating_add(1);
+                    continue;
+                }
                 let Some(hdr) = udp_proto::parse_header(&udp_buf[..n]) else {
                     continue;
                 };
                 if hdr.msg_type != 1 || hdr.payload_len as usize != n - udp_proto::UDP_HEADER_LEN {
                     continue;
                 }
-                if let Some(prev) = last_seq {
-                    let expect = prev.wrapping_add(1);
-                    if hdr.sequence != expect {
+                // ssrc 必须等于 hello nonce 里的连接 id: 重连/新会话期间旧连接的
+                // 在途包序号可能比新会话大, 不校验会把新会话所有包判成「迟到」。
+                let hello_ssrc =
+                    u32::from_be_bytes([udp_nonce[4], udp_nonce[5], udp_nonce[6], udp_nonce[7]]);
+                if hdr.ssrc != hello_ssrc {
+                    bad_src = bad_src.saturating_add(1);
+                    continue;
+                }
+                // 序号: 用序号回绕比较, 先丢弃迟到/重复包, 再算缺口。
+                // 旧实现先按 last_seq 算缺口, 一个迟到包会污染后续判断并
+                // 凭空插入 PLC 帧 (杂音)。
+                let seq = hdr.sequence;
+                if have_seq {
+                    let diff = seq.wrapping_sub(max_seq);
+                    if diff == 0 || diff >= 0x8000_0000 {
+                        late_pkts = late_pkts.saturating_add(1);
+                        continue;
+                    }
+                    if diff > 1 {
                         seq_gaps += 1;
-                        let missing = hdr.sequence.wrapping_sub(expect);
+                        let missing = diff - 1;
                         if seq_gaps <= 5 || seq_gaps.is_multiple_of(50) {
                             warn!(
                                 "UDP 下行不连续: seq {} → {} (缺 {}) 累计 {}",
-                                prev, hdr.sequence, missing, seq_gaps
+                                max_seq, seq, missing, seq_gaps
                             );
                         }
                         // 丢包隐藏: 通知音频侧补 PLC 帧 (最多 4 帧, 防通道拥塞)
-                        if missing > 0 && missing < 64 {
-                            channels
-                                .downlink
-                                .send(DownlinkPacket {
-                                    timestamp: 0,
-                                    data: OpusPacket::new(),
-                                    lost: missing.min(4) as u8,
-                                })
-                                .await;
+                        if missing < 64 {
+                            let send = channels.downlink.send(DownlinkPacket {
+                                timestamp: 0,
+                                data: OpusPacket::new(),
+                                lost: missing.min(4) as u8,
+                            });
+                            if with_timeout(Duration::from_secs(2), send).await.is_err() {
+                                warn!("下行通道拥塞, 丢弃 PLC");
+                            }
                         }
                     }
+                } else {
+                    have_seq = true;
                 }
-                last_seq = Some(hdr.sequence);
-                if hdr.sequence < max_seq {
-                    late_pkts += 1;
-                }
-                max_seq = max_seq.max(hdr.sequence);
+                max_seq = seq;
                 if DROP_DOWNLINK.load(core::sync::atomic::Ordering::Relaxed) {
                     continue;
                 }
@@ -688,26 +799,41 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
                 {
                     down_pkts += 1;
                     down_bytes += data.len() as u64;
-                    channels
-                        .downlink
-                        .send(DownlinkPacket {
-                            timestamp: hdr.timestamp,
-                            data,
-                            lost: 0,
-                        })
-                        .await;
+                    let send = channels.downlink.send(DownlinkPacket {
+                        timestamp: hdr.timestamp,
+                        data,
+                        lost: 0,
+                    });
+                    if with_timeout(Duration::from_secs(2), send).await.is_err() {
+                        warn!("下行通道拥塞, 丢弃一帧");
+                    }
                 }
             }
         }
 
         // ---- 心跳 ----
-        if now_ms().saturating_sub(last_ping) >= KEEPALIVE_SECS as u64 * 500 {
-            last_ping = now_ms();
+        let now = now_ms();
+        if now.saturating_sub(last_ping) >= KEEPALIVE_SECS as u64 * 500 {
+            last_ping = now;
             if write_all(&mut socket, &mqtt::PINGREQ_FRAME).await.is_err() {
                 connected = false;
                 udp_ready = false;
+                awaiting_pong = None;
                 channels.event.send(SessionEvent::Closed).await;
+            } else {
+                awaiting_pong = Some(now);
             }
+        }
+        // 半开连接: broker 已死但 TCP 仍 Established 时, PINGRESP 不会回来
+        if let Some(sent) = awaiting_pong
+            && now.saturating_sub(sent) > 10_000
+        {
+            warn!("MQTT PINGRESP 超时 (10s), 重连");
+            socket.abort();
+            connected = false;
+            udp_ready = false;
+            awaiting_pong = None;
+            channels.event.send(SessionEvent::Closed).await;
         }
 
         embassy_time::Timer::after(Duration::from_millis(5)).await;

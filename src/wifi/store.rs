@@ -34,6 +34,9 @@ pub fn save(flash: &mut FlashStorage<'_>, config: &WifiConfig) -> Result<(), &'s
         buf[o..o + part.len()].copy_from_slice(part);
         o += part.len();
     }
+    // 末尾 CRC: 部分写入/位翻转不能当成有效凭据
+    let crc = xiaozhi_core::ota::crc32_init_xorout(&buf[..o], 0, 0xFFFF_FFFF);
+    buf[o..o + 4].copy_from_slice(&crc.to_le_bytes());
 
     NorFlash::erase(flash, SECTOR, SECTOR + SECTOR_SIZE).map_err(|_| "Flash 擦除失败")?;
     NorFlash::write(flash, SECTOR, &buf).map_err(|_| "Flash 写入失败")
@@ -69,6 +72,15 @@ pub fn load(flash: &mut FlashStorage<'_>) -> Option<WifiConfig> {
     let ssid = next(32)?;
     let password = next(64)?;
     let server = next(64)?;
+    drop(next);
+
+    // CRC 校验: 旧格式末尾为 0x00, 视为 legacy 接受; 非零且不匹配视为损坏。
+    let crc_stored = u32::from_le_bytes(buf.get(o..o + 4)?.try_into().ok()?);
+    let crc_calc = xiaozhi_core::ota::crc32_init_xorout(&buf[..o], 0, 0xFFFF_FFFF);
+    if crc_stored != 0 && crc_stored != crc_calc {
+        defmt::error!("凭据 CRC 校验失败 (存储损坏)");
+        return None;
+    }
 
     Some(WifiConfig {
         ssid: heapless::String::try_from(core::str::from_utf8(ssid).ok()?).ok()?,
@@ -84,27 +96,72 @@ pub fn clear(flash: &mut FlashStorage<'_>) -> Result<(), &'static str> {
 
 /// 音量持久化 — NVS 分区独立扇区 (0xD000, 与凭据 0xE000 分离)
 const VOLUME_SECTOR: u32 = 0xD000;
+const VOLUME_SECTOR_SIZE: u32 = 4096;
+/// 单条记录 4 字节 (首字节音量), 按 4B 对齐追加, 避免整扇区擦除
+const VOLUME_RECORD: usize = 4;
 
-/// 保存音量 (0~100; 0xFF = 擦除态 → 默认 60)
+/// 下一条可编程记录的偏移 (0 = 尚未扫描)
+static VOLUME_NEXT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
+/// 扫描扇区: 返回 (最后一条有效音量, 下一条空闲记录偏移)
+///
+/// 记录按 4B 槽追加; 首字节 0xFF 视为空闲槽。旧格式 (首字节音量 +
+/// 其余 0xFF) 天然兼容: 扫描到槽 1 时返回音量并定位到偏移 4。
+fn scan_volume(flash: &mut FlashStorage<'_>) -> (u8, u16) {
+    let mut buf = [0u8; 64];
+    let mut last = 60u8;
+    let mut off = 0u32;
+    while off < VOLUME_SECTOR_SIZE {
+        if flash.read(VOLUME_SECTOR + off, &mut buf).is_err() {
+            return (last, off as u16);
+        }
+        let mut i = 0usize;
+        while i + VOLUME_RECORD <= buf.len() {
+            if buf[i] == 0xFF {
+                return (last, (off as usize + i) as u16);
+            }
+            last = buf[i].min(100);
+            i += VOLUME_RECORD;
+        }
+        off += buf.len() as u32;
+    }
+    (last, VOLUME_SECTOR_SIZE as u16)
+}
+
+/// 保存音量 (0~100): 追加一条 4B 记录, 不擦扇区
+///
+/// 旧实现每次调节都擦 4KB (25–100ms), 而调用点在音频主循环里。
+/// 追加写只编程 4B, 扇区写满 (约 1024 次调节) 才擦除一次。
 pub fn save_volume(flash: &mut FlashStorage<'_>, volume: u8) {
-    // 只写首字节, 避免 4KB 栈缓冲 (调用点在音频主循环, 编码栈已 ~87KB)
-    let word = [volume.min(100), 0xFF, 0xFF, 0xFF];
-    if let Err(e) = NorFlash::erase(flash, VOLUME_SECTOR, VOLUME_SECTOR + 4096) {
-        defmt::error!("音量保存: 擦除失败 {:?}", e);
+    use core::sync::atomic::Ordering;
+    let v = volume.min(100);
+    let mut next = VOLUME_NEXT.load(Ordering::Relaxed);
+    if next == 0 {
+        // 尚未 load_volume (或首次写入): 先定位空闲槽
+        let (_, n) = scan_volume(flash);
+        next = n;
+    }
+    if next as u32 + VOLUME_RECORD as u32 > VOLUME_SECTOR_SIZE {
+        if let Err(e) = NorFlash::erase(flash, VOLUME_SECTOR, VOLUME_SECTOR + VOLUME_SECTOR_SIZE) {
+            defmt::error!("音量保存: 擦除失败 {:?}", e);
+            return;
+        }
+        next = 0;
+    }
+    let word = [v, 0xFF, 0xFF, 0xFF];
+    if let Err(e) = NorFlash::write(flash, VOLUME_SECTOR + next as u32, &word) {
+        defmt::error!("音量保存: 写入失败 {:?}", e);
         return;
     }
-    if let Err(e) = NorFlash::write(flash, VOLUME_SECTOR, &word) {
-        defmt::error!("音量保存: 写入失败 {:?}", e);
-    }
+    VOLUME_NEXT.store(next + VOLUME_RECORD as u16, Ordering::Relaxed);
 }
 
 /// 读取音量 (无记录/擦除态返回默认 60)
 pub fn load_volume(flash: &mut FlashStorage<'_>) -> u8 {
-    let mut buf = [0u8; 1];
-    match flash.read(VOLUME_SECTOR, &mut buf) {
-        Ok(()) if buf[0] != 0xFF => buf[0].min(100),
-        _ => 60,
-    }
+    use core::sync::atomic::Ordering;
+    let (v, next) = scan_volume(flash);
+    VOLUME_NEXT.store(next, Ordering::Relaxed);
+    v
 }
 
 /// xiaozhi 协议版本 — NVS 独立扇区 (0xB000, 与音量/凭据分离)
@@ -150,8 +207,8 @@ impl MqttSettings {
     /// password/publish_topic/subscribe_topic
     const CAPS: [usize; 6] = [64, 96, 96, 96, 32, 64];
 
-    /// 序列化后的总长度上界 (magic 4 + 6×(len 2 + 容量))
-    const BUF_LEN: usize = 4 + 6 * 2 + 64 + 96 + 96 + 96 + 32 + 64;
+    /// 序列化后的总长度上界 (magic 4 + 6×(len 2 + 容量) + CRC 4)
+    const BUF_LEN: usize = 4 + 6 * 2 + 64 + 96 + 96 + 96 + 32 + 64 + 4;
 
     fn fields(&self) -> [&str; 6] {
         [
@@ -187,6 +244,10 @@ pub fn save_mqtt(flash: &mut FlashStorage<'_>, cfg: &MqttSettings) -> Result<(),
         buf[o..o + s.len()].copy_from_slice(s.as_bytes());
         o += s.len();
     }
+    // 末尾 CRC: 部分写入/位翻转时必须能被识别, 否则会带着坏配置走 MQTT
+    let crc = xiaozhi_core::ota::crc32_init_xorout(&buf[..o], 0, 0xFFFF_FFFF);
+    buf[o..o + 4].copy_from_slice(&crc.to_le_bytes());
+    o += 4;
     NorFlash::erase(flash, MQTT_SECTOR, MQTT_SECTOR + 4096).map_err(|_| "Flash 擦除失败")?;
     NorFlash::write(flash, MQTT_SECTOR, &buf[..o]).map_err(|_| "Flash 写入失败")
 }
@@ -210,6 +271,12 @@ pub fn load_mqtt(flash: &mut FlashStorage<'_>) -> Option<MqttSettings> {
         }
         *out.get_mut(i)? = heapless::String::try_from(s).ok()?;
     }
+    // CRC 校验: 旧格式 (末尾 0xFF) 或位翻转一律视为无效 → 回退 WS
+    let crc_stored = u32::from_le_bytes(buf.get(o..o + 4)?.try_into().ok()?);
+    let crc_calc = xiaozhi_core::ota::crc32_init_xorout(&buf[..o], 0, 0xFFFF_FFFF);
+    if crc_stored != crc_calc {
+        return None;
+    }
     Some(MqttSettings {
         endpoint: heapless::String::try_from(out[0].as_str()).ok()?,
         client_id: heapless::String::try_from(out[1].as_str()).ok()?,
@@ -218,6 +285,11 @@ pub fn load_mqtt(flash: &mut FlashStorage<'_>) -> Option<MqttSettings> {
         publish_topic: heapless::String::try_from(out[4].as_str()).ok()?,
         subscribe_topic: heapless::String::try_from(out[5].as_str()).ok()?,
     })
+}
+
+/// 清除 MQTT 配置 (endpoint 非法/损坏时回退 WS)
+pub fn clear_mqtt(flash: &mut FlashStorage<'_>) -> Result<(), &'static str> {
+    NorFlash::erase(flash, MQTT_SECTOR, MQTT_SECTOR + 4096).map_err(|_| "Flash 擦除失败")
 }
 
 /// 启动自检: 写已知模式到备用扇区并读回, 验证存储层工作正常

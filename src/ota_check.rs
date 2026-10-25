@@ -15,6 +15,7 @@ use embedded_storage::{ReadStorage as _, Storage as _};
 use defmt::{error, info, warn};
 use esp_storage::FlashStorage;
 
+use xiaozhi_core::http;
 use xiaozhi_core::ota;
 
 /// 检查结果
@@ -26,13 +27,15 @@ pub struct UpdateReport {
     pub update_available: bool,
     /// 固件下载 url (清单 firmware.url)
     pub url: heapless::String<160>,
+    /// 可选镜像 SHA-256 (清单 firmware.sha256 / hash; 服务端不支持时为 None)
+    pub sha256: Option<heapless::String<64>>,
     /// MQTT 网关配置 (服务器启用 `mqtt_gateway` 时下发)
     pub mqtt: Option<crate::wifi::store::MqttSettings>,
 }
 
 /// 板型标识 (服务器按 `board.type` 匹配 `data/bin/<type>_<version>.bin`;
-/// 对齐 C++ `BOARD_TYPE` / config.json `name`)
-const OTA_BOARD_TYPE: &str = "gezipai";
+/// 直接取 BSP 板名, 换板时无需改 OTA 代码)
+const OTA_BOARD_TYPE: &str = crate::bsp::active::BOARD.name;
 
 /// ota_0 / ota_1 / otadata 分区基址与大小 (与 partitions.csv 一致)
 const OTA_0_BASE: u32 = 0x20_000;
@@ -94,7 +97,15 @@ pub async fn boot_ota_task(
                     "OTA: 发现新版本 {}, 下载并烧写...",
                     report.latest_version.as_str()
                 );
-                match download_and_flash(stack, server, report.url.as_str(), flash).await {
+                match download_and_flash(
+                    stack,
+                    server,
+                    report.url.as_str(),
+                    report.sha256.as_deref(),
+                    flash,
+                )
+                .await
+                {
                     Some(v) => {
                         info!("OTA: 烧写成功 ({}), 重启...", v.as_str());
                         esp_hal::system::software_reset();
@@ -152,16 +163,33 @@ async fn check_inner(
     );
     write_all(&mut socket, request.as_bytes()).await.ok()?;
 
-    // 2048: 清单含 firmware + mqtt 两个对象时 ~600B, 留足固件 url 余量
-    let resp: &'static mut heapless::String<2048> =
-        alloc::boxed::Box::leak(alloc::boxed::Box::new(heapless::String::new()));
+    // 2048: 清单含 firmware + mqtt 两个对象时 ~600B, 留足固件 url 余量。
+    // 按字节累积 (不能逐字节 as char, 否则非 ASCII UTF-8 会被拆成 Latin-1)。
+    let resp: &'static mut heapless::Vec<u8, 2048> =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(heapless::Vec::new()));
     let mut read_buf = [0u8; 256];
+    let mut header_end: Option<usize> = None;
+    let mut body_need: Option<usize> = None;
     loop {
         match socket.read(&mut read_buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => push_bytes(resp, &read_buf[..n]),
         }
-        if resp.len() >= resp.capacity() - 1 {
+        if header_end.is_none()
+            && let Some(pos) = resp.windows(4).position(|w| w == b"\r\n\r\n")
+        {
+            header_end = Some(pos + 4);
+            let head = core::str::from_utf8(&resp[..pos + 4]).unwrap_or("");
+            body_need = http::parse_content_length(head).map(|n| n as usize);
+        }
+        // 有 Content-Length 时收到完整正文就停, 不等服务器关连接
+        // (HTTP/1.1 keep-alive/代理会让旧实现白等 45s)
+        if let (Some(off), Some(need)) = (header_end, body_need)
+            && resp.len() >= off + need
+        {
+            break;
+        }
+        if resp.len() >= resp.capacity() {
             break;
         }
     }
@@ -171,7 +199,8 @@ async fn check_inner(
         warn!("OTA: 检查响应为空 (服务器关闭连接)");
         return None;
     }
-    let (status, body) = split_http_response(resp.as_str())?;
+    let resp_str = core::str::from_utf8(resp).unwrap_or("");
+    let (status, body) = http::split_response(resp_str)?;
     if status != 200 {
         warn!("OTA: 检查响应非 200 ({})", status);
         return None;
@@ -193,10 +222,22 @@ async fn check_inner(
         info!("OTA: 已是最新 ({})", current);
     }
     let mqtt = ota::parse_mqtt_config(body).and_then(to_mqtt_settings);
+    // 可选 SHA-256: 出现但格式非法时拒绝清单 (不能悄悄跳过校验)
+    let sha256 = match manifest.sha256 {
+        Some(h) => match heapless::String::<64>::try_from(h) {
+            Ok(s) if xiaozhi_core::udp::decode_hex::<32>(s.as_str()).is_some() => Some(s),
+            _ => {
+                warn!("OTA: SHA-256 字段非法 (需 64 位十六进制), 拒绝清单");
+                return None;
+            },
+        },
+        None => None,
+    };
     Some(UpdateReport {
         latest_version: latest,
         update_available,
         url,
+        sha256,
         mqtt,
     })
 }
@@ -215,7 +256,7 @@ fn to_mqtt_settings(m: ota::MqttConfig<'_>) -> Option<crate::wifi::store::MqttSe
 
 /// 下载固件 → 4KB 扇区擦写目标槽 → 写 otadata → 返回新版本串
 ///
-/// 防护: HTTP 200 / Content-Length 完整性 / 分区大小上界 / 整体超时。
+/// 防护: HTTP 200 / Content-Length 完整性 / 可选 SHA-256 / 分区大小上界 / 整体超时。
 /// 调用时机: `main()` 直线路径 (采集未启动, 无 I2S DMA 冲突)。
 /// 成功时调用方负责 `esp_hal::system::software_reset()`。
 /// 失败返回 `None`, 设备继续用当前固件; 失败计数由调用方 [`record_failure`]。
@@ -223,11 +264,12 @@ pub async fn download_and_flash(
     stack: Stack<'static>,
     server: Ipv4Address,
     url: &str,
+    expected_sha256: Option<&str>,
     flash: &mut FlashStorage<'_>,
 ) -> Option<heapless::String<32>> {
     with_timeout(
         NET_TIMEOUT,
-        download_and_flash_inner(stack, server, url, flash),
+        download_and_flash_inner(stack, server, url, expected_sha256, flash),
     )
     .await
     .ok()?
@@ -237,6 +279,7 @@ async fn download_and_flash_inner(
     stack: Stack<'static>,
     server: Ipv4Address,
     url: &str,
+    expected_sha256: Option<&str>,
     flash: &mut FlashStorage<'_>,
 ) -> Option<heapless::String<32>> {
     // 1. 读 otadata → 确定目标槽 (乒乓)
@@ -261,8 +304,35 @@ async fn download_and_flash_inner(
     info!("OTA: 烧写 → {} (seq {})", target_name, new_seq);
 
     // 2. HTTP GET
-    let (url_host, port, path) = parse_url(url);
-    let host = url_host.unwrap_or(server);
+    let (url_host, port, path) = http::parse_url(url);
+    // 清单 URL 未认证; 拒绝控制字符/空白, 防止 CRLF 注入请求头
+    if path.bytes().any(|b| b <= 0x20 || b == 0x7F) {
+        warn!("OTA: URL 路径含非法字符, 拒绝下载");
+        return None;
+    }
+    // 字面量 IPv4 直接使用; 域名走 DHCP 下发的 DNS, 失败回退配置 server
+    let host = if let Ok(ip) = url_host.parse::<Ipv4Address>() {
+        ip
+    } else {
+        match with_timeout(
+            Duration::from_secs(5),
+            stack.dns_query(url_host, embassy_net::dns::DnsQueryType::A),
+        )
+        .await
+        {
+            Ok(Ok(addrs)) => addrs
+                .iter()
+                .find_map(|a| match a {
+                    // 当前固件只启用 IPv4; 开 IPv6 时需补 Aaaa 分支
+                    embassy_net::IpAddress::Ipv4(ip) => Some(*ip),
+                })
+                .unwrap_or(server),
+            _ => {
+                warn!("OTA: 域名解析失败 ({}), 回退配置 server", url_host);
+                server
+            },
+        }
+    };
     let rx: &'static mut [u8] = alloc::vec![0u8; 4096].leak();
     let tx: &'static mut [u8] = alloc::vec![0u8; 1024].leak();
     let mut socket = TcpSocket::new(stack, rx, tx);
@@ -297,13 +367,13 @@ async fn download_and_flash_inner(
         }
     }
     let head_str = core::str::from_utf8(&head_buf[..head_len]).unwrap_or("");
-    let status = parse_http_status(head_str)?;
+    let status = http::parse_status(head_str)?;
     if status != 200 {
         warn!("OTA: 下载响应非 200 ({})", status);
         return None;
     }
     // Content-Length 必填: 完整性依赖它 (缺失无法证明镜像完整)
-    let expected = parse_content_length(head_str)?;
+    let expected = http::parse_content_length(head_str)?;
     if expected == 0 || expected > APP_PARTITION_SIZE {
         warn!(
             "OTA: Content-Length 非法 ({} > 分区 {} 或为 0)",
@@ -336,11 +406,22 @@ async fn download_and_flash_inner(
     // 5. 流式 4KB 扇区写入 (硬上界 = APP_PARTITION_SIZE)
     let sector_buf: &'static mut [u8] = alloc::vec![0u8; 4096].leak();
     sector_buf[..128].copy_from_slice(&img_head);
-    let mut fill = 128usize;
+    // 头与正文可能在同一次 TCP 读里到达: 镜像头之后的字节必须原样
+    // 转入扇区缓冲, 否则会被丢弃, 最终 total != Content-Length → 升级失败。
+    let leftover = if rem > 128 {
+        &head_buf[body_off + 128..head_len]
+    } else {
+        &[][..]
+    };
+    debug_assert!(128 + leftover.len() <= sector_buf.len());
+    sector_buf[128..128 + leftover.len()].copy_from_slice(leftover);
+    let mut fill = 128 + leftover.len();
     let mut written = 0u32;
     // 扇区计数已包含前 128B 镜像头, 不能从 128 起算 (会多算 128B)
     let mut total = 0u32;
     let mut last_log = 0u32;
+    // 可选 SHA-256: 与写 flash 同步流式计算 (不额外占 RAM)
+    let mut hasher = xiaozhi_core::sha256::Sha256::new();
 
     loop {
         if fill < 4096 {
@@ -357,6 +438,7 @@ async fn download_and_flash_inner(
                 return None;
             }
             let abs = target_base + written * SECTOR;
+            hasher.update(&sector_buf[..4096]);
             if let Err(e) = flash.write(abs, &sector_buf[..4096]) {
                 error!("OTA: 扇区写失败 @0x{:05X}: {:?}", abs, e);
                 return None;
@@ -379,6 +461,7 @@ async fn download_and_flash_inner(
         }
         // 末扇区: 只写实际字节 (Storage 会整扇区擦写, 无需单独 4KB 缓冲)
         let abs = target_base + written * SECTOR;
+        hasher.update(&sector_buf[..fill]);
         if let Err(e) = flash.write(abs, &sector_buf[..fill]) {
             error!("OTA: 末扇区写失败 @0x{:05X}: {:?}", abs, e);
             return None;
@@ -395,6 +478,19 @@ async fn download_and_flash_inner(
             total, expected
         );
         return None;
+    }
+    // 可选哈希: 清单提供时必须匹配, 否则拒绝切槽 (Content-Length 不是认证)
+    if let Some(want) = expected_sha256 {
+        let digest = hasher.finish();
+        match xiaozhi_core::udp::decode_hex::<32>(want) {
+            Some(h) if h == digest => info!("OTA: SHA-256 校验通过"),
+            _ => {
+                warn!("OTA: SHA-256 校验失败, 拒绝切槽");
+                return None;
+            },
+        }
+    } else {
+        info!("OTA: 清单未提供 SHA-256, 仅做长度校验");
     }
 
     // 6. 擦除目标 otadata 扇区并写 PENDING_VERIFY 条目
@@ -481,74 +577,10 @@ fn save_fail_record(flash: &mut FlashStorage<'_>, version: &str, count: u8) {
     }
 }
 
-/// 拆分 HTTP 响应为 (状态码, body); 无头/非 HTTP 返回 None
-fn split_http_response(resp: &str) -> Option<(u16, &str)> {
-    let header_end = resp.find("\r\n\r\n")?;
-    let status = parse_http_status(&resp[..header_end + 4])?;
-    Some((status, &resp[header_end + 4..]))
-}
-
-/// 从 HTTP 状态行取状态码 (`HTTP/1.x 200 ...`)
-fn parse_http_status(head: &str) -> Option<u16> {
-    let line_end = head.find("\r\n").unwrap_or(head.len());
-    let line = &head[..line_end];
-    let mut parts = line.split_whitespace();
-    let proto = parts.next()?;
-    if !proto.starts_with("HTTP/") {
-        return None;
-    }
-    parts.next()?.parse().ok()
-}
-
-/// 从 url 取 (端口, 路径): 端口取 host:port (缺省 8003), 路径为 `//` 后到末尾
-fn parse_url(url: &str) -> (Option<Ipv4Address>, u16, &str) {
-    let after = url.find("://").map(|i| &url[i + 3..]).unwrap_or(url);
-    let (hostport, path) = match after.find('/') {
-        Some(i) => (&after[..i], &after[i..]),
-        None => (after, "/"),
-    };
-    // 仅支持 IPv4 字面量主机; 域名无 DNS 解析, 回退到配置 server
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((h, p)) => match p.parse::<u16>() {
-            Ok(port) => (h, port),
-            Err(_) => (hostport, 8003),
-        },
-        None => (hostport, 8003),
-    };
-    (host.parse().ok(), port, path)
-}
-
-/// 从 HTTP 头取 Content-Length (大小写不敏感; 缺省 `None`)
-fn parse_content_length(head: &str) -> Option<u32> {
-    let hl = head.as_bytes();
-    let key = b"content-length:";
-    if hl.len() < key.len() {
-        return None;
-    }
-    let mut at = None;
-    for i in 0..=(hl.len() - key.len()) {
-        let mut ok = true;
-        for j in 0..key.len() {
-            if hl[i + j].to_ascii_lowercase() != key[j] {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            at = Some(i + key.len());
-            break;
-        }
-    }
-    let at = at?;
-    let v = head[at..].trim_start();
-    let end = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
-    v[..end].parse().ok()
-}
-
-/// 逐字节 push 进 resp (容量满即停)
-fn push_bytes(resp: &mut heapless::String<2048>, chunk: &[u8]) {
+/// 逐字节追加到 resp (容量满即停); 保持原始字节, 由调用方统一做 UTF-8 校验
+fn push_bytes(resp: &mut heapless::Vec<u8, 2048>, chunk: &[u8]) {
     for b in chunk {
-        if resp.push(*b as char).is_err() {
+        if resp.push(*b).is_err() {
             return;
         }
     }

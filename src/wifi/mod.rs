@@ -63,10 +63,19 @@ pub fn boot_mode(flash: &mut esp_storage::FlashStorage) -> Mode {
     }
 }
 
-/// STA 连接: 建网络栈 → 重试连接 (3 次) → 等 DHCP
+/// STA 连接失败原因 (决定调用方是否清除凭据)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectError {
+    /// 关联/认证失败 (密码错误、AP 不存在): 清凭据重回配网
+    Association,
+    /// 关联成功但 DHCP 超时: 保留凭据, 稍后重启重试 (路由器 DHCP 池满等)
+    DhcpTimeout,
+}
+
+/// STA 连接: 建网络栈 → 重试连接 (5 次) → 等 DHCP (30s 超时)
 ///
-/// 返回网络栈供上层建会话; 失败 (3 次未连上 / DHCP 超时) 返回 Err,
-/// 由调用方决定降级策略 (清凭据重回配网或周期重试)。
+/// 返回网络栈供上层建会话; 失败原因区分「关联失败」与「DHCP 超时」,
+/// 由调用方决定清凭据还是保留凭据重试。
 pub async fn connect_station(
     spawner: &Spawner,
     config: &WifiConfig,
@@ -77,7 +86,7 @@ pub async fn connect_station(
         esp_radio::wifi::WifiController<'static>,
         heapless::String<32>,
     ),
-    (),
+    ConnectError,
 > {
     let interface = esp_radio::wifi::Interface::station();
     let mac_bytes = interface.mac_address();
@@ -102,6 +111,7 @@ pub async fn connect_station(
     )
     .map_err(|_| {
         error!("WiFi 控制器初始化失败");
+        ConnectError::Association
     })?;
 
     let (stack, runner) = embassy_net::new(
@@ -114,22 +124,44 @@ pub async fn connect_station(
     );
     spawner.spawn(net_task(runner).unwrap());
 
-    for attempt in 1..=3u8 {
+    // 5 次 × 5s: 覆盖路由器重启/DFS 切换等瞬断, 避免过早清凭据
+    for attempt in 1..=5u8 {
         info!(
             "连接 WiFi: [{}] (第 {} 次)...",
             config.ssid.as_str(),
             attempt
         );
-        if controller.connect_async().await.is_ok() {
+        let connected = matches!(
+            embassy_time::with_timeout(
+                embassy_time::Duration::from_secs(20),
+                controller.connect_async(),
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        if connected {
             info!("WiFi 已连接!");
-            stack.wait_config_up().await;
-            // 控制器一并交还调用方保活 (丢弃可能影响射频状态; 断线重连策略后续接入)
-            return Ok((stack, controller, mac));
+            // DHCP 无超时会让启动永久卡住 (此时看门狗尚未启用)
+            match embassy_time::with_timeout(
+                embassy_time::Duration::from_secs(30),
+                stack.wait_config_up(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    // 控制器一并交还调用方保活 (丢弃可能影响射频状态)
+                    return Ok((stack, controller, mac));
+                },
+                Err(_) => {
+                    error!("WiFi 关联成功但 DHCP 获取超时 (30s)");
+                    return Err(ConnectError::DhcpTimeout);
+                },
+            }
         }
         error!("连接失败");
-        embassy_time::Timer::after(embassy_time::Duration::from_secs(3)).await;
+        embassy_time::Timer::after(embassy_time::Duration::from_secs(5)).await;
     }
-    Err(())
+    Err(ConnectError::Association)
 }
 
 /// 运行期断线重连任务
@@ -198,7 +230,7 @@ pub async fn reconnect_task(mut controller: esp_radio::wifi::WifiController<'sta
 
             match select(
                 controller.wait_for_disconnect_async(),
-                embassy_time::Timer::after(embassy_time::Duration::from_millis(100)),
+                embassy_time::Timer::after(embassy_time::Duration::from_millis(500)),
             )
             .await
             {

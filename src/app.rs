@@ -7,6 +7,8 @@
 //!
 //! 状态转移委托 [`xiaozhi_core::dialog::DialogSm`] (host 单测覆盖)。
 
+use core::fmt::Write as _;
+
 use embassy_net::{Ipv4Address, Stack};
 use embassy_sync::channel::Channel;
 
@@ -23,6 +25,7 @@ use xiaozhi_core::audio::wake::{
 };
 use xiaozhi_core::dialog::{Action, DialogEvent, DialogSm, DialogState, ListenMode};
 use xiaozhi_core::idle::IdlePromptPolicy;
+use xiaozhi_core::server_msg::{self, ServerMessage};
 
 use crate::audio::opus::{MAX_PACKET_BYTES, OpusDecoder, OpusEncoder};
 
@@ -34,7 +37,6 @@ impl defmt::Format for SessionCommand {
             SessionCommand::SendListenStop => defmt::write!(f, "ListenStop"),
             SessionCommand::SendTtsAbort => defmt::write!(f, "TtsAbort"),
             SessionCommand::CloseSession => defmt::write!(f, "CloseSession"),
-            SessionCommand::SetVolume(_) => defmt::write!(f, "SetVolume"),
         }
     }
 }
@@ -42,7 +44,7 @@ use crate::audio::playback::Playback;
 use crate::bsp::components::{
     Audio, Battery, BreathSpeed, Buttons, Display, LedMode, Leds, Power, Rgb565,
 };
-use crate::prompt::PromptPlayer;
+use crate::prompt::{Clip, PromptPlayer};
 use crate::session;
 
 /// 上行音频参数 (16kHz 单声道 60ms, 对齐 C++ 参考与 hello.audio_params;
@@ -111,7 +113,10 @@ pub static DROP_DOWNLINK: core::sync::atomic::AtomicBool =
 /// MCP self.reboot 待执行 (会话任务发完应答后复位)
 pub static MCP_REBOOT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// 当前会话轮次 (日志关联用)
 pub static TURN_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// 会话任务心跳: 每轮循环 +1; 音频循环据此发现「任务卡死但主循环还活着」
+pub static SESSION_HEARTBEAT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static BATTERY_PCT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 pub static CHARGING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// MCP set_volume 待办 (valid 标记 + 目标值; 音频循环轮询消费)
@@ -140,8 +145,6 @@ pub enum SessionCommand {
     SendTtsAbort,
     /// 本地会话结束: 通知服务器关闭通道 (MQTT 网关据此释放 bridge)
     CloseSession,
-    /// MCP: 设置音量 (音频任务执行 I2C 写)
-    SetVolume(u8),
 }
 
 /// 会话任务 → 音频主循环 事件
@@ -153,20 +156,58 @@ pub enum SessionEvent {
     TtsStart,
     /// 服务器播报结束
     TtsStop,
+    /// 会话异常关闭 (网络/建连失败) — 与正常收尾区分, 用于提示音/显示
+    Error,
     /// 会话关闭
     Closed,
+}
+
+/// 服务器文本/情绪 (显示层; 音频主循环按「最新值」覆盖, 不做历史)
+#[derive(Debug, Clone)]
+pub enum UiMessage {
+    /// 用户语音识别文本 (stt)
+    UserText(heapless::String<160>),
+    /// 助手朗读文本 (tts sentence_start)
+    AssistantText(heapless::String<160>),
+    /// 情绪名 (llm.emotion, 用于表情)
+    Emotion(heapless::String<24>),
+    /// 服务器 alert: 状态/文案/情绪
+    Alert {
+        status: heapless::String<32>,
+        message: heapless::String<96>,
+        emotion: heapless::String<24>,
+    },
+}
+
+/// 截断到固定容量 (按字符边界, 超长丢弃尾部)
+pub(crate) fn ui_text<const N: usize>(text: &str) -> heapless::String<N> {
+    let mut out = heapless::String::new();
+    for ch in text.chars() {
+        if out.push(ch).is_err() {
+            break;
+        }
+    }
+    out
+}
+
+/// 会话任务 → 音频主循环: 显示消息 (尽力发送, 满则丢弃旧语义)
+pub(crate) fn ui_send(channels: &Channels, msg: UiMessage) {
+    let _ = channels.ui.try_send(msg);
 }
 
 /// 任务间通道 (main 装配一次, 静态常驻)
 pub struct Channels {
     /// 音频 → 会话: 编码后的 opus 帧 (+ AEC 时间戳)
-    pub uplink: Channel<RawMutex, UplinkPacket, 12>,
+    /// 40 槽 ≈2.4s, 覆盖一次慢帧/半开读 (WS 1.5s / MQTT 2s) 造成的阻塞
+    pub uplink: Channel<RawMutex, UplinkPacket, 40>,
     /// 会话 → 音频: 下行 opus 帧 (TTS, + 服务器时间戳)
-    pub downlink: Channel<RawMutex, DownlinkPacket, 6>,
-    /// 音频 → 会话: 命令
-    pub command: Channel<RawMutex, SessionCommand, 4>,
+    pub downlink: Channel<RawMutex, DownlinkPacket, 16>,
+    /// 音频 → 会话: 命令 (与 pending 容量对齐, 避免静默丢弃)
+    pub command: Channel<RawMutex, SessionCommand, 8>,
     /// 会话 → 音频: 事件
     pub event: Channel<RawMutex, SessionEvent, 4>,
+    /// 会话 → 音频: 显示文本/情绪 (stt/llm/tts/alert)
+    pub ui: Channel<RawMutex, UiMessage, 4>,
 }
 
 /// 会话任务依赖 ('static: embassy 任务要求参数永久存活)
@@ -201,6 +242,7 @@ pub async fn session_task(args: SessionArgs) {
     let mut down_bytes: u64 = 0;
 
     loop {
+        SESSION_HEARTBEAT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // ---- WiFi 掉线: 当前 WS 会话不可信, 立即收尾等重连 ----
         // (重连任务负责重新关联; 这里只关闭并 abort socket, 下次唤醒重建)
         if connected && !stack.is_link_up() {
@@ -248,13 +290,15 @@ pub async fn session_task(args: SessionArgs) {
                         }
                     }
                 },
-                Ok(SessionCommand::SetVolume(v)) => {
-                    // 音频主循环轮询 PENDING_VOLUME 并执行 I2C 写
-                    PENDING_VOLUME.store(v, core::sync::atomic::Ordering::Relaxed);
-                    PENDING_VOLUME_VALID.store(true, core::sync::atomic::Ordering::Relaxed);
-                },
                 Ok(SessionCommand::CloseSession) => {
-                    // WS 服务端按会话超时自行回收, 无需显式 goodbye
+                    // 与 MQTT 对齐: 显式 goodbye, 让服务端尽快释放会话/通道
+                    // (WS 服务端即使忽略也无害)
+                    if connected {
+                        let mut ws = session::WsClient {
+                            socket: &mut socket,
+                        };
+                        let _ = ws.send_text(session::GOODBYE.as_bytes()).await;
+                    }
                 },
                 Ok(SessionCommand::SendTtsAbort) => {
                     if connected {
@@ -337,18 +381,15 @@ pub async fn session_task(args: SessionArgs) {
                     Ok((opcode, payload)) => match opcode {
                         1 => {
                             let text = core::str::from_utf8(&payload).unwrap_or("");
-                            match (
-                                session::json_str_field(text, "type"),
-                                session::json_str_field(text, "state"),
-                            ) {
-                                (Some("tts"), Some("start")) => {
+                            match server_msg::parse(text) {
+                                ServerMessage::TtsStart => {
                                     // 新回复开始: 解除打断后的下行丢弃
                                     DROP_DOWNLINK
                                         .store(false, core::sync::atomic::Ordering::Relaxed);
                                     info!("服务器: tts start");
                                     channels.event.send(SessionEvent::TtsStart).await;
                                 },
-                                (Some("tts"), Some("stop")) => {
+                                ServerMessage::TtsStop => {
                                     info!(
                                         "服务器: tts stop (下行 {} 包 {}B)",
                                         down_pkts, down_bytes
@@ -357,21 +398,70 @@ pub async fn session_task(args: SessionArgs) {
                                     down_bytes = 0;
                                     channels.event.send(SessionEvent::TtsStop).await;
                                 },
-                                _ => {
-                                    // MCP 帧 (type=mcp): 解析并回送 initialize/tools_list/tools_call 应答
-                                    if session::json_str_field(text, "type") == Some("mcp") {
-                                        let volume =
-                                            VOLUME_PCT.load(core::sync::atomic::Ordering::Relaxed);
-                                        if let Some(resp) = mcp_handle(text, volume, channels) {
-                                            info!("MCP 应答: {}", resp.as_str());
-                                            if ws.send_text(resp.as_bytes()).await.is_err() {
-                                                connected = false;
-                                                channels.event.send(SessionEvent::Closed).await;
-                                            }
-                                        }
+                                ServerMessage::TtsSentenceStart(t) => {
+                                    info!("服务器: 朗读 \"{}\"", t);
+                                    ui_send(channels, UiMessage::AssistantText(ui_text::<160>(t)));
+                                },
+                                ServerMessage::Stt(t) => {
+                                    info!("服务器: 识别 \"{}\"", t);
+                                    ui_send(channels, UiMessage::UserText(ui_text::<160>(t)));
+                                },
+                                ServerMessage::Llm { emotion } => {
+                                    info!("服务器: 情绪 {}", emotion);
+                                    ui_send(channels, UiMessage::Emotion(ui_text::<24>(emotion)));
+                                },
+                                ServerMessage::Alert {
+                                    status,
+                                    message,
+                                    emotion,
+                                } => {
+                                    warn!("服务器 alert: {} / {}", status, message);
+                                    ui_send(
+                                        channels,
+                                        UiMessage::Alert {
+                                            status: ui_text::<32>(status),
+                                            message: ui_text::<96>(message),
+                                            emotion: ui_text::<24>(emotion),
+                                        },
+                                    );
+                                },
+                                ServerMessage::System { command } => {
+                                    if command == "reboot" {
+                                        info!("服务器: 远程重启");
+                                        MCP_REBOOT
+                                            .store(true, core::sync::atomic::Ordering::Relaxed);
+                                        mcp_maybe_reboot().await;
                                     } else {
-                                        info!("服务器: {}", text);
+                                        warn!("服务器: 未知 system 命令 {}", command);
                                     }
+                                },
+                                ServerMessage::Error { message } => {
+                                    warn!("服务器错误: {}", message);
+                                    channels.event.send(SessionEvent::Error).await;
+                                    channels.event.send(SessionEvent::Closed).await;
+                                },
+                                ServerMessage::Mcp => {
+                                    let volume =
+                                        VOLUME_PCT.load(core::sync::atomic::Ordering::Relaxed);
+                                    if let Some(resp) = mcp_handle(text, volume) {
+                                        info!("MCP 应答: {}", resp.as_str());
+                                        if ws.send_text(resp.as_bytes()).await.is_err() {
+                                            MCP_REBOOT.store(
+                                                false,
+                                                core::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            connected = false;
+                                            channels.event.send(SessionEvent::Closed).await;
+                                        } else {
+                                            mcp_maybe_reboot().await;
+                                        }
+                                    }
+                                },
+                                ServerMessage::Hello
+                                | ServerMessage::Goodbye
+                                | ServerMessage::Custom
+                                | ServerMessage::Unknown(_) => {
+                                    info!("服务器: {}", text);
                                 },
                             }
                         },
@@ -392,20 +482,29 @@ pub async fn session_task(args: SessionArgs) {
                                 };
                             let mut pkt: OpusPacket = heapless::Vec::new();
                             if pkt.extend_from_slice(opus).is_ok() {
-                                // 阻塞发送: 通道满时停止读 TCP → 反压服务器,
-                                // 而不是丢帧 (丢帧 = 漏字)
-                                channels
-                                    .downlink
-                                    .send(DownlinkPacket {
-                                        timestamp,
-                                        data: pkt,
-                                        lost: 0,
-                                    })
-                                    .await;
+                                // 通道满时短暂反压服务器; 但音频侧若停摆,
+                                // 不能让网络任务永久卡死 (否则心跳/命令全停)。
+                                let send = channels.downlink.send(DownlinkPacket {
+                                    timestamp,
+                                    data: pkt,
+                                    lost: 0,
+                                });
+                                if embassy_time::with_timeout(
+                                    embassy_time::Duration::from_secs(2),
+                                    send,
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    warn!("下行通道拥塞, 丢弃一帧");
+                                }
                             }
                         },
                         8 => {
                             info!("服务器关闭连接");
+                            // 回 close 并立即释放 socket, 不留半开连接
+                            let _ = ws.send_frame(8, &[]).await;
+                            ws.socket.abort();
                             connected = false;
                             channels.event.send(SessionEvent::Closed).await;
                         },
@@ -416,6 +515,7 @@ pub async fn session_task(args: SessionArgs) {
                     },
                     Err(e) => {
                         warn!("WS 接收错误: {} — 会话关闭", e);
+                        ws.socket.abort();
                         connected = false;
                         channels.event.send(SessionEvent::Closed).await;
                     },
@@ -440,6 +540,10 @@ pub struct AppArgs<'a, 'b> {
     pub cap: &'a mut DmaTransferRxCircular<'b, I2sRx<'static, Blocking>>,
     pub channels: &'a Channels,
     pub flash: &'a mut esp_storage::FlashStorage<'static>,
+    /// 常驻播放管线: 由 main 只分配一次, CaptureFault 重入时复用
+    pub playback: &'a mut Playback,
+    /// 常驻唤醒预录环: 同上, 避免每次重入泄漏 32KB
+    pub preroll: &'a mut [i16],
     /// 服务端 AEC 已启用 (协议版本 ≥2): 播报期间持续上行, 由服务端消除回声
     pub server_aec: bool,
 }
@@ -518,8 +622,13 @@ pub async fn run(
         cap,
         channels,
         flash,
+        playback,
+        preroll,
         server_aec,
     } = args;
+
+    // 复用常驻管线: 上一次 CaptureFault 可能留下未播完的帧
+    playback.reset();
 
     let mut sm = DialogSm::new();
     // 下行播放时间戳 → 上行帧 (服务端 AEC 对齐; 版本 1 恒为 0)
@@ -537,11 +646,12 @@ pub async fn run(
     );
     let mut encoder: Option<OpusEncoder> = None;
     let mut decoder: Option<OpusDecoder> = None;
+    // 编解码器创建失败退避: 避免每 1ms 重试 + error! 日志风暴
+    let mut codec_retry_at: u64 = 0;
+    let mut codec_fail_count: u8 = 0;
     let mut pcm_dec: alloc::boxed::Box<[i16]> = alloc::vec![0i16; FRAME_SAMPLES].into_boxed_slice();
     let mut stereo_out: alloc::boxed::Box<[u8]> =
         alloc::vec![0u8; FRAME_SAMPLES * 4].into_boxed_slice();
-    // 播报播放管线: 软件 PCM 队列 + DMA 泵送 + 预缓冲/排空门控
-    let mut playback = Playback::new();
     // 空闲提示: 60s 无活动 → 播放语音提示 → 进入低功耗待机
     // (idle-selftest: 窗口缩到 5s, 便于真机验证流程)
     const IDLE_WINDOW_MS: u64 = if cfg!(feature = "idle-selftest") {
@@ -560,11 +670,12 @@ pub async fn run(
     let mut ack_pending = false;
     let mut ack_flush_at: u64 = 0;
     let mut volume_dirty = false;
-    let preroll = alloc_preroll();
     let preroll_len = preroll.len();
     let mut preroll_w = 0usize;
     let mut preroll_valid = 0usize;
     let mut preroll_flush = false;
+    // 预录补发上限: 编码器/通道异常时不能永远卡在 "flushing" 而丢掉实时音频
+    let mut preroll_deadline: u64 = 0;
     let mut preroll_off = 0usize;
     let mut preroll_seq: u64 = 0;
     let mut preroll_from: u64 = 0;
@@ -573,6 +684,9 @@ pub async fn run(
     // TTS 结束后的静默期: 防止扬声器尾音/回声立刻触发本地收尾
     let mut listen_grace_until_ms: u64 = 0;
     let mut boot_ms: u64 = 0;
+    // 会话任务心跳检测 (任务卡死但音频循环存活时兜底)
+    let mut hb_last: u32 = 0;
+    let mut hb_ms: u64 = 0;
     info!(
         "PCM 环: {}KB ({})",
         playback.capacity() / 1024,
@@ -587,7 +701,20 @@ pub async fn run(
     let mut tx_rate_ms: u64 = 0;
     let mut acc_len = 0usize;
     let mut held = false;
-    let mut vol_edge = false;
+    // 音量键: 单击 ±10, 长按 (≥800ms) 直达 100/静音 (对齐 C++ 参考)
+    let mut vol_dir: i8 = 0;
+    let mut vol_since_ms: u64 = 0;
+    let mut vol_long = false;
+    // 通知行: 音量/低电/错误 (状态行下方的临时文本)
+    let mut notify_until_ms: u64 = 0;
+    let mut notify_text: heapless::String<32> = heapless::String::new();
+    let mut notify_shown: Option<heapless::String<32>> = None;
+    // 低电提示锁存: 掉到 20% 以下只提醒一次, 回升到 25% 或充电后复位
+    let mut low_batt_latched = false;
+    // 最近一次显示用文本 (UI 批次接屏幕时渲染; 当前仅诊断可读)
+    let mut last_user_text: heapless::String<160> = heapless::String::new();
+    let mut last_assistant_text: heapless::String<160> = heapless::String::new();
+    let mut last_emotion: heapless::String<24> = heapless::String::new();
     let mut last_led: Option<LedMode> = None;
     let mut last_state: Option<DialogState> = None;
     let mut state_since_ms = 0u64;
@@ -630,6 +757,8 @@ pub async fn run(
             // 空闲窗口从主循环真正开始计（开机/WiFi/OTA 的十多秒不算空闲，
             // 也避免 systimer 未清零时窗口"已经到期"导致复位后立刻提示）
             idle_policy.note_activity(now_ms);
+            hb_ms = now_ms;
+            hb_last = SESSION_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
         }
         // 喂 RWDT: 主循环存活即视为系统正常 (网络任务独立, 不参与)
         crate::wdt::feed();
@@ -675,11 +804,87 @@ pub async fn run(
                     // 等软件队列 + DMA 排空后由 poll_stop 派发, 防回声循环
                     playback.on_tts_stop();
                 },
+                Ok(SessionEvent::Error) => {
+                    error!("会话异常 (网络/建连失败)");
+                    // 错误提示音走本地提示通道, 同时安静地结束会话
+                    if !prompt.is_active() {
+                        // 低功耗待机时功放已断电, 提示音前先恢复
+                        if !audio.pa_enabled() {
+                            audio.set_pa(true);
+                        }
+                        low_power = false;
+                        prompt.play(Clip::Error);
+                        prompt_until_ms = now_ms + prompt.duration_ms() + 400;
+                    }
+                    notify_text.clear();
+                    let _ = write!(&mut notify_text, "NET ERROR");
+                    notify_until_ms = now_ms + 5_000;
+                    dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed)
+                },
                 Ok(SessionEvent::Closed) => {
                     dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed)
                 },
                 Err(_) => break,
             }
+        }
+
+        // ---- 1.5 显示消息 (stt / llm / tts 句子 / alert) ----
+        // 文本先缓存, 屏幕 UI 批次再渲染; 情绪名是 ASCII, 当前先做通知显示。
+        while let Ok(msg) = channels.ui.try_receive() {
+            match msg {
+                UiMessage::UserText(t) => {
+                    crate::diag!("UI 用户: {}", t.as_str());
+                    last_user_text = t;
+                },
+                UiMessage::AssistantText(t) => {
+                    crate::diag!("UI 助手: {}", t.as_str());
+                    last_assistant_text = t;
+                },
+                UiMessage::Emotion(e) => {
+                    crate::diag!("UI 情绪: {}", e.as_str());
+                    if e.as_str() != last_emotion.as_str() {
+                        notify_text.clear();
+                        let _ = write!(&mut notify_text, "EMO {}", e.as_str());
+                        notify_until_ms = now_ms + 1_500;
+                    }
+                    last_emotion = e;
+                },
+                UiMessage::Alert {
+                    status,
+                    message,
+                    emotion,
+                } => {
+                    warn!("UI alert: {} / {}", status.as_str(), message.as_str());
+                    last_emotion = emotion;
+                    notify_text.clear();
+                    let _ = write!(&mut notify_text, "ALERT");
+                    notify_until_ms = now_ms + 5_000;
+                    // 播报中不插播提示音 (会打断 TTS), 仅显示
+                    if sm.state() != DialogState::Speaking && !prompt.is_active() {
+                        if !audio.pa_enabled() {
+                            audio.set_pa(true);
+                        }
+                        low_power = false;
+                        prompt.play(Clip::Alert);
+                        prompt_until_ms = now_ms + prompt.duration_ms() + 400;
+                        // 聆听中插播提醒音: 静音窗内不上行, 防把提示音发给服务器
+                        mic_mute_until_ms = prompt_until_ms;
+                        idle_policy.note_activity(now_ms);
+                    }
+                },
+            }
+        }
+
+        // ---- 1.6 会话任务心跳: 任务卡死但音频循环还活着时兜底 ----
+        let hb = SESSION_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
+        if hb != hb_last {
+            hb_last = hb;
+            hb_ms = now_ms;
+        }
+        if sm.state() != DialogState::Idle && now_ms.saturating_sub(hb_ms) > 20_000 {
+            warn!("会话任务 20s 无心跳, 结束会话");
+            dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
+            hb_ms = now_ms;
         }
 
         // ---- 2. 会话拆除 / 编解码器生命周期 ----
@@ -691,10 +896,16 @@ pub async fn run(
                 playback.reset();
                 preroll_flush = false;
                 preroll_off = 0;
+                preroll_deadline = 0;
                 DROP_DOWNLINK.store(false, core::sync::atomic::Ordering::Relaxed);
                 info!("会话已结束, 回到待机监听");
             }
-        } else if encoder.is_none() && sm.state() == DialogState::Listening {
+            codec_fail_count = 0;
+            codec_retry_at = 0;
+        } else if encoder.is_none()
+            && sm.state() == DialogState::Listening
+            && now_ms >= codec_retry_at
+        {
             match (
                 OpusEncoder::new_voip_mono(SAMPLE_RATE, FRAME_MS),
                 OpusDecoder::new_mono(SAMPLE_RATE),
@@ -702,14 +913,31 @@ pub async fn run(
                 (Ok(enc), Ok(dec)) => {
                     encoder = Some(enc);
                     decoder = Some(dec);
+                    codec_fail_count = 0;
+                    codec_retry_at = 0;
                 },
-                _ => error!("opus 编解码器创建失败"),
+                _ => {
+                    codec_fail_count = codec_fail_count.saturating_add(1);
+                    codec_retry_at = now_ms + 1_000;
+                    if codec_fail_count >= 5 {
+                        // 连续失败 (堆耗尽/碎片): 结束会话回 Idle, 避免静默卡死
+                        error!("opus 编解码器连续创建失败, 结束会话");
+                        dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
+                    } else {
+                        error!("opus 编解码器创建失败 (1s 后重试)");
+                    }
+                },
             }
         }
         // 唤醒预录补发: 非阻塞分片 (每轮 ≤4 帧), 避免阻塞主循环
         // 导致 I2S RX 排空不及时 (DmaError::Late → 采集重建)
         if preroll_flush {
-            if let Some(enc) = encoder.as_mut() {
+            if preroll_deadline != 0 && now_ms >= preroll_deadline {
+                warn!("预录补发超时, 放弃剩余帧并恢复实时上行");
+                preroll_flush = false;
+                preroll_off = 0;
+                preroll_deadline = 0;
+            } else if let Some(enc) = encoder.as_mut() {
                 let total = ((preroll_seq - preroll_from) as usize).min(preroll_valid);
                 let start = (preroll_w + preroll_len - total) % preroll_len;
                 let mut sent = 0;
@@ -757,6 +985,7 @@ pub async fn run(
                     preroll_flush = false;
                     preroll_valid = 0;
                     preroll_off = 0;
+                    preroll_deadline = 0;
                 }
             }
         }
@@ -776,11 +1005,15 @@ pub async fn run(
                 preroll_flush = true;
                 preroll_off = 0;
                 preroll_from = preroll_seq;
+                preroll_deadline = now_ms + 1_000;
             }
             if held && sm.state() == DialogState::Speaking {
-                // 播报中按键: 立即丢弃未播完的 TTS, 转入 auto 聆听
-                playback.reset();
+                // 播报中按键: 立即丢弃未播完的 TTS, 转入 auto 聆听。
+                // 先立标志再清通道, 防止会话任务在清理后又塞入旧包。
                 DROP_DOWNLINK.store(true, core::sync::atomic::Ordering::Relaxed);
+                while channels.downlink.try_receive().is_ok() {}
+                playback.reset();
+                aec_clock.clear();
                 barge_in_active = true;
                 dispatch(&mut sm, &mut pending, DialogEvent::BargeIn);
             } else if !held && barge_in_active {
@@ -800,9 +1033,20 @@ pub async fn run(
         }
         let vol_up = buttons.volume_up_pressed();
         let vol_down = buttons.volume_down_pressed();
-        if (vol_up || vol_down) && !vol_edge {
+        let dir: i8 = if vol_up {
+            1
+        } else if vol_down {
+            -1
+        } else {
+            0
+        };
+        if dir != 0 && dir != vol_dir {
+            // 按下沿: 单击步进 ±10
+            vol_dir = dir;
+            vol_since_ms = now_ms;
+            vol_long = false;
             let cur = audio.volume() as i16;
-            let next = (cur + if vol_up { 5 } else { -5 }).clamp(0, 100) as u8;
+            let next = (cur + 10 * dir as i16).clamp(0, 100) as u8;
             audio.set_volume(next);
             VOLUME_PCT.store(next, core::sync::atomic::Ordering::Relaxed);
             volume_dirty = true;
@@ -811,9 +1055,29 @@ pub async fn run(
             if !audio.pa_enabled() {
                 audio.set_pa(true);
             }
+            notify_text.clear();
+            let _ = write!(&mut notify_text, "VOL {}", next);
+            notify_until_ms = now_ms + 2_000;
             info!("音量: {}%", next);
+        } else if dir != 0 && !vol_long && now_ms - vol_since_ms >= 800 {
+            // 长按: 直达最大/静音 (只触发一次, 松开前不再步进)
+            vol_long = true;
+            let next: u8 = if dir > 0 { 100 } else { 0 };
+            audio.set_volume(next);
+            VOLUME_PCT.store(next, core::sync::atomic::Ordering::Relaxed);
+            volume_dirty = true;
+            notify_text.clear();
+            let _ = if next == 0 {
+                write!(&mut notify_text, "MUTE")
+            } else {
+                write!(&mut notify_text, "VOL 100")
+            };
+            notify_until_ms = now_ms + 2_000;
+            info!("音量长按: {}%", next);
+        } else if dir == 0 {
+            vol_dir = 0;
+            vol_long = false;
         }
-        vol_edge = vol_up || vol_down;
 
         // ---- 3.5 MCP SetVolume 待办 + 设备状态发布 ----
         if PENDING_VOLUME_VALID.swap(false, core::sync::atomic::Ordering::Relaxed) {
@@ -825,9 +1089,14 @@ pub async fn run(
             low_power = false;
             info!("MCP 音量: {}%", v);
         }
-        // 充电状态: GPIO 实时 (不读 ADC, 与 WiFi PHY 无冲突)
+        // 充电状态: GPIO 实时 (不读 ADC, 与 WiFi PHY 无冲突)。
+        // Charged 也视为"接外部电源", 与 main 启动路径保持一致。
         CHARGING.store(
-            matches!(power.status(), xiaozhi_core::board::PowerStatus::Charging),
+            matches!(
+                power.status(),
+                xiaozhi_core::board::PowerStatus::Charging
+                    | xiaozhi_core::board::PowerStatus::Charged
+            ),
             core::sync::atomic::Ordering::Relaxed,
         );
         // 电量: 仅 Idle + 10s 限频 (S3 WiFi PHY 与 SARADC 共用 ADC1,
@@ -840,12 +1109,38 @@ pub async fn run(
                 .unwrap_or_else(|| BATTERY_PCT.load(core::sync::atomic::Ordering::Relaxed));
             BATTERY_PCT.store(pct, core::sync::atomic::Ordering::Relaxed);
             // 10s 一次诊断 (M8 项 9 验收): 电量 + 充电态, 确认不再崩 pm_on_beacon_rx
-            let charging = matches!(power.status(), xiaozhi_core::board::PowerStatus::Charging);
+            let status = power.status();
+            let charging = matches!(status, xiaozhi_core::board::PowerStatus::Charging);
+            let on_external = matches!(
+                status,
+                xiaozhi_core::board::PowerStatus::Charging
+                    | xiaozhi_core::board::PowerStatus::Charged
+            );
             info!(
                 "电量: {}% (充电: {})",
                 pct,
                 if charging { "是" } else { "否" }
             );
+            // 低电提醒 (对齐 C++: <20% 且放电, 仅一次; 回升到 25% 后复位)
+            if on_external || pct >= 25 {
+                low_batt_latched = false;
+            } else if pct > 0 && pct < 20 && !low_batt_latched {
+                low_batt_latched = true;
+                warn!("低电量: {}% — 播放提示", pct);
+                notify_text.clear();
+                let _ = write!(&mut notify_text, "LOW BAT {}%", pct);
+                notify_until_ms = now_ms + 5_000;
+                if !prompt.is_active() {
+                    if !audio.pa_enabled() {
+                        audio.set_pa(true);
+                    }
+                    low_power = false;
+                    prompt.play(Clip::LowBattery);
+                    prompt_until_ms = now_ms + prompt.duration_ms() + 400;
+                    // 重新起算空闲窗口: 播完 60s 仍可正常进入低功耗待机
+                    idle_policy.note_activity(now_ms);
+                }
+            }
             // 堆水位诊断 (10s): 只看内部 RAM 分区, 不能把 8MB PSRAM 算进去
             let hs = esp_alloc::HEAP.stats();
             if let Some(r) = hs.region_stats.iter().flatten().find(|r| {
@@ -891,11 +1186,14 @@ pub async fn run(
         }
         pending.clear();
 
-        // 音频会话期间关闭 WiFi 省电; 建连前等预切换完成
-        #[cfg(feature = "ps-always-none")]
-        let session_active = true;
-        #[cfg(not(feature = "ps-always-none"))]
+        // WiFi 省电策略: 默认常开 `None`。
+        // ROADMAP 记录自适应切换 (空闲 Minimum / 会话 None) 会因切换瞬间
+        // 丢 1~3 包导致长句断序, 已在真机回退; 用 `ps-adaptive` 重新做 A/B,
+        // 未复测前不作为默认。
+        #[cfg(feature = "ps-adaptive")]
         let session_active = sm.state() != DialogState::Idle;
+        #[cfg(not(feature = "ps-adaptive"))]
+        let session_active = true;
         crate::wifi::WIFI_AUDIO_ACTIVE.store(session_active, core::sync::atomic::Ordering::Relaxed);
         if pending_connect
             && (crate::wifi::WIFI_PS_READY.load(core::sync::atomic::Ordering::Relaxed)
@@ -942,6 +1240,12 @@ pub async fn run(
         }
 
         // ---- 5. 等回复超时: 20s 无服务器消息恢复待机 ----
+        // 状态可能在本轮 step 1/3/4 已经变化 (例如长按 BOOT 后松开):
+        // 先同步进入时刻, 否则会拿上一状态的时刻误判超时 (step 9 才更新)。
+        // 注意不要提前改 `last_state`: 它还负责触发 step 9 的显示刷新。
+        if last_state != Some(sm.state()) {
+            state_since_ms = now_ms;
+        }
         if sm.state() == DialogState::WaitingReply && now_ms - state_since_ms > 20_000 {
             warn!("等回复超时 (20s), 结束会话");
             // 通知服务器释放通道 (MQTT 网关 bridge 会一直挂着, 下次 hello
@@ -999,43 +1303,59 @@ pub async fn run(
                         &mono_buf[..ns],
                     );
                     // 1Hz 电平诊断 (原始域): 阈值调参/假唤醒排查
-                    // peak = 自上次打印以来的最大块 rms (说话峰值可能落在采样点之间)
-                    let (mean, rms) = level_stats(&mono_buf[..ns]);
-                    idle_peak_rms = idle_peak_rms.max(rms);
-                    // 环境噪声自适应: 慢速 EMA 估计噪声底, 阈值 = 2x 噪声 + 150,
-                    // 限制在 [VAD_THRESHOLD, 1200], 避免吵环境里持续误唤醒 (周期性"嘟")
-                    // 快降慢升: 迅速跟随安静底噪, 忽略说话/瞬态抬升
-                    // 阈值先用上一轮噪声底算; 只有低于阈值的块才更新噪声底,
-                    // 避免说话声自己把阈值抬高 (天花板 650)
-                    let wake_threshold = adaptive_threshold(noise_ema, VAD_THRESHOLD, 650);
-                    if rms < wake_threshold as i32 {
-                        noise_ema = update_noise_floor(noise_ema, rms);
+                    // peak = 自上次打印以来的最大子块 rms
+                    //
+                    // 按 60ms 子块处理: pop 返回的是 64~512ms 的变长块,
+                    // 整块算 RMS 会稀释短语音, 整块只算一帧也会让 4 帧去抖
+                    // 变成 0.25~2s。固定子块后 VAD/去抖/噪声底才稳定。
+                    let mut mean = 0i32;
+                    let mut rms = 0i32;
+                    let mut wake_threshold = adaptive_threshold(noise_ema, VAD_THRESHOLD, 650);
+                    for chunk in mono_buf[..ns].chunks(FRAME_SAMPLES) {
+                        let (m, r) = level_stats(chunk);
+                        mean = m;
+                        rms = r;
+                        idle_peak_rms = idle_peak_rms.max(r);
+                        // 环境噪声自适应: 慢速 EMA 估计噪声底, 阈值 = 1.5x + 100,
+                        // 限制在 [VAD_THRESHOLD, 650]; 只有低于阈值的块才更新,
+                        // 避免说话声自己把阈值抬高。
+                        wake_threshold = adaptive_threshold(noise_ema, VAD_THRESHOLD, 650);
+                        if r < wake_threshold as i32 {
+                            noise_ema = update_noise_floor(noise_ema, r);
+                        }
+                        wake.source_mut().set_threshold(wake_threshold);
+                        // 提示音播放期 + 尾音窗口: 不喂 VAD, 防扬声器自唤醒
+                        if now_ms >= prompt_until_ms {
+                            triggered |= wake.feed(chunk, now_ms) == WakeEvent::Triggered;
+                        }
                     }
-                    wake.source_mut().set_threshold(wake_threshold);
                     if now_ms.saturating_sub(last_level_log_ms) >= 1_000 {
                         last_level_log_ms = now_ms;
-                        let regs = audio.es7210_debug_regs();
-                        let rd = |reg: u8| {
-                            regs.iter()
-                                .find(|(r, _)| *r == reg)
-                                .map(|(_, v)| *v)
-                                .unwrap_or(0xFF)
-                        };
-                        crate::diag!(
-                            "待机电平: mean={} rms={} peak={} (阈值 {}) ES7210 01={:02X} 08={:02X} 02={:02X}",
-                            mean,
-                            rms,
-                            idle_peak_rms,
-                            wake_threshold,
-                            rd(0x01),
-                            rd(0x08),
-                            rd(0x02)
-                        );
+                        #[cfg(feature = "debug-diag")]
+                        {
+                            // 只在诊断构建里回读寄存器: release 下这 12 次 I2C
+                            // 约 5ms/s, 且结果无人使用。
+                            let regs = audio.es7210_debug_regs();
+                            let rd = |reg: u8| {
+                                regs.iter()
+                                    .find(|(r, _)| *r == reg)
+                                    .map(|(_, v)| *v)
+                                    .unwrap_or(0xFF)
+                            };
+                            crate::diag!(
+                                "待机电平: mean={} rms={} peak={} (阈值 {}) ES7210 01={:02X} 08={:02X} 02={:02X}",
+                                mean,
+                                rms,
+                                idle_peak_rms,
+                                wake_threshold,
+                                rd(0x01),
+                                rd(0x08),
+                                rd(0x02)
+                            );
+                        }
+                        #[cfg(not(feature = "debug-diag"))]
+                        let _ = (mean, rms, wake_threshold);
                         idle_peak_rms = 0;
-                    }
-                    // 提示音播放期 + 尾音窗口: 不喂 VAD, 防扬声器自唤醒
-                    if now_ms >= prompt_until_ms {
-                        triggered |= wake.feed(&mono_buf[..ns], now_ms) == WakeEvent::Triggered;
                     }
                 },
                 DialogState::Listening => {
@@ -1172,6 +1492,7 @@ pub async fn run(
             preroll_flush = true;
             preroll_off = 0;
             preroll_from = preroll_seq;
+            preroll_deadline = now_ms + 1_000;
         }
 
         // auto 模式本地收尾: 说过话且静音 800ms, 或 12s 无人声 → listen stop
@@ -1212,6 +1533,10 @@ pub async fn run(
             // 丢包隐藏: 对缺口补 1~4 帧 PLC, 避免解码断点产生爆音
             if pkt.data.is_empty() {
                 for _ in 0..pkt.lost.min(4) {
+                    // 外层只按单帧预检过一次; PLC 最多补 4 帧, 必须逐帧再检
+                    if !playback.has_space() {
+                        break;
+                    }
                     match decoder.decode(&[], &mut pcm_dec) {
                         Ok(n) if n > 0 => {
                             let n = n.min(pcm_dec.len());
@@ -1248,15 +1573,26 @@ pub async fn run(
         // ---- 8. 时钟维持: 软件队列 → DMA 环形, 没数据时补静音 ----
         // 空闲提示音优先占用输出; 播完后恢复常规泵送 (补静音)
         if prompt.is_active() && prompt.pump(audio, &mut stereo_out[..]) {
-            if prompt.is_wake_ack() {
-                // 唤醒应答播完: 恢复用户音量 (预录补发已由 ack_flush_at 触发)
-                prompt_vol_restore_at = now_ms + 200;
-            } else {
-                low_power = true;
-                prompt_vol_restore_at = now_ms + 300;
-                // 功放断电: 消掉空闲期的功放底噪/RF 串扰, 同时省电
-                audio.set_pa(false);
-                info!("提示音播放完成, 进入低功耗待机 (功放关闭)");
+            match prompt.kind() {
+                Clip::WakeAck => {
+                    // 唤醒应答播完: 恢复用户音量 (预录补发已由 ack_flush_at 触发)
+                    prompt_vol_restore_at = now_ms + 200;
+                },
+                Clip::IdlePrompt => {
+                    low_power = true;
+                    prompt_vol_restore_at = now_ms + 300;
+                    // 功放断电: 消掉空闲期的功放底噪/RF 串扰, 同时省电
+                    audio.set_pa(false);
+                    info!("提示音播放完成, 进入低功耗待机 (功放关闭)");
+                },
+                // 低电/错误/alert/成功音: 播完恢复音量; 若仍在待机则回到低功耗
+                _ => {
+                    prompt_vol_restore_at = now_ms + 200;
+                    if sm.state() == DialogState::Idle {
+                        low_power = true;
+                        audio.set_pa(false);
+                    }
+                },
             }
         }
         if !prompt.is_active() {
@@ -1273,13 +1609,14 @@ pub async fn run(
         if playback.take_prebuffer_done() {
             crate::diag!("预缓冲完成: {}B", playback.queue_len());
         }
-        if sm.state() == DialogState::Speaking && now_ms.saturating_sub(tx_rate_ms) >= 1_000 {
+        if sm.state() == DialogState::Speaking && now_ms.saturating_sub(tx_rate_ms) >= 2_000 {
             let tx_bytes = playback.tx_bytes();
             crate::diag!(
-                "TX 推送速率: {}B/s (队列 {}B, 欠载累计 {})",
+                "播报队列: PCM {}KB, 下行 {}, 欠载 {}, TX {}B/s",
+                playback.queue_len() / 1024,
+                channels.downlink.len(),
+                playback.underruns(),
                 (tx_bytes - tx_rate_bytes) * 1000 / now_ms.saturating_sub(tx_rate_ms).max(1),
-                playback.queue_len(),
-                playback.underruns()
             );
             tx_rate_ms = now_ms;
             tx_rate_bytes = tx_bytes;
@@ -1288,21 +1625,27 @@ pub async fn run(
         // TtsStop 延迟派发: 队列空 + DMA 播完后才回到 Listening (防回声)
         if playback.poll_stop(now_ms) {
             wake.policy_mut().note_playback_end(now_ms);
-            listen_grace_until_ms = now_ms + 100;
+            // 软件队列已空, 但 TX DMA 环里可能还有 ~128ms 尾音:
+            // 留 500ms 本地静默期, 避免一进入 Listening 就录到自己的尾音。
+            listen_grace_until_ms = now_ms + 500;
+            // 尾音同样禁止上行: 否则服务端 ASR 会把扬声器尾音/混响识别成
+            // 用户说话, 回一句「我听到啦」形成自问自答 (真机日志可见)。
+            mic_mute_until_ms = mic_mute_until_ms.max(now_ms + 600);
+            // 播报期间积压的上行帧里全是扬声器回声, 不能等会话任务慢慢发完:
+            // 全部丢弃, 否则 tts stop 之后服务器还会收到 1~2s 的“用户说话”。
+            while channels.uplink.try_receive().is_ok() {}
+            acc_len = 0;
             dispatch(&mut sm, &mut pending, DialogEvent::TtsStop);
         }
-        // 让出 CPU: 会话任务/网络任务需要被轮询才能推进连接与收发
-        // Idle 时放宽到 10ms (降 CPU 唤醒频率, I2S 缓冲 512ms 容量足够)
+        // 让出 CPU: 会话任务/网络任务需要被轮询才能推进连接与收发。
+        // 活跃态 4ms (原 1ms): 下行解码 3 帧/轮仍 >45x 实时, RX 环 512ms,
+        // 足以覆盖; 唤醒次数降 4 倍。Idle 保持 10ms。
         let wait_ms = if sm.state() == DialogState::Idle {
             10
         } else {
-            1
+            4
         };
-        // 低功耗待机: 轻睡实验暂时停用 (真机出现无法唤醒, 待单独验证后恢复)
-        let slept = false;
-        if !slept {
-            embassy_time::Timer::after(embassy_time::Duration::from_millis(wait_ms)).await;
-        }
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(wait_ms)).await;
 
         // ---- 9. 灯语 + 显示状态 ----
         let led = match sm.state() {
@@ -1339,6 +1682,18 @@ pub async fn run(
                 },
             );
         }
+        // 通知行 (音量/低电/错误/alert): 显示到超时, 文本变化时重绘
+        if now_ms < notify_until_ms {
+            if notify_shown.as_deref() != Some(notify_text.as_str()) {
+                display.draw_notification(notify_text.as_str(), Rgb565::YELLOW);
+                notify_shown = Some(notify_text.clone());
+            }
+        } else if notify_shown.is_some() {
+            display.clear_notification();
+            notify_shown = None;
+        }
+        // 文本缓存供下一批屏幕 UI 渲染 (当前 3x5 字库无中文, 暂不显示)
+        let _ = (&last_user_text, &last_assistant_text);
     }
 }
 
@@ -1350,22 +1705,8 @@ pub async fn run(
 /// 杜绝环形欠载时 DMA 绕回重放旧数据 (听感为逐字重复/杂音)。
 /// 返回是否发生「播报中队列空、只能补静音」的欠载
 /// PSRAM 分配唤醒预录环 (失败回退内部 RAM)
-fn alloc_preroll() -> &'static mut [i16] {
-    use core::alloc::Layout;
-    let bytes = PREROLL_SAMPLES * 2;
-    let layout = Layout::from_size_align(bytes, 4).expect("bad layout");
-    // SAFETY: 非零布局; 分配块常驻
-    let p =
-        unsafe { esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::External.into(), layout) };
-    if p.is_null() {
-        alloc::vec![0i16; PREROLL_SAMPLES].leak()
-    } else {
-        // SAFETY: 可写 bytes 字节, 清零后按 i16 使用
-        unsafe {
-            core::ptr::write_bytes(p, 0, bytes);
-            core::slice::from_raw_parts_mut(p.cast::<i16>(), PREROLL_SAMPLES)
-        }
-    }
+pub fn alloc_preroll() -> &'static mut [i16] {
+    crate::mem::psram_i16(PREROLL_SAMPLES)
 }
 
 /// 追加原始 PCM 到预录环 (保留最近 len 个样本)
@@ -1449,15 +1790,11 @@ fn event_label(ev: DialogEvent) -> &'static str {
     }
 }
 
-/// MCP 请求应答 (会话任务内; 设备状态经原子量读取, set_volume 经命令下发)
+/// MCP 请求应答 (会话任务内; 设备状态经原子量读取, set_volume 写待办)
 ///
-/// 由 [`session_task`] 在收到服务器 `type=mcp` 文本帧时调用, 回送
+/// 由两种传输在收到服务器 `type=mcp` 文本帧时调用, 回送
 /// initialize/tools_list/tools_call 应答 (见 session.rs HELLO 的 `features.mcp`)。
-pub(crate) fn mcp_handle(
-    text: &str,
-    volume: u8,
-    channels: &Channels,
-) -> Option<heapless::String<1024>> {
+pub(crate) fn mcp_handle(text: &str, volume: u8) -> Option<heapless::String<1024>> {
     use xiaozhi_core::mcp;
     let Some(req) = mcp::parse_request(text) else {
         return None; // notifications / 无法解析: 无需回应
@@ -1477,14 +1814,10 @@ pub(crate) fn mcp_handle(
             },
             ("self.audio_speaker.set_volume", Some(v)) => {
                 let v = v.clamp(0, 100) as u8;
+                // 直接投递到音频侧待办: WS/MQTT 两种传输共用同一条副作用路径
                 VOLUME_PCT.store(v, core::sync::atomic::Ordering::Relaxed);
-                if channels
-                    .command
-                    .try_send(SessionCommand::SetVolume(v))
-                    .is_err()
-                {
-                    warn!("MCP: 命令通道满, 音量设置丢弃");
-                }
+                PENDING_VOLUME.store(v, core::sync::atomic::Ordering::Relaxed);
+                PENDING_VOLUME_VALID.store(true, core::sync::atomic::Ordering::Relaxed);
                 mcp::text_result_response(req.id, "true")
             },
             ("self.reboot", _) => {
@@ -1507,4 +1840,16 @@ pub(crate) fn mcp_handle(
         },
         mcp::McpMethod::Unknown(_) => mcp::error_response(req.id, "Method not implemented"),
     })
+}
+
+/// MCP `self.reboot`: 应答成功发出后延迟复位 (WS / MQTT 共用)
+///
+/// `mcp_handle` 只置位; 调用方必须在本条应答真正写入 socket 后调用本函数,
+/// 发送失败时应清掉标志, 避免下一条无关应答误触发重启。
+pub async fn mcp_maybe_reboot() {
+    if MCP_REBOOT.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        info!("MCP: 应答已发送, 200ms 后重启");
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(200)).await;
+        esp_hal::system::software_reset();
+    }
 }

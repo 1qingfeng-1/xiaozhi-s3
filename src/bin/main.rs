@@ -58,29 +58,7 @@ const POP_BUF_SIZE: usize = 4092 * 8;
 /// 单 DMA 描述符字节数 (4092B ≈ 64ms @ 16kHz 立体声)
 const BLOCK_BYTES: usize = 4092;
 
-/// 从 PSRAM (External) 分配字节缓冲; 失败回退内部 RAM
-fn psram_bytes(len: usize) -> &'static mut [u8] {
-    use core::alloc::Layout;
-    let layout = Layout::from_size_align(len, 4).expect("bad layout");
-    // SAFETY: 非零布局, 分配块常驻 (泄漏至重启)
-    let p =
-        unsafe { esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::External.into(), layout) };
-    if p.is_null() {
-        alloc::vec![0u8; len].leak()
-    } else {
-        // SAFETY: alloc_caps 返回 len 字节可写内存; 必须清零 (否则"静音"是随机字节)
-        unsafe {
-            core::ptr::write_bytes(p, 0, len);
-            core::slice::from_raw_parts_mut(p, len)
-        }
-    }
-}
-
-fn psram_i16(len: usize) -> &'static mut [i16] {
-    let b = psram_bytes(len * 2);
-    // SAFETY: 4 字节对齐, 长度按 i16 计
-    unsafe { core::slice::from_raw_parts_mut(b.as_mut_ptr().cast(), len) }
-}
+use xiaozhi_s3::mem::{psram_bytes, psram_i16, psram_static};
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -101,6 +79,21 @@ async fn main(spawner: Spawner) -> ! {
     // 板子工厂: 内部堆第一行注册 → 音频 DMA 缓冲 → PSRAM 最后注册
     let mut board = create_board(peripherals);
     info!("板子 [{}] 初始化完成", board.name);
+    // PSRAM 不可用时所有大缓冲都会回退内部堆, 合计 >150KB 必然 OOM;
+    // 启动即告警, 避免后面出现难以定位的分配失败。
+    let psram_ok = esp_alloc::HEAP
+        .stats()
+        .region_stats
+        .iter()
+        .flatten()
+        .any(|r| {
+            r.size > 0
+                && r.capabilities
+                    .contains(esp_alloc::MemoryCapability::External)
+        });
+    if !psram_ok {
+        error!("PSRAM 不可用: 音频大缓冲将回退内部堆, 可能 OOM");
+    }
 
     // 电池电量: ADC 只在 WiFi 启动前读一次 (S3 的 WiFi PHY 与 SARADC 共用,
     // WiFi 激活期间读 ADC1 会干扰 PHY, 曾触发 WiFi blob 崩溃, 见 app.rs)
@@ -139,7 +132,8 @@ async fn main(spawner: Spawner) -> ! {
     // xiaozhi WS 协议版本 (NVS 0xB000, 默认 1): ≥2 时上行帧带时间戳
     // (最终传输方式由 OTA 是否下发 MQTT 配置决定, 见下方会话任务选择)
     let ws_version = store::load_ws_version(flash);
-    let mut server_aec = ws_version >= 2;
+    // 仅 v2 帧带服务端 AEC 时间戳; v3 头没有 timestamp
+    let mut server_aec = ws_version == 2;
     info!("WS 协议版本: v{}", ws_version);
 
     // BOOT 键**持续按住 3s**: 清除凭据强制重回配网
@@ -158,16 +152,14 @@ async fn main(spawner: Spawner) -> ! {
         }
     }
 
-    // 任务间通道 (静态常驻)
-    let channels = xiaozhi_s3::mk_static!(
-        Channels,
-        Channels {
-            uplink: Channel::new(),
-            downlink: Channel::new(),
-            command: Channel::new(),
-            event: Channel::new(),
-        }
-    );
+    // 任务间通道: 约 23KB, 放 PSRAM 以保住主任务栈 (opus 编码需要)
+    let channels = psram_static(Channels {
+        uplink: Channel::new(),
+        downlink: Channel::new(),
+        command: Channel::new(),
+        event: Channel::new(),
+        ui: Channel::new(),
+    });
 
     // WiFi: 有凭据连 STA; 无凭据/连接失败 → 配网模式 (SoftAP 表单, 保存后重启)
     // controller 必须活到 main 结束 (保活射频状态), 勿提前 drop
@@ -177,15 +169,27 @@ async fn main(spawner: Spawner) -> ! {
                 let server = match config.server.as_str().parse() {
                     Ok(ip) => ip,
                     Err(_) => {
-                        error!("服务器地址无效: {}", config.server.as_str());
+                        // 旧配置/手误写入非法地址: 复位但不改配置会形成无限
+                        // 重启循环, 这里清凭据回到配网。
+                        error!(
+                            "服务器地址无效: {} — 清除凭据进入配网",
+                            config.server.as_str()
+                        );
+                        let _ = store::clear(flash);
                         esp_hal::system::software_reset();
                     },
                 };
                 (stack, server, controller, mac)
             },
-            Err(_) => {
-                error!("WiFi 连接失败, 清除凭据重启进入配网");
+            Err(wifi::ConnectError::Association) => {
+                error!("WiFi 关联/认证失败, 清除凭据重启进入配网");
                 let _ = store::clear(flash);
+                esp_hal::system::software_reset();
+            },
+            Err(wifi::ConnectError::DhcpTimeout) => {
+                // DHCP 池满/路由器异常: 保留凭据, 稍后重启重试
+                error!("DHCP 超时, 保留凭据, 10s 后重启重试");
+                embassy_time::Timer::after(embassy_time::Duration::from_secs(10)).await;
                 esp_hal::system::software_reset();
             },
         },
@@ -251,9 +255,29 @@ async fn main(spawner: Spawner) -> ! {
     // 传输方式: OTA 下发过 MQTT 网关配置 → MQTT+UDP, 否则 WebSocket
     // embassy_executor::task: 调用返回 SpawnToken, 必须交给 spawner.spawn
     // (丢弃 token 会 panic)
-    let mqtt_cfg = store::load_mqtt(flash);
+    // 配置损坏/endpoint 非法时回退 WS (否则 mqtt 任务会永久休眠,
+    // 设备表现为"联网但无语音通道")
+    let mqtt_cfg = match store::load_mqtt(flash) {
+        Some(cfg) if xiaozhi_s3::mqtt_session::parse_endpoint(cfg.endpoint.as_str()).is_some() => {
+            Some(cfg)
+        },
+        Some(cfg) => {
+            error!(
+                "MQTT endpoint 非法 ({}), 清除配置并回退 WS",
+                cfg.endpoint.as_str()
+            );
+            let _ = store::clear_mqtt(flash);
+            None
+        },
+        None => None,
+    };
     // UDP 通道恒带时间戳, 服务端 AEC 可用 → 播报中持续上行
     server_aec |= mqtt_cfg.is_some();
+    #[cfg(feature = "aec-off")]
+    {
+        server_aec = false;
+        info!("诊断 aec-off: 播报中不上行");
+    }
     if server_aec {
         info!("服务端 AEC: 开 (上行帧携带时间戳)");
     }
@@ -293,6 +317,11 @@ async fn main(spawner: Spawner) -> ! {
         esp_hal::delay::Delay::new().delay_millis(12_000);
     }
 
+    // 常驻播放管线/预录环: 只分配一次, CaptureFault 重入时复用
+    // (放在 run() 里会导致每次重入泄漏 192KB + 32KB)
+    let mut playback = xiaozhi_s3::audio::playback::Playback::new();
+    let preroll = app::alloc_preroll();
+
     // 采集常驻 + 主循环 (采集故障 → 直线路径重建 → 重进)
     let mut cap = match board.capture.start() {
         Ok(t) => t,
@@ -313,6 +342,8 @@ async fn main(spawner: Spawner) -> ! {
                 cap: &mut cap,
                 channels,
                 flash,
+                playback: &mut playback,
+                preroll: &mut preroll[..],
                 server_aec,
             },
             &mut pop_buf[..],

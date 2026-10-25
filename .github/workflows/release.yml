@@ -139,6 +139,13 @@ jobs:
           mv release/xiaozhi-s3 release/xiaozhi-s3-${{ needs.changelog.outputs.tag_name }}.bin
           ls -lh release/
 
+      # Release body 里的 $(...) 不会被执行, 先在这里算好
+      - name: Collect release metadata
+        id: meta
+        run: |
+          echo "size=$(du -sh release/xiaozhi-s3-*.bin | cut -f1)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -155,8 +162,8 @@ jobs:
 
             - **芯片**: ESP32-S3R8
             - **Flash**: 16MB
-            - **固件大小**: $(du -sh release/xiaozhi-s3-*.bin | cut -f1)
-            - **构建日期**: $(date +%Y-%m-%d)
+            - **固件大小**: ${{ steps.meta.outputs.size }}
+            - **构建日期**: ${{ steps.meta.outputs.date }}
 
             ### 烧录方法
 

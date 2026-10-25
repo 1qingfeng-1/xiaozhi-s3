@@ -1,8 +1,10 @@
-//! 空闲提示音播放器
+//! 本地提示音播放器
 //!
-//! 资源为 16kHz 单声道 s16le（`assets/idle_prompt.raw`，由
-//! `tools/gen_prompt.sh` 合成），播放时转成立体声写入 I2S TX 环形。
-//! 采用**非阻塞分片**：每轮只往环形空闲区推数据，绝不阻塞音频主循环。
+//! 资源为 16kHz 单声道 s16le（`assets/*.raw`）。空闲提示与唤醒应答由
+//! `tools/gen_prompt.sh` 合成；低电/错误/提醒/成功音由 C++ 参考工程的
+//! OGG 资源转码而来（`tools/convert_prompts.sh`）。
+//! 播放时转成立体声写入 I2S TX 环形，采用**非阻塞分片**：每轮只往环形
+//! 空闲区推数据，绝不阻塞音频主循环。
 
 use crate::bsp::components::Audio;
 
@@ -10,15 +12,40 @@ use crate::bsp::components::Audio;
 pub const IDLE_PROMPT: &[u8] = include_bytes!("../assets/idle_prompt.raw");
 /// 语音唤醒应答「我在」
 pub const WAKE_ACK: &[u8] = include_bytes!("../assets/wake_ack.raw");
+/// 低电量提示
+pub const LOW_BATTERY: &[u8] = include_bytes!("../assets/low_battery.raw");
+/// 错误提示（网络/协议异常）
+pub const ERROR_SOUND: &[u8] = include_bytes!("../assets/exclamation.raw");
+/// 服务器 alert 提醒
+pub const ALERT_SOUND: &[u8] = include_bytes!("../assets/vibration.raw");
+/// 启动就绪提示
+pub const SUCCESS_SOUND: &[u8] = include_bytes!("../assets/success.raw");
 
-/// 当前片段类型
+/// 提示音片段
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Clip {
     IdlePrompt,
     WakeAck,
+    LowBattery,
+    Error,
+    Alert,
+    Success,
 }
 
-/// 提示音播放器（空闲提示 / 唤醒应答共用）
+impl Clip {
+    const fn pcm(self) -> &'static [u8] {
+        match self {
+            Clip::IdlePrompt => IDLE_PROMPT,
+            Clip::WakeAck => WAKE_ACK,
+            Clip::LowBattery => LOW_BATTERY,
+            Clip::Error => ERROR_SOUND,
+            Clip::Alert => ALERT_SOUND,
+            Clip::Success => SUCCESS_SOUND,
+        }
+    }
+}
+
+/// 提示音播放器（本地提示音共用；同一时刻只播一段，新片段覆盖旧片段）
 pub struct PromptPlayer {
     pcm: &'static [u8],
     kind: Clip,
@@ -36,25 +63,37 @@ impl PromptPlayer {
         }
     }
 
-    /// 播放空闲提示音
-    pub fn play_idle(&mut self) {
-        self.pcm = IDLE_PROMPT;
-        self.kind = Clip::IdlePrompt;
+    /// 播放指定片段（覆盖当前片段）
+    pub fn play(&mut self, clip: Clip) {
+        self.pcm = clip.pcm();
+        self.kind = clip;
         self.pos = 0;
         self.active = true;
     }
 
+    /// 播放空闲提示音
+    pub fn play_idle(&mut self) {
+        self.play(Clip::IdlePrompt);
+    }
+
     /// 播放唤醒应答「我在」
     pub fn play_wake_ack(&mut self) {
-        self.pcm = WAKE_ACK;
-        self.kind = Clip::WakeAck;
-        self.pos = 0;
-        self.active = true;
+        self.play(Clip::WakeAck);
+    }
+
+    /// 当前片段类型
+    pub fn kind(&self) -> Clip {
+        self.kind
     }
 
     /// 当前片段是否为唤醒应答
     pub fn is_wake_ack(&self) -> bool {
         self.kind == Clip::WakeAck
+    }
+
+    /// 当前片段是否为空闲提示音
+    pub fn is_idle_prompt(&self) -> bool {
+        self.kind == Clip::IdlePrompt
     }
 
     /// 中止播放（唤醒/进入会话时调用）

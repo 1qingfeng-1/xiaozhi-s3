@@ -295,10 +295,10 @@ espflash flash --chip esp32s3 target/xtensa-esp32s3-none-elf/release/xiaozhi-s3
 
 ### 目标
 
-- **启动时间**: < 2 秒
-- **音频延迟**: < 100ms
-- **内存占用**: < 100KB (运行时)
-- **固件大小**: < 4MB
+- **启动时间**: 进入主循环 < 2 秒（不含 WiFi 连接/OTA 检查，后者最长 45s）
+- **音频延迟**: 本地采集→编码 < 100ms；服务端 TTS 端到端约 1s 预缓冲 + 最长 3s 队列
+- **内存占用**: 内部堆 128KB（DMA ~45KB + opus ~30KB + 网络）；PCM/预录/MQTT 大缓冲走 PSRAM
+- **固件大小**: < 4MB（当前 release ~1.1MB 文本 + ~0.44MB rodata）
 
 ### 监控
 

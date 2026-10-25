@@ -13,16 +13,21 @@ use xiaozhi_core::protocol::AecClock;
 
 use crate::bsp::components::Audio;
 
-/// PCM 队列上限 (立体声 16bit, 128KB ≈ 2s, 走 PSRAM)
-pub const QUEUE_MAX: usize = 192 * 1024;
-/// PSRAM 分配失败时的内部 RAM 回退容量 (0.5s)
+/// PCM 队列上限 (立体声 16bit, 512KB ≈ 8s @64KB/s, 走 PSRAM)
+///
+/// 服务端 TTS 通常快于实时、成串下发; 3s 队列会在长句尾部反压到
+/// UDP/downlink 并丢包。8s 队列留足突发吸收空间 (PSRAM 8MB, 代价可接受)。
+pub const QUEUE_MAX: usize = 512 * 1024;
+/// PSRAM 分配失败时的内部 RAM 回退容量 (≈0.5s)
 const QUEUE_FALLBACK: usize = 32 * 1024;
-/// 预缓冲阈值: 0.5s 立体声
+/// 预缓冲阈值: 1.0s 立体声 (64KB/s)
 pub const PREBUFFER: usize = 16_000 / 1000 * 1000 * 4;
 /// 单帧最大 PCM 字节数 (60ms 立体声 16bit)
 pub const FRAME_MAX: usize = 960 * 4;
-/// TtsStop 后等 DMA 播完的余量
-const DRAIN_MS: u64 = 50;
+/// TtsStop 后等 DMA 播完的余量: 必须 ≥ TX 环形时长 (8184B ≈128ms)
+const DRAIN_MS: u64 = 200;
+/// TX DMA 卡死兜底: 队列满时长 (≈3.07s) + TX 环 + 余量
+const FORCE_MS: u64 = (QUEUE_MAX as u64 * 1000) / 64_000 + 1_000;
 
 /// 优先从 PSRAM (External) 分配；失败回退内部 RAM (容量缩半)
 fn alloc_ring(size: usize) -> (&'static mut [u8], usize) {
@@ -59,13 +64,15 @@ pub struct Playback {
 impl Playback {
     pub fn new() -> Self {
         let (buf, cap) = alloc_ring(QUEUE_MAX);
+        // PSRAM 失败时回退 32KB: 预缓冲必须小于回退容量, 否则永远不开始播放
+        let prebuffer = PREBUFFER.min(cap / 2);
         Self {
             buf,
             cap,
             read: 0,
             write: 0,
             len: 0,
-            flow: PlaybackFlow::new(PREBUFFER, DRAIN_MS),
+            flow: PlaybackFlow::new(prebuffer, DRAIN_MS, FORCE_MS),
             underruns: 0,
             tx_bytes: 0,
             ts: PlayoutTimestamps::new(),
@@ -73,6 +80,11 @@ impl Playback {
     }
 
     pub fn on_tts_start(&mut self) {
+        // 新回复开始: 上一轮若仍有残留 (例如服务器提前发 tts start),
+        // 必须丢弃, 否则新旧音频会拼接成延迟/重复播放。
+        if self.flow.pending_stop() || self.len > 0 {
+            self.reset();
+        }
         self.flow.on_tts_start(self.len);
     }
 

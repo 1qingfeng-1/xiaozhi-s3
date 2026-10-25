@@ -112,7 +112,8 @@ pub fn create_board(peripherals: Peripherals) -> Board {
     // 110KB 曾致 WiFi 协议栈堆不足 (配网 SoftAP 手机连不上)。
     esp_alloc::heap_allocator!(size: 128_000);
 
-    // 编译期校验: 硬接线与所选板子的 BSP 配置一致 (换板时改错立即报错)
+    // 编译期校验: 硬接线与所选板子的 BSP 配置一致 (换板时改错立即报错)。
+    // 覆盖全部实际用到的引脚/地址, 避免 BOARD 字段与工厂硬编码漂移。
     const _: () = assert!(
         BOARD.leds.builtin_gpio == 17
             && BOARD.buttons.boot_gpio == 1
@@ -121,6 +122,24 @@ pub fn create_board(peripherals: Peripherals) -> Board {
             && BOARD.power.charging_gpio == 41
             && BOARD.power.charge_done_gpio == 42
             && BOARD.power.battery_adc_gpio == 3
+            && BOARD.power.battery_voltage_multiplier == 3
+            && BOARD.audio.mclk_gpio == 40
+            && BOARD.audio.ws_gpio == 45
+            && BOARD.audio.bclk_gpio == 39
+            && BOARD.audio.din_gpio == 21
+            && BOARD.audio.dout_gpio == 48
+            && BOARD.codec_ctrl.sda_gpio == 38
+            && BOARD.codec_ctrl.scl_gpio == 47
+            && BOARD.codec_ctrl.dac_addr == 0x18
+            && BOARD.codec_ctrl.adc_addr == 0x40
+            && BOARD.display.sck_gpio == 7
+            && BOARD.display.mosi_gpio == 6
+            && BOARD.display.cs_gpio == 15
+            && BOARD.display.dc_gpio == 16
+            && BOARD.display.reset_gpio == 5
+            && BOARD.display.backlight_gpio == 4
+            && BOARD.display.width_px == 240
+            && BOARD.display.height_px == 240
     );
 
     // LED17: 低电平点亮, LEDC PWM 12bit (呼吸调光)
@@ -219,7 +238,14 @@ pub fn create_board(peripherals: Peripherals) -> Board {
         let dc = Output::new(peripherals.GPIO16, Level::High, OutputConfig::default());
         let rst = Output::new(peripherals.GPIO5, Level::High, OutputConfig::default());
         let bl = Output::new(peripherals.GPIO4, Level::Low, OutputConfig::default());
-        components::Display::new(spi, dc, rst, bl)
+        components::Display::new(
+            spi,
+            dc,
+            rst,
+            bl,
+            BOARD.display.width_px,
+            BOARD.display.height_px,
+        )
     };
 
     // 板载 8MB Octal PSRAM 接入全局堆 (esp-hal 自动探测模式)。

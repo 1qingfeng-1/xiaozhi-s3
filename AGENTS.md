@@ -19,7 +19,7 @@ cargo fmt --all -- --check
 cargo clippy --all-features -- -D warnings --cap-lints allow   # 与 CI/pre-commit 一致
 cargo check --all
 
-# 核心层 136 个 host 单测 — 必须在 xiaozhi-core/ 目录内跑
+# 核心层 146 个 host 单测 — 必须在 xiaozhi-core/ 目录内跑
 cd xiaozhi-core && cargo +stable nextest run
 # 单测过滤: cargo +stable nextest run ota_crc
 # 或 cargo +stable test
@@ -39,7 +39,7 @@ xtensa；从根目录跑 `cargo +stable nextest run -p xiaozhi-core` 会拿父�
 - **不要在仓库根目录跑 `cargo test`**（作用于 xtensa target，必失败）；
 - xiaozhi-core 是独立 workspace 根（空 `[workspace]` + 自带 `.cargo/config.toml` 覆盖回 host target），
   不继承父目录的 esp target/-nostartfiles；
-- 只有 xiaozhi-core 有单测，且只能在 host 上跑（136 个，当前全绿）。
+- 只有 xiaozhi-core 有单测，且只能在 host 上跑（146 个，当前全绿）。
 
 ## 架构与分层
 
@@ -51,7 +51,7 @@ xiaozhi-s3/          固件 crate (no_std, esp-rtos 双任务)
 ├── src/session.rs   WS 传输层 (embassy-net TCP 上写手帧编解码, :8000 /xiaozhi/v1/, 含 ping/pong)
 ├── src/mqtt_session.rs MQTT+UDP 传输 (MQTT 控制通道 + UDP/AES-128-CTR 音频, 网关配置由 OTA 下发)
 ├── src/wdt.rs       主循环看门狗 (TIMG0 MWDT 8s, 每轮 feed)
-├── src/ota_check.rs OTA: main() 直线路径 POST :8003 检查 → download_and_flash
+├── src/ota_check.rs OTA: boot_ota_task 独立任务 POST :8003 检查 → download_and_flash
 │                    (HTTP200/完整性/分区上界/超时/失败退避 → 4KB 擦写 → otadata → 复位)
 ├── src/wifi/        STA 连接 + SoftAP 配网 + Flash 凭据/音量存取 (esp-storage)
 ├── src/audio/       opus FFI 安全封装 + wake_net (esp-sr, feature `wakenet`)
@@ -59,9 +59,9 @@ xiaozhi-s3/          固件 crate (no_std, esp-rtos 双任务)
 ├── src/macros.rs    mk_static! (StaticCell 常驻分配, 各 bin 共用)
 ├── partitions.csv   双 app 分区表 (见下); espflash.toml 声明其路径
 ├── vendor/          libopus (v1.6.1 裁剪) / esp-sr / esp-dsp 子集 / cjson (均 build.rs 编译或链接)
-xiaozhi-core/        git submodule, 纯逻辑层: audio (音量/时钟/codec 序列/状态机/唤醒 VAD) +
+xiaozhi-core/        git submodule, 纯逻辑层: audio (音量映射/时钟/codec 序列/唤醒 VAD/播放流程) +
                      dialog (对话状态机) + mcp (JSON-RPC 解析) + ota (清单/版本/e9 头/otadata 条目) +
-                     display + board 规则 + protocol/aes/mqtt/udp 编解码; host 可单测 (136 个), #![deny(unsafe_code)]
+                     display + board 规则 + protocol/aes/mqtt/udp 编解码; host 可单测 (146 个), #![deny(unsafe_code)]
 ```
 
 分层规则（改代码前必读）：
@@ -93,7 +93,7 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量/时钟/codec 序
 - **otadata 两条各占一扇区（4KB 间距），不是相邻 32B**——对齐 IDF `bootloader_common_read_otadata`；
   CRC = reflected CRC-32（init 0, xorout 0xFFFFFFFF）对 `ota_seq` 4B LE；
   纯逻辑在 `xiaozhi_core::ota`（`read_otadata`/`next_write`/`otadata_entry_offset`）。
-- **OTA 只在 main() 直线路径做**（采集未 start、会话任务未 spawn）：避免 flash 擦写停顿期间
+- **OTA 由 `boot_ota_task` 独立任务执行**（main await done；采集未 start、会话任务未 spawn）：避免 flash 擦写停顿期间
   I2S RX DMA 溢出（`DmaError::Late`）。勿把 flash 写塞进 `app::run` 循环或 `session_task`。
 - Flash 读写走 `esp-storage` `FlashStorage`（ROM 驱动；`features` 含 `defmt` 才能 `{:?}` 打印
   `FlashStorageError`）。同一 `FlashStorage` 实例跨 NVS/OTA 共用（`mk_static!` 单例）。
@@ -107,7 +107,7 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量/时钟/codec 序
 - 日志用 defmt（`.cargo/config.toml` `[env] DEFMT_LOG=info`），打印走 esp-println。
 - edition 2024，rust-version 1.88；`profile.dev` 也开 `opt-level = "s"`（勿改回）。
 - 内部堆 **128KB**（`create_board` 第一行注册，先于任何分配，各 bin 共用）；
-  主任务栈 = RWDATA 剩余（~107KB）。**opus 编码 60ms 帧需 ~87KB 栈**（SILK VLA 随帧长线性，
+  主任务栈 = RWDATA 剩余（Channels 迁 PSRAM 后实测 **102,604B ≈100KB**，CI 守卫 `scripts/check_stack.sh` 下限 96KiB）。**opus 编码 60ms 帧需 ~87KB 栈**（SILK VLA 随帧长线性，
   `VAR_ARRAYS` 走任务栈）——缩堆或加长帧前必须重估，否则栈溢出。
   主循环 Idle+10s 读 `esp_alloc::HEAP.stats()`，`current_usage/size > 90%` 打警告。
 - 音频 DMA 缓冲必须在**内部 RAM**；8MB PSRAM 为 Octal SPI，`psram_allocator!` 必须在
@@ -128,7 +128,7 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量/时钟/codec 序
   曾崩 WiFi blob 信标路径（`pm_on_beacon_rx` LoadProhibited）；故电量 ADC 只在 **Idle 且
   10s 限频**时读一次（会话/播报期绝不读，见 `app.rs` 主循环），充电态用 GPIO
   （CHARGING=41/DONE=42）实时。排查 WiFi 崩溃先确认电池 ADC 未在活跃期被读。
-- WiFi STA 连接后设 `PowerSaveMode::Minimum`（beacon 间 modem sleep）；deep-sleep 唤醒
+- WiFi 默认常开 `PowerSaveMode::None`（长句 TTS 音质优先）；自适应「空闲 Minimum / 会话 None」放在 feature `ps-adaptive` 后（实测切换瞬间会丢 1~3 包）；deep-sleep 唤醒
   **v1.0 不做**：BOOT/VOL± 是 GPIO1/18/2，S3 上非 RTC-capable，无法做按键唤醒。
 - embassy-net `StackResources` 容量按**每张表**计（`TcpSocket::new` 超容 panic → 重启循环）：
   STA 栈 `StackResources<6>`（wifi/mod.rs，DHCP+OTA+会话 TCP+UDP 音频）；SoftAP 配网表
@@ -136,20 +136,28 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量/时钟/codec 序
   socket 跨重连复用（`session_task` 内持有），勿每次 connect 新建（泄漏耗尽内部堆）。
 - `session_task` 是 embassy 任务：参数必须 `'static`（Channels 经 `mk_static!` 常驻），
   返回的 SpawnToken 必须 `spawner.spawn`（丢弃即 panic）。
-- BOOT 键**开机按住** = 清除 WiFi 凭据重回配网；配网 = SoftAP `xiaozhi-gezipai` +
-  表单页 `http://192.168.4.1:8080/`；凭据+服务器 IP 存 NVS `0xE000` 扇区（magic `ZOIX`），
-  音量存同分区 `0xD000` 扇区（首字节 0~100，0xFF→默认 60，与凭据分离勿混写）。
+- BOOT 键**开机按住** = 清除 WiFi 凭据重回配网；配网 = SoftAP `xiaozhi-gezipai`
+  （WPA2，密码 `xiaozhi-setup`，启动日志会打印）+ 表单页 `http://192.168.4.1:8080/`；
+  凭据+服务器 IP 存 NVS `0xE000` 扇区（magic `ZOIX`），
+  音量存同分区 `0xD000` 扇区（4B 追加记录，首字节 0~100，写满 1024 条才擦除一次，避免主循环擦扇区；与凭据分离勿混写）。
 - 对话状态机（`xiaozhi_core::dialog`）：`WaitingReply` 20s 无服务器消息 → 结束会话回待机。
 - **MCP 已接通并真机验证**（M9，2026-09-06）：hello 发 `features:{"mcp":true}`，
   会话任务内分发 `initialize`/`tools/list`/`tools/call` 到 `app::mcp_handle` 并即时回包
-  （工具：`get_device_status`/`set_volume`）。原 NO_MEM 阻塞（commit 27359e0，宣告
+  （工具：`get_device_status`/`set_volume`/`get_system_info`/`reboot`；WS 与 MQTT 共用
+  `mcp_handle`，音量直接写 `PENDING_VOLUME` 待办）。原 NO_MEM 阻塞（commit 27359e0，宣告
   `mcp:true` 后服务器等 `initialize` 期间停读 TCP 流 → `esp_wifi_internal_tx
   NO_MEM(257)` 连刷）由「会话内异步应答」规避，且当前 xiaozhi-server 用非阻塞
   `create_task` 读循环，实测不再复现。
 - OTA 检查是 **POST** `:8003/xiaozhi/ota/`（Device-Id 头 + JSON body）；GET 只回健康串拿不到清单（实测）。
-- 音量：ES8311 REG32 是 **dB 线性映射**（0%= -95.5dB → 100%= +32dB），35% ≈ -51dB 基本不可闻
-  （audio-loopback 回放音量压 35% 防啸叫）；麦克风数字电平仅 1~5% 满幅，回放/上行前
-  软件增益 800%（+18dB）。
+- OTA 清单可选 `firmware.sha256` / `hash`：存在时下载过程流式 SHA-256，
+  不匹配拒绝切槽；当前服务端不下发，仅做 Content-Length 校验。
+  固件 URL 主机支持 IPv4 字面量或域名（DHCP DNS，5s 超时回退配置 server）。
+- WS Bearer token 默认 `xiaozhi-test`，构建期 `XIAOZHI_WS_TOKEN=...` 可覆盖。
+- 音量：ES8311 REG32 是 **dB 线性映射**（步进 0.5dB）。0% = REG0（-95.5dB 静音）；
+  1~100% 映射到 REG91~185（-50dB ~ **-3dB**），100% 刻意不进 +dB 区——满幅 PCM
+  再叠加 +32dB 会硬削顶（真机 VOL 100% 破音）。60% ≈ REG147 ≈ -22dB。
+  麦克风数字电平仅 1~5% 满幅，回放/上行前软件增益 600%（+15.6dB，`GAIN_PERCENT`；
+  过高会削顶毁 ASR）。`audio-loopback` 回放仍压 35% 防啸叫。
 - 引脚曾误判：充电检测是 GPIO41(CHARGING)/GPIO42(DONE)；**GPIO12/13 是灯效串口**（非充电脚）。
   一切以 `src/bsp/gezipai.rs` 为准。
 
@@ -202,4 +210,7 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量/时钟/codec 序
   `docs/ROADMAP.md`（下一步上机验证项以此为准）；引脚表见 README「引脚映射」。
 - MQTT 网关部署与 UDP 加密/时间戳：`docs/MQTT_UDP.md`；换板/跨芯片移植：`docs/PORTING.md`。
 - 默认关闭的**自测 feature**：`debug-diag`（高频日志）、`ota-selftest-crash`（确认前 panic）、
-  `session-selftest`（开机 5s 自动唤醒）、`watchdog-selftest`（阻塞主循环验证复位）。
+  `session-selftest`（开机 5s 自动唤醒）、`watchdog-selftest`（阻塞主循环验证复位）、
+  `tts-selftest`（长句 TTS）、`idle-selftest`（空闲窗口缩到 5s）、
+  `ps-adaptive`（WiFi 省电自适应 A/B，默认 None）。
+- 门禁可用 `scripts/check.sh`（含 core fmt/clippy/nextest）；栈预算用 `scripts/check_stack.sh`。

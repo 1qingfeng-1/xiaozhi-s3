@@ -12,12 +12,12 @@
 use esp_hal::{
     Blocking,
     dma::{DmaChannelFor, DmaDescriptor, DmaTransferRxCircular, DmaTransferTxCircular},
+    gpio::interconnect::{PeripheralInput, PeripheralOutput},
     i2c::master::I2c,
     i2s::{
         AnyI2s,
         master::{Channels, Config, DataFormat, Error, I2s, I2sRx, I2sTx},
     },
-    peripherals::{GPIO21, GPIO39, GPIO40, GPIO45, GPIO48},
     time::{Duration, Instant},
 };
 
@@ -91,11 +91,11 @@ impl Audio {
         mut i2c: I2c<'static, Blocking>,
         i2s0: esp_hal::peripherals::I2S0<'static>,
         dma: impl DmaChannelFor<AnyI2s<'static>>,
-        bclk: GPIO39<'static>,
-        ws: GPIO45<'static>,
-        dout: GPIO48<'static>,
-        mclk: GPIO40<'static>,
-        din: GPIO21<'static>,
+        bclk: impl PeripheralOutput<'static>,
+        ws: impl PeripheralOutput<'static>,
+        dout: impl PeripheralOutput<'static>,
+        mclk: impl PeripheralOutput<'static>,
+        din: impl PeripheralInput<'static>,
         pa: esp_hal::gpio::Output<'static>,
         sample_rate_hz: u32,
         dac_addr: u8,
@@ -184,9 +184,7 @@ impl Audio {
     /// 读取 ES8311 芯片 ID (寄存器 0xFD/0xFE), 用于 I2C 通路自检
     pub fn es8311_chip_id(&mut self) -> [u8; 2] {
         let mut id = [0u8; 2];
-        let _ = self
-            .i2c
-            .write_read(codec_mod::CodecAddr::Es8311.value(), &[0xFD], &mut id);
+        let _ = self.i2c.write_read(self.dac_addr, &[0xFD], &mut id);
         id
     }
 
@@ -280,6 +278,9 @@ impl Audio {
 
     /// 设置音量 (0~100), 0 为数字静音
     pub fn set_volume(&mut self, percent: u8) {
+        // 诊断构建: codec 恒 0 (功放仍使能), 用于区分 PA 电路与扬声器电流
+        #[cfg(feature = "volume-off")]
+        let percent = 0;
         self.volume = percent.clamp(0, 100);
         let _ = Self::write_seq(
             &mut self.i2c,
@@ -292,6 +293,9 @@ impl Audio {
     /// 当前音量
     /// 功放使能: 低功耗待机时关闭 (省电并消除功放底噪), 唤醒/播报前打开
     pub fn set_pa(&mut self, on: bool) {
+        // 诊断构建: 功放恒关, 用于判断扬声器 EMI/供电是否影响 WiFi
+        #[cfg(feature = "pa-off")]
+        let on = false;
         if on {
             self.pa.set_high();
         } else {
@@ -344,11 +348,20 @@ impl Audio {
             return;
         };
         let mut off = 0;
+        let start = Instant::now();
         while off < data.len() {
             match t.push(&data[off..]) {
                 // push 是全量语义: 空间不足返回 Overflow, 等消费后重试
                 Ok(n) => off += n,
-                Err(esp_hal::dma::DmaError::Overflow) => core::hint::spin_loop(),
+                Err(esp_hal::dma::DmaError::Overflow) => {
+                    // DMA 停摆时不能无限自旋 (只能等 8s 看门狗);
+                    // 200ms 足够覆盖 150ms 提示音的排空等待。
+                    if start.elapsed() > Duration::from_millis(200) {
+                        defmt::warn!("I2S TX 自旋超时 (DMA 停摆?), 丢弃本块");
+                        return;
+                    }
+                    core::hint::spin_loop();
+                },
                 Err(e) => {
                     defmt::warn!("I2S TX push 失败: {:?} — 丢弃本块", e);
                     return;

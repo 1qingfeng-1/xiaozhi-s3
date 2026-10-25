@@ -46,25 +46,26 @@ const CMD_INVON: u8 = 0x21;
 const CMD_NORON: u8 = 0x13;
 const CMD_DISPON: u8 = 0x29;
 
-/// 面板尺寸 (gezipai: 240x240, 无行偏移)
-const PANEL_W: u16 = 240;
-const PANEL_H: u16 = 240;
-
 /// ST7789 显示器
 pub struct Display {
     spi: Spi<'static, Blocking>,
     dc: Output<'static>,
     _rst: Output<'static>,
     _backlight: Output<'static>,
+    /// 面板尺寸来自 BoardConfig, 不在驱动层硬编码
+    w: u16,
+    h: u16,
 }
 
 impl Display {
-    /// 组装并初始化 (工厂调用; 引脚接线见 BoardConfig.display)
+    /// 组装并初始化 (工厂调用; 引脚接线/尺寸见 BoardConfig.display)
     pub fn new(
         spi: Spi<'static, Blocking>,
         dc: Output<'static>,
         mut rst: Output<'static>,
         mut backlight: Output<'static>,
+        width: u16,
+        height: u16,
     ) -> Self {
         backlight.set_high();
         // 硬复位
@@ -78,6 +79,8 @@ impl Display {
             dc,
             _rst: rst,
             _backlight: backlight,
+            w: width,
+            h: height,
         };
         // 初始化序列 (ST7789 无 GRAM 初始化区的通用最小集)
         disp.cmd(CMD_SWRESET);
@@ -91,11 +94,11 @@ impl Display {
         disp.cmd(CMD_DISPON);
         disp.cmd_data(
             CMD_CASET,
-            &[0, 0, ((PANEL_W - 1) >> 8) as u8, (PANEL_W - 1) as u8],
+            &[0, 0, ((width - 1) >> 8) as u8, (width - 1) as u8],
         );
         disp.cmd_data(
             CMD_RASET,
-            &[0, 0, ((PANEL_H - 1) >> 8) as u8, (PANEL_H - 1) as u8],
+            &[0, 0, ((height - 1) >> 8) as u8, (height - 1) as u8],
         );
         disp
     }
@@ -159,7 +162,7 @@ impl Display {
 
     /// 清屏
     pub fn clear(&mut self, color: Rgb565) {
-        self.fill_rect(0, 0, PANEL_W, PANEL_H, color);
+        self.fill_rect(0, 0, self.w, self.h, color);
     }
 
     /// 绘制文本 (3x5 点阵; 越界部分静默裁剪; 不支持的字形渲染为空白)
@@ -197,17 +200,41 @@ impl Display {
         }
     }
 
+    /// 通知行: 状态行下方临时文本 (音量/低电/错误), 2 倍字高
+    pub fn draw_notification(&mut self, text: &str, fg: Rgb565) {
+        const BG: Rgb565 = Rgb565::BLACK;
+        const Y: u16 = 60;
+        let scale = 2u16;
+        let panel_w = self.w;
+        let max_chars =
+            (panel_w as usize / (((GLYPH_W + GLYPH_GAP) as u16 * scale) as usize)).max(1);
+        let text: heapless::String<32> = text.chars().take(max_chars).collect();
+        let (w, h) = text_size(text.as_str());
+        let px_w = (w as u16) * scale;
+        let x = (panel_w.saturating_sub(px_w)) / 2;
+        self.fill_rect(0, Y - 2, panel_w, h as u16 * scale + 4, BG);
+        self.draw_text(x, Y, text.as_str(), fg, BG, scale);
+    }
+
+    /// 清除通知行 (通知到期)
+    pub fn clear_notification(&mut self) {
+        const BG: Rgb565 = Rgb565::BLACK;
+        const Y: u16 = 60;
+        self.fill_rect(0, Y - 2, self.w, GLYPH_H as u16 * 2 + 4, BG);
+    }
+
     /// 状态行: 清区 + 写文本 (水平居中, 2 倍字高)
     pub fn draw_status(&mut self, text: &str, fg: Rgb565) {
         const BG: Rgb565 = Rgb565::BLACK;
         let (w, h) = text_size(text);
         let scale = 2u16;
         let px_w = (w as u16) * scale;
-        let x = px_w.min(PANEL_W.saturating_sub(1));
-        let x = if x == px_w { (PANEL_W - px_w) / 2 } else { 0 };
+        let panel_w = self.w;
+        let x = px_w.min(panel_w.saturating_sub(1));
+        let x = if x == px_w { (panel_w - px_w) / 2 } else { 0 };
         let y = 12;
         // 清除文本区 (上一次文本残留)
-        self.fill_rect(0, y - 2, PANEL_W, h as u16 * scale + 4, BG);
+        self.fill_rect(0, y - 2, panel_w, h as u16 * scale + 4, BG);
         self.draw_text(x, y, text, fg, BG, scale);
     }
 }
@@ -215,9 +242,9 @@ impl Display {
 /// 工厂辅助: 构造 SPI 总线 (gezipai: SPI2, 面板 20MHz, Mode0)
 pub fn make_spi(
     spi: esp_hal::peripherals::SPI2<'static>,
-    sck: esp_hal::peripherals::GPIO7<'static>,
-    mosi: esp_hal::peripherals::GPIO6<'static>,
-    cs: esp_hal::peripherals::GPIO15<'static>,
+    sck: impl esp_hal::gpio::interconnect::PeripheralOutput<'static>,
+    mosi: impl esp_hal::gpio::interconnect::PeripheralOutput<'static>,
+    cs: impl esp_hal::gpio::interconnect::PeripheralOutput<'static>,
 ) -> Spi<'static, Blocking> {
     Spi::new(
         spi,
