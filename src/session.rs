@@ -156,6 +156,12 @@ impl WsClient<'_> {
     }
 }
 
+impl crate::control::ControlLink for WsClient<'_> {
+    async fn send_control(&mut self, text: &str) -> Result<(), &'static str> {
+        WsClient::send_text(self, text.as_bytes()).await
+    }
+}
+
 /// 解析下行音频帧, 返回 (时间戳, opus 载荷)
 ///
 /// 版本 1 无帧头 (时间戳为 0); 版本 2/3 按帧头切分并校验长度。

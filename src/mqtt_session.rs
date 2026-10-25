@@ -24,10 +24,9 @@ use xiaozhi_core::server_msg::{self, ServerMessage};
 use xiaozhi_core::udp as udp_proto;
 
 use crate::app::{
-    Channels, DROP_DOWNLINK, DownlinkPacket, OpusPacket, SessionCommand, SessionEvent, UiMessage,
-    VOLUME_PCT, mcp_handle, ui_send, ui_text,
+    Channels, DROP_DOWNLINK, DownlinkPacket, OpusPacket, SessionEvent, UiMessage, VOLUME_PCT,
+    mcp_handle, ui_send, ui_text,
 };
-use crate::session::{LISTEN_START_AUTO, LISTEN_START_MANUAL, LISTEN_STOP, TTS_ABORT};
 use crate::wifi::store::MqttSettings;
 
 /// MQTT keepalive (秒); 网关按此判断心跳超时
@@ -179,6 +178,25 @@ async fn publish(
 ) -> Result<(), &'static str> {
     let n = mqtt::encode_publish(topic, payload, out).map_err(|_| "MQTT 组包失败")?;
     write_all(socket, &out[..n]).await
+}
+
+/// 控制面适配: 把一条文本控制消息 publish 到设备主题
+struct MqttLink<'a> {
+    socket: &'a mut TcpSocket<'static>,
+    topic: &'a str,
+    out: &'a mut [u8],
+}
+
+impl crate::control::ControlLink for MqttLink<'_> {
+    async fn send_control(&mut self, text: &str) -> Result<(), &'static str> {
+        publish(
+            &mut *self.socket,
+            &mut *self.out,
+            self.topic,
+            text.as_bytes(),
+        )
+        .await
+    }
 }
 
 /// 建立 MQTT 连接并订阅回复主题
@@ -358,79 +376,38 @@ pub async fn mqtt_session_task(args: MqttSessionArgs) {
             channels.event.send(SessionEvent::Closed).await;
         }
 
-        // ---- 命令 ----
-        loop {
-            match channels.command.try_receive() {
-                Ok(SessionCommand::Connect) => {
-                    if connected {
-                        let hello = xiaozhi_core::protocol::udp_hello_message();
-                        if publish(
-                            &mut socket,
-                            out_buf,
-                            config.publish_topic.as_str(),
-                            hello.as_bytes(),
-                        )
-                        .await
-                        .is_ok()
-                        {
-                            awaiting_hello = true;
-                            session_id.clear();
-                            info!("会话: 已发送 hello (等待 UDP 配置)");
-                        }
-                    } else {
-                        want_connect = true;
+        // ---- 命令 (控制面与 WS 共用) ----
+        {
+            let mut link = MqttLink {
+                socket: &mut socket,
+                topic: config.publish_topic.as_str(),
+                out: &mut out_buf[..],
+            };
+            let cmd = crate::control::run_commands(channels, connected, &mut link).await;
+            if cmd.send_failed {
+                connected = false;
+                udp_ready = false;
+                channels.event.send(SessionEvent::Closed).await;
+            }
+            if cmd.want_connect {
+                if connected {
+                    let hello = xiaozhi_core::protocol::udp_hello_message();
+                    if publish(
+                        &mut socket,
+                        out_buf,
+                        config.publish_topic.as_str(),
+                        hello.as_bytes(),
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        awaiting_hello = true;
+                        session_id.clear();
+                        info!("会话: 已发送 hello (等待 UDP 配置)");
                     }
-                },
-                Ok(SessionCommand::SendListenStart(mode)) => {
-                    if connected {
-                        let msg = if mode == xiaozhi_core::dialog::ListenMode::Auto {
-                            LISTEN_START_AUTO
-                        } else {
-                            LISTEN_START_MANUAL
-                        };
-                        let _ = publish(
-                            &mut socket,
-                            out_buf,
-                            config.publish_topic.as_str(),
-                            msg.as_bytes(),
-                        )
-                        .await;
-                    }
-                },
-                Ok(SessionCommand::SendListenStop) => {
-                    if connected {
-                        let _ = publish(
-                            &mut socket,
-                            out_buf,
-                            config.publish_topic.as_str(),
-                            LISTEN_STOP.as_bytes(),
-                        )
-                        .await;
-                    }
-                },
-                Ok(SessionCommand::SendTtsAbort) => {
-                    if connected {
-                        let _ = publish(
-                            &mut socket,
-                            out_buf,
-                            config.publish_topic.as_str(),
-                            TTS_ABORT.as_bytes(),
-                        )
-                        .await;
-                    }
-                },
-                Ok(SessionCommand::CloseSession) => {
-                    if connected {
-                        let _ = publish(
-                            &mut socket,
-                            out_buf,
-                            config.publish_topic.as_str(),
-                            crate::session::GOODBYE.as_bytes(),
-                        )
-                        .await;
-                    }
-                },
-                Err(_) => break,
+                } else {
+                    want_connect = true;
+                }
             }
         }
 

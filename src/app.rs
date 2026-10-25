@@ -265,59 +265,18 @@ pub async fn session_task(args: SessionArgs) {
             channels.event.send(SessionEvent::Closed).await;
         }
 
-        // ---- 命令 ----
-        loop {
-            match channels.command.try_receive() {
-                Ok(SessionCommand::Connect) => want_connect = true,
-                Ok(SessionCommand::SendListenStart(mode)) => {
-                    if connected {
-                        let msg = if mode == ListenMode::Auto {
-                            session::LISTEN_START_AUTO
-                        } else {
-                            session::LISTEN_START_MANUAL
-                        };
-                        let mut ws = session::WsClient {
-                            socket: &mut socket,
-                        };
-                        if ws.send_text(msg.as_bytes()).await.is_err() {
-                            connected = false;
-                            channels.event.send(SessionEvent::Closed).await;
-                        }
-                    }
-                },
-                Ok(SessionCommand::SendListenStop) => {
-                    if connected {
-                        let mut ws = session::WsClient {
-                            socket: &mut socket,
-                        };
-                        if ws.send_text(session::LISTEN_STOP.as_bytes()).await.is_err() {
-                            connected = false;
-                            channels.event.send(SessionEvent::Closed).await;
-                        }
-                    }
-                },
-                Ok(SessionCommand::CloseSession) => {
-                    // 与 MQTT 对齐: 显式 goodbye, 让服务端尽快释放会话/通道
-                    // (WS 服务端即使忽略也无害)
-                    if connected {
-                        let mut ws = session::WsClient {
-                            socket: &mut socket,
-                        };
-                        let _ = ws.send_text(session::GOODBYE.as_bytes()).await;
-                    }
-                },
-                Ok(SessionCommand::SendTtsAbort) => {
-                    if connected {
-                        let mut ws = session::WsClient {
-                            socket: &mut socket,
-                        };
-                        if ws.send_text(session::TTS_ABORT.as_bytes()).await.is_err() {
-                            connected = false;
-                            channels.event.send(SessionEvent::Closed).await;
-                        }
-                    }
-                },
-                Err(_) => break,
+        // ---- 命令 (控制面与 MQTT 共用) ----
+        {
+            let mut link = session::WsClient {
+                socket: &mut socket,
+            };
+            let cmd = crate::control::run_commands(channels, connected, &mut link).await;
+            if cmd.send_failed {
+                connected = false;
+                channels.event.send(SessionEvent::Closed).await;
+            }
+            if cmd.want_connect {
+                want_connect = true;
             }
         }
 
