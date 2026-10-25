@@ -6,6 +6,23 @@
 
 use core::alloc::Layout;
 
+/// PSRAM 是否可用 (存在 size > 0 的 External 区域)
+///
+/// 本固件的音频大缓冲 (PCM 环/预录/网络) 合计 >150KB, 没有 PSRAM 时
+/// 回退内部堆必然 OOM; 启动期用本函数做硬性检查。
+pub fn psram_available() -> bool {
+    esp_alloc::HEAP
+        .stats()
+        .region_stats
+        .iter()
+        .flatten()
+        .any(|r| {
+            r.size > 0
+                && r.capabilities
+                    .contains(esp_alloc::MemoryCapability::External)
+        })
+}
+
 /// 分配字节缓冲: 优先 External (PSRAM), 失败回退内部堆; 返回块已清零
 pub fn psram_bytes(len: usize) -> &'static mut [u8] {
     let layout = Layout::from_size_align(len, 4).expect("bad layout");

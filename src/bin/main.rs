@@ -79,20 +79,12 @@ async fn main(spawner: Spawner) -> ! {
     // 板子工厂: 内部堆第一行注册 → 音频 DMA 缓冲 → PSRAM 最后注册
     let mut board = create_board(peripherals);
     info!("板子 [{}] 初始化完成", board.name);
-    // PSRAM 不可用时所有大缓冲都会回退内部堆, 合计 >150KB 必然 OOM;
-    // 启动即告警, 避免后面出现难以定位的分配失败。
-    let psram_ok = esp_alloc::HEAP
-        .stats()
-        .region_stats
-        .iter()
-        .flatten()
-        .any(|r| {
-            r.size > 0
-                && r.capabilities
-                    .contains(esp_alloc::MemoryCapability::External)
-        });
-    if !psram_ok {
-        error!("PSRAM 不可用: 音频大缓冲将回退内部堆, 可能 OOM");
+    // 音频大缓冲 (PCM 环 512KB + 预录/MQTT 等) 必须落 PSRAM; 没有 PSRAM
+    // 时内部堆 128KB 必然 OOM。与其随机崩溃, 不如明确报错重启 (硬件故障)。
+    if !xiaozhi_s3::mem::psram_available() {
+        error!("PSRAM 不可用: 音频缓冲无法分配, 10s 后重启");
+        embassy_time::Timer::after(embassy_time::Duration::from_secs(10)).await;
+        esp_hal::system::software_reset();
     }
 
     // 电池电量: ADC 只在 WiFi 启动前读一次 (S3 的 WiFi PHY 与 SARADC 共用,

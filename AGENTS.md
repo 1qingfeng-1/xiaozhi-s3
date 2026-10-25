@@ -107,12 +107,14 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量映射/时钟/cod
 - 日志用 defmt（`.cargo/config.toml` `[env] DEFMT_LOG=info`），打印走 esp-println。
 - edition 2024，rust-version 1.88；`profile.dev` 也开 `opt-level = "s"`（勿改回）。
 - 内部堆 **128KB**（`create_board` 第一行注册，先于任何分配，各 bin 共用）；
-  主任务栈 = RWDATA 剩余（Channels 迁 PSRAM 后实测 **102,604B ≈100KB**，CI 守卫 `scripts/check_stack.sh` 下限 96KiB）。**opus 编码 60ms 帧需 ~87KB 栈**（SILK VLA 随帧长线性，
+  主任务栈 = RWDATA 剩余（Channels 迁 PSRAM 后实测 **约 100KB（100,268B）**，CI 守卫 `scripts/check_stack.sh` 下限 96KiB）。**opus 编码 60ms 帧需 ~87KB 栈**（SILK VLA 随帧长线性，
   `VAR_ARRAYS` 走任务栈）——缩堆或加长帧前必须重估，否则栈溢出。
   主循环 Idle+10s 读 `esp_alloc::HEAP.stats()`，`current_usage/size > 90%` 打警告。
 - 音频 DMA 缓冲必须在**内部 RAM**；8MB PSRAM 为 Octal SPI，`psram_allocator!` 必须在
   DMA 缓冲分配**之后**注册（`create_board` 末尾），否则 I2S 缓冲落 PSRAM 报
   `DmaError(UnsupportedMemoryRegion)`。opus 大状态块/socket 缓冲是纯 CPU 访问，可落 PSRAM。
+- PSRAM 不可用（无 size>0 的 External 区域）时启动即报错并 10s 后重启：
+  音频大缓冲合计 >150KB，回退 128KB 内部堆必然 OOM。
 - I2S 全双工（esp-hal 1.1）：TX 主机经 `signal_loopback` 把时钟共享给 RX（等价 IDF
   `i2s_ll_share_bck_ws`）；**RX 从机依赖 TX 时钟**，TX 不跑 ES7210 不出数据。
   循环采集描述符必须与缓冲精确等分（8×4092B = 32KB RX 链）。
