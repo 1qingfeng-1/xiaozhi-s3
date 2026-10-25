@@ -16,7 +16,7 @@ use esp_hal::{Blocking, dma::DmaTransferRxCircular, i2s::master::I2sRx};
 
 use defmt::{error, info, warn};
 
-use xiaozhi_core::audio::capture::{apply_gain_percent, extract_slot, level_stats, limit_peak};
+use xiaozhi_core::audio::capture::{condition_for_uplink, extract_slot, level_stats};
 use xiaozhi_core::audio::listen::{ListenTurn, ListenTurnConfig, voiced_ms as measure_voiced_ms};
 use xiaozhi_core::audio::preroll::PrerollRing;
 use xiaozhi_core::audio::wake::{
@@ -949,8 +949,11 @@ pub async fn run(
                     for i in n..FRAME_SAMPLES {
                         pcm_dec[i] = 0;
                     }
-                    apply_gain_percent(&mut pcm_dec[..FRAME_SAMPLES], GAIN_PERCENT);
-                    limit_peak(&mut pcm_dec[..FRAME_SAMPLES], UPLINK_CEILING);
+                    condition_for_uplink(
+                        &mut pcm_dec[..FRAME_SAMPLES],
+                        GAIN_PERCENT,
+                        UPLINK_CEILING,
+                    );
                     let mut raw = [0u8; MAX_PACKET_BYTES];
                     if let Ok(len) = enc.encode(&pcm_dec[..FRAME_SAMPLES], &mut raw) {
                         let mut pkt: OpusPacket = heapless::Vec::new();
@@ -1396,8 +1399,8 @@ pub async fn run(
                         }
                     }
                     listen_turn.feed(voiced_ms, frame_ms, now_ms < mic_mute_until_ms, in_grace);
-                    apply_gain_percent(&mut mono_buf[..ns], GAIN_PERCENT);
-                    let limited = limit_peak(&mut mono_buf[..ns], UPLINK_CEILING);
+                    let limited =
+                        condition_for_uplink(&mut mono_buf[..ns], GAIN_PERCENT, UPLINK_CEILING);
                     // 1Hz 上行电平诊断 (增益后): 调增益/查削顶
                     let (lmean, lrms) = level_stats(&mono_buf[..ns]);
                     listen_peak_rms = listen_peak_rms.max(lrms);
@@ -1436,8 +1439,7 @@ pub async fn run(
                 // 无 AEC 时不能开: 设备会拾取自己的播报形成自问自答。
                 DialogState::Speaking if server_aec => {
                     if let Some(encoder) = encoder.as_mut() {
-                        apply_gain_percent(&mut mono_buf[..ns], GAIN_PERCENT);
-                        limit_peak(&mut mono_buf[..ns], UPLINK_CEILING);
+                        condition_for_uplink(&mut mono_buf[..ns], GAIN_PERCENT, UPLINK_CEILING);
                         let sent = encode_uplink(
                             &mono_buf[..ns],
                             acc_buf,

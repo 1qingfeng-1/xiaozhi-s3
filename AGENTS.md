@@ -19,7 +19,7 @@ cargo fmt --all -- --check
 cargo clippy --all-features -- -D warnings   # 与 CI/pre-commit 一致
 cargo check --all
 
-# 核心层 201 个 host 单测 — 必须在 xiaozhi-core/ 目录内跑
+# 核心层 202 个 host 单测 — 必须在 xiaozhi-core/ 目录内跑
 cd xiaozhi-core && cargo +stable nextest run
 # 单测过滤: cargo +stable nextest run ota_crc
 # 或 cargo +stable test
@@ -39,7 +39,7 @@ xtensa；从根目录跑 `cargo +stable nextest run -p xiaozhi-core` 会拿父�
 - **不要在仓库根目录跑 `cargo test`**（作用于 xtensa target，必失败）；
 - xiaozhi-core 是独立 workspace 根（空 `[workspace]` + 自带 `.cargo/config.toml` 覆盖回 host target），
   不继承父目录的 esp target/-nostartfiles；
-- 只有 xiaozhi-core 有单测，且只能在 host 上跑（201 个，当前全绿）。
+- 只有 xiaozhi-core 有单测，且只能在 host 上跑（202 个，当前全绿）。
 
 ## 架构与分层
 
@@ -61,7 +61,7 @@ xiaozhi-s3/          固件 crate (no_std, esp-rtos 双任务)
 ├── vendor/          libopus (v1.6.1 裁剪) / esp-sr / esp-dsp 子集 / cjson (均 build.rs 编译或链接)
 xiaozhi-core/        git submodule, 纯逻辑层: audio (音量映射/时钟/codec 序列/唤醒 VAD/播放流程) +
                      dialog (对话状态机) + mcp (JSON-RPC 解析) + ota (清单/版本/e9 头/otadata 条目) +
-                     display + board 规则 + protocol/aes/mqtt/udp 编解码; host 可单测 (201 个), #![deny(unsafe_code)]
+                     display + board 规则 + protocol/aes/mqtt/udp 编解码; host 可单测 (202 个), #![deny(unsafe_code)]
 ```
 
 分层规则（改代码前必读）：
