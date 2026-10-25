@@ -202,20 +202,15 @@ async fn main(spawner: Spawner) -> ! {
     // 开机 OTA: **独立任务** (勿内联 main — main future 膨胀会挤掉 opus 主栈)
     // 采集未 start; flash 交出后等 done 再用; 成功路径任务内 reset
     let ota_done = xiaozhi_s3::mk_static!(
-        Channel<embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, (), 1>,
-        Channel::new()
+        xiaozhi_s3::ota_check::FlashChannel,
+        xiaozhi_s3::ota_check::FlashChannel::new()
     );
-    let ota_token = xiaozhi_s3::ota_check::boot_ota_task(
-        stack,
-        server,
-        mac.clone(),
-        xiaozhi_s3::ota_check::FlashPtr(flash as *mut _),
-        ota_done.sender(),
-    )
-    .unwrap();
+    let ota_token =
+        xiaozhi_s3::ota_check::boot_ota_task(stack, server, mac.clone(), flash, ota_done.sender())
+            .unwrap();
     spawner.spawn(ota_token);
-    ota_done.receiver().receive().await;
-    // flash 指针交还: OTA 任务已结束 (或已 reset), main 可继续用
+    // 等任务归还 flash 独占所有权 (成功则任务内复位, 不会到达这里)
+    let flash = ota_done.receiver().receive().await;
 
     // 会话常驻缓冲 (帧长/常量与 app.rs 对齐: 960 样本 @16kHz 60ms)
     // 堆分配而非 mk_static: 大数组进 bss 会把主栈压到 <87KB (opus SILK)

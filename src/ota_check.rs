@@ -56,23 +56,22 @@ const OTA_FAIL_LIMIT: u8 = 3;
 
 type RawMutex = embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
-/// FlashStorage 裸指针 (单核独占: main 交出后等 done 才再用)
-pub struct FlashPtr(pub *mut FlashStorage<'static>);
-// SAFETY: 交接协议 — main spawn 后 await done, 任务结束前 main 不碰 flash
-unsafe impl Send for FlashPtr {}
+/// main ↔ OTA 任务的 flash 归还通道 (容量 1)
+pub type FlashChannel =
+    embassy_sync::channel::Channel<RawMutex, &'static mut FlashStorage<'static>, 1>;
 
-/// 开机 OTA 独立任务: 检查 → (有新版) 下载烧写 → 成功 reset / 失败通知 main
+/// 开机 OTA 独立任务: 检查 → (有新版) 下载烧写 → 成功 reset / 失败归还 flash
 ///
 /// 状态机在本任务 TaskStorage, **不进 main future** (否则 .bss 挤掉主栈)。
+/// flash 以 `&'static mut` 独占传入, 结束时经通道归还给 main (无裸指针/unsafe)。
 #[embassy_executor::task]
 pub async fn boot_ota_task(
     stack: Stack<'static>,
     server: Ipv4Address,
     mac: heapless::String<32>,
-    flash_ptr: FlashPtr,
-    done: embassy_sync::channel::Sender<'static, RawMutex, (), 1>,
+    flash: &'static mut FlashStorage<'static>,
+    done: embassy_sync::channel::Sender<'static, RawMutex, &'static mut FlashStorage<'static>, 1>,
 ) {
-    let flash = unsafe { &mut *flash_ptr.0 };
     let report = check(stack, server, &mac).await;
     // MQTT 网关配置: 服务器下发 → 持久化 (内容未变不重复擦写)
     if let Some(mqtt) = report.as_ref().and_then(|r| r.mqtt.as_ref()) {
@@ -120,7 +119,8 @@ pub async fn boot_ota_task(
         Some(_) => {}, // 已是最新
         None => warn!("OTA: 检查失败 (服务器不可达/超时/响应异常), 跳过本次升级"),
     }
-    let _ = done.try_send(());
+    // 归还 flash 独占所有权; main 收到后才继续使用
+    let _ = done.send(flash).await;
 }
 
 /// 向服务器查询固件更新
