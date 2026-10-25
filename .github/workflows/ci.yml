@@ -144,6 +144,21 @@ jobs:
         working-directory: xiaozhi-core
         run: cargo nextest run --locked
 
+  # GitHub Actions 工作流静态检查
+  actionlint:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.7
+
+      - name: Run actionlint
+        run: ./actionlint -color
+
   # 文档与拼写检查 (与 pre-commit 的 typos / markdownlint 对齐)
   docs-lint:
     name: Docs & typos
@@ -248,13 +263,7 @@ jobs:
 
       # 自测 feature 组合必须都能编译 (默认构建不会覆盖这些分支)
       - name: Check feature matrix
-        run: |
-          cargo check --locked --no-default-features --features board-gezipai
-          cargo check --locked --no-default-features --features board-gezipai,ps-adaptive
-          cargo check --locked --no-default-features --features board-gezipai,debug-diag
-          cargo check --locked --no-default-features --features board-gezipai,idle-selftest,session-selftest,tts-selftest
-          cargo check --locked --no-default-features --features board-gezipai,watchdog-selftest,ota-selftest-crash
-          cargo check --locked --no-default-features --features board-gezipai,aec-off,pa-off,volume-off
+        run: ./scripts/check_features.sh
 
       - name: Build release firmware
         run: cargo build --release --locked

@@ -25,6 +25,14 @@ core-test:
 core-clippy:
     cd xiaozhi-core && cargo +stable clippy --locked --all-targets -- -D warnings
 
+# 变异测试 (耗时, 本地按需)
+mutants:
+    cd xiaozhi-core && cargo mutants --test-tool nextest
+
+# 诊断/自测 feature 组合编译检查
+features:
+    ./scripts/check_features.sh
+
 # release 构建
 build:
     cargo build --release --locked

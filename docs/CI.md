@@ -96,6 +96,16 @@ cargo +nightly fuzz run parse_ws \
 target 列表与说明见 [`../xiaozhi-core/fuzz/README.md`](../xiaozhi-core/fuzz/README.md)。
 CI 不跑 fuzz（需要 nightly sanitizer 且耗时）。
 
+### 变异测试（本地，不进 CI）
+
+```bash
+cargo install cargo-mutants --locked
+cd xiaozhi-core && cargo mutants --test-tool nextest
+```
+
+配置见 `xiaozhi-core/mutants.toml`。用于验证测试是否能发现逻辑错误，
+建议在改动协议/状态机/OTA 编码后跑一次。
+
 ## 4. GitHub Actions
 
 工作流：`.github/workflows/ci.yml`，在 `push main` 与 PR 时触发。
@@ -108,6 +118,7 @@ CI 不跑 fuzz（需要 nightly sanitizer 且耗时）。
 | `core-test` | core fmt / clippy / nextest（host） |
 | `core-coverage` | `cargo llvm-cov nextest`，上传 `core-lcov` artifact（不设阈值） |
 | `docs-lint` | `typos` + `markdownlint-cli2@0.17.2` |
+| `actionlint` | GitHub Actions 工作流静态检查（actionlint 1.7.7） |
 | `deny` | `cargo deny check advisories licenses` |
 | `build` | feature 矩阵编译 → release 构建 → 栈预算 → 镜像生成与大小门禁 → 上传产物 |
 
