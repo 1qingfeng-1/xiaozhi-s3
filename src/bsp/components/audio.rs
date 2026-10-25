@@ -27,6 +27,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use xiaozhi_core::audio::codec::{
     self as codec_mod, RegWrite, es7210_init_sequence, es8311_init_sequence, es8311_volume_write,
 };
+use xiaozhi_core::audio::tone::ToneGen;
 
 /// TX DMA 描述符数量 (每个最大管理 4092B; 环形模式按需切分即可)
 const TX_DESCRIPTOR_COUNT: usize = 8;
@@ -400,20 +401,29 @@ impl Audio {
         }
     }
 
-    /// 播放提示音 (250Hz 正弦, 指定时长; 环形常流追加, 延迟 ≤ 目标队列)
+    /// 播放提示音 (250Hz 正弦)
     pub fn beep(&mut self, ms: u32) {
+        self.beep_hz(250, ms);
+    }
+
+    /// 播放任意频率正弦测试音 (16kHz 立体声, 环形常流追加)
+    ///
+    /// 由 `xiaozhi_core::audio::tone::ToneGen` 生成, 跨块保持相位连续。
+    pub fn beep_hz(&mut self, freq_hz: u32, ms: u32) {
         self.ensure_tx();
-        // 64B/ms @16kHz 立体声 16bit; 分块生成, 保持相位连续
+        // 64B/ms @16kHz 立体声 16bit
         let total = ms as usize * 64;
+        let mut tone = ToneGen::new(freq_hz, 16_000, i16::MAX);
         let mut done = 0;
-        let mut phase = 0usize;
         while done < total {
-            let n = (total - done).min(self.beep_buf.len());
+            let n = (total - done).min(self.beep_buf.len()) & !3;
+            if n == 0 {
+                break;
+            }
             let Self { beep_buf, tx, .. } = self;
-            Self::fill_sine(&mut beep_buf[..n], phase);
-            phase = (phase + n / 4) % 64;
-            Self::push_all(tx, &beep_buf[..n]);
-            done += n;
+            let written = tone.fill_stereo_le(&mut beep_buf[..n]);
+            Self::push_all(tx, &beep_buf[..written]);
+            done += written;
         }
     }
 
@@ -464,21 +474,6 @@ impl Audio {
         t.push(&data[..n]).unwrap_or_default()
     }
 
-    /// 填充正弦波 (250Hz @16kHz: 64 采样/周期, 立体声 16bit)
-    ///
-    /// `phase` 为起始采样相位 (0..64), 分块生成时保持连续。
-    fn fill_sine(buf: &mut [u8], mut phase: usize) {
-        const TAB: [i16; 64] = build_sine_table();
-        let samples = buf.len() / 4;
-        for i in 0..samples {
-            let v = TAB[phase % 64].to_le_bytes();
-            let o = i * 4;
-            buf[o..o + 2].copy_from_slice(&v); // 左
-            buf[o + 2..o + 4].copy_from_slice(&v); // 右
-            phase += 1;
-        }
-    }
-
     fn write_seq(
         i2c: &mut I2c<'static, Blocking>,
         seq: &[RegWrite],
@@ -521,16 +516,4 @@ impl Capture {
         }
         Ok(transfer)
     }
-}
-
-/// 64 点正弦表: 32767 * sin(2*pi*n/64), 250Hz @ 16kHz
-const fn build_sine_table() -> [i16; 64] {
-    [
-        0, 3212, 6393, 9512, 12539, 15446, 18204, 20787, 23170, 25329, 27245, 28898, 30273, 31356,
-        32137, 32609, 32767, 32609, 32137, 31356, 30273, 28898, 27245, 25329, 23170, 20787, 18204,
-        15446, 12539, 9512, 6393, 3212, 0, -3212, -6393, -9512, -12539, -15446, -18204, -20787,
-        -23170, -25329, -27245, -28898, -30273, -31356, -32137, -32609, -32767, -32609, -32137,
-        -31356, -30273, -28898, -27245, -25329, -23170, -20787, -18204, -15446, -12539, -9512,
-        -6393, -3212,
-    ]
 }

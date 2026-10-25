@@ -43,10 +43,11 @@ WAKE / BARGE_IN / SIM_LOW_BATTERY 15 / REBOOT
 
 - 控制通道：**USB Serial/JTAG**（独立于 UART0 日志）；
 - 已支持：`PING` / `VERSION` / `GET_COUNTERS` / `RESET_COUNTERS` /
-  `SET_VOLUME` / `PLAY_TONE 250 <ms>` / `SIM_LOW_BATTERY` / `REBOOT`；
+  `SET_VOLUME` / `PLAY_TONE <20-20000> <ms>` / `SIM_LOW_BATTERY` / `REBOOT`；
 - 暂返回 `HIL error reason=not_implemented`：`CAPTURE` / `WAKE` / `BARGE_IN`
   （需要与主音频/会话链路合流后再实现）；
-- `PLAY_TONE` 目前仅支持 250Hz（蜂鸣器固定频率），任意频率待夹具阶段扩展。
+- `PLAY_TONE` 由 `xiaozhi-core::audio::tone::ToneGen` 生成任意频率；
+  主固件的提示音 `beep` 仍固定 250Hz。
 
 - 走第二路 UART 或 USB Serial/JTAG，与音频/网络链路物理隔离；
 - `CAPTURE` 回传 PCM 统计（RMS/峰值/ZCR/削顶数），必要时才回传原始数据；

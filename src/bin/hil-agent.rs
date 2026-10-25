@@ -157,19 +157,13 @@ fn handle<W: Write>(cmd: Command, board: &mut Board, out: &mut W, c: &mut Counte
             board.audio.set_volume(percent);
             let _ = write!(out, "HIL ok volume={percent}\r\n");
         },
-        // 当前蜂鸣器只支持 250Hz; 任意频率留到夹具阶段再扩展
         Command::PlayTone {
             freq_hz,
             duration_ms,
         } => {
-            if freq_hz == 250 {
-                board.audio.set_pa(true);
-                board.audio.beep(duration_ms);
-                let _ = write!(out, "HIL ok tone_ms={duration_ms}\r\n");
-            } else {
-                c.errors += 1;
-                let _ = write!(out, "HIL error reason=unsupported_freq\r\n");
-            }
+            board.audio.set_pa(true);
+            board.audio.beep_hz(freq_hz, duration_ms);
+            let _ = write!(out, "HIL ok tone_hz={freq_hz} tone_ms={duration_ms}\r\n");
         },
         Command::SimLowBattery { percent } => {
             c.battery = Some(percent);
