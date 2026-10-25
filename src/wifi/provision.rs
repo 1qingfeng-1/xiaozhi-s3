@@ -144,7 +144,7 @@ async fn dhcp_server(stack: Stack<'static>) {
             },
         }
 
-        let reply = match dhcp_build_reply(&buf[..n]) {
+        let reply = match xiaozhi_core::dhcp::build_reply(&buf[..n]) {
             Some(r) => r,
             None => continue,
         };
@@ -152,68 +152,6 @@ async fn dhcp_server(stack: Stack<'static>) {
         let _ = socket.send_to(&reply, (Ipv4Address::BROADCAST, port)).await;
         info!("DHCP 应答: {}B (类型 {})", reply.len(), reply[242]);
     }
-}
-
-/// 解析 DHCP 请求并构造 OFFER/ACK 响应
-fn dhcp_build_reply(req: &[u8]) -> Option<heapless::Vec<u8, 320>> {
-    if req.len() < 240 || req[0] != 1 {
-        return None; // 非 BOOTREQUEST
-    }
-    let msg_type = dhcp_option(req, 53)?;
-    let reply_type: u8 = match msg_type {
-        1 => 2, // DISCOVER → OFFER
-        3 => 5, // REQUEST → ACK
-        _ => return None,
-    };
-
-    let client_ip = [192, 168, 4, 2];
-    let ap_ip = [192, 168, 4, 1];
-
-    let mut out: heapless::Vec<u8, 320> = heapless::Vec::new();
-    out.extend_from_slice(&[2, 1, 6, 0]).ok()?; // op=BOOTREPLY, htype, hlen, hops
-    out.extend_from_slice(&req[4..8]).ok()?; // xid
-    out.extend_from_slice(&[0, 0, 0, 0]).ok()?; // secs(2) + flags(2)
-    out.extend_from_slice(&req[12..16]).ok()?; // ciaddr
-    out.extend_from_slice(&client_ip).ok()?; // yiaddr
-    out.extend_from_slice(&ap_ip).ok()?; // siaddr
-    out.extend_from_slice(&[0; 4]).ok()?; // giaddr
-    out.extend_from_slice(&req[28..44]).ok()?; // chaddr
-    out.extend_from_slice(&[0; 64]).ok()?; // sname
-    out.extend_from_slice(&[0; 128]).ok()?; // file
-    out.extend_from_slice(&[0x63, 0x82, 0x53, 0x63]).ok()?; // magic cookie
-
-    let mut opt = |code: u8, data: &[u8]| -> Option<()> {
-        out.extend_from_slice(&[code, data.len() as u8]).ok()?;
-        out.extend_from_slice(data).ok()
-    };
-    opt(53, &[reply_type])?;
-    opt(54, &ap_ip)?; // server identifier
-    opt(51, &[0xFF, 0xFF, 0xFF, 0xFF])?; // lease: 无限
-    opt(1, &[255, 255, 255, 0])?; // subnet mask
-    opt(3, &ap_ip)?; // router
-    // BOOTP 规定最小包长 300B: 不足则用 padding option (0) 填充, 客户端会丢弃短包
-    while out.len() < 299 {
-        out.extend_from_slice(&[0]).ok()?;
-    }
-    out.extend_from_slice(&[255]).ok()?; // end
-    Some(out)
-}
-
-/// 在 DHCP options 区查找指定 option 的值
-fn dhcp_option(req: &[u8], code: u8) -> Option<u8> {
-    let mut i = 240;
-    while i + 2 <= req.len() {
-        let c = req[i];
-        if c == 255 {
-            return None;
-        }
-        let len = req[i + 1] as usize;
-        if c == code {
-            return req.get(i + 2).copied();
-        }
-        i += 2 + len;
-    }
-    None
 }
 
 /// 嵌入资源: Vue3 运行时 + 配网页 (构建时打包进固件)
@@ -420,7 +358,7 @@ fn parse_query(
             Some(x) => x,
             None => continue,
         };
-        let full = url_decode(v);
+        let full = xiaozhi_core::http::url_decode::<64>(v);
         let decoded = heapless::String::<64>::try_from(full.trim()).unwrap_or_default();
         match k {
             "ssid" => ssid = heapless::String::try_from(decoded.as_str()).unwrap_or_default(),
@@ -433,52 +371,4 @@ fn parse_query(
         server = heapless::String::try_from(DEFAULT_SERVER).unwrap_or_default();
     }
     (ssid, pass, server)
-}
-
-fn url_decode(s: &str) -> heapless::String<64> {
-    // 先按字节解码, 最后一次性做 UTF-8 校验: 逐字节 `as char` 会把
-    // 中文/emoji 的 UTF-8 多字节序列拆成 Latin-1, 写进 NVS 后无法连接。
-    let mut bytes = [0u8; 64];
-    let mut n = 0usize;
-    let src = s.as_bytes();
-    let mut i = 0usize;
-    while i < src.len() && n < bytes.len() {
-        match src[i] {
-            b'+' => {
-                bytes[n] = b' ';
-                n += 1;
-                i += 1;
-            },
-            b'%' if i + 2 < src.len() => match (hex_val(src[i + 1]), hex_val(src[i + 2])) {
-                (Some(hi), Some(lo)) => {
-                    bytes[n] = (hi << 4) | lo;
-                    n += 1;
-                    i += 3;
-                },
-                _ => {
-                    bytes[n] = src[i];
-                    n += 1;
-                    i += 1;
-                },
-            },
-            c => {
-                bytes[n] = c;
-                n += 1;
-                i += 1;
-            },
-        }
-    }
-    core::str::from_utf8(&bytes[..n])
-        .ok()
-        .and_then(|s| heapless::String::try_from(s).ok())
-        .unwrap_or_default()
-}
-
-fn hex_val(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
 }
