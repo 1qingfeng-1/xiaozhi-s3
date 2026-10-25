@@ -20,6 +20,7 @@ use xiaozhi_core::audio::capture::{
     apply_gain_percent, extract_slot, is_voice_active, level_stats, limit_peak,
 };
 use xiaozhi_core::audio::listen::{ListenTurn, ListenTurnConfig};
+use xiaozhi_core::audio::preroll::PrerollRing;
 use xiaozhi_core::audio::wake::{
     VadWakeDetector, WakeEngine, WakeEvent, WakePolicy, WakePolicyConfig, adaptive_threshold,
     update_noise_floor,
@@ -675,14 +676,11 @@ pub async fn run(
     let mut ack_pending = false;
     let mut ack_flush_at: u64 = 0;
     let mut volume_dirty = false;
-    let preroll_len = preroll.len();
-    let mut preroll_w = 0usize;
-    let mut preroll_valid = 0usize;
+    let mut preroll = PrerollRing::new(preroll);
     let mut preroll_flush = false;
     // 预录补发上限: 编码器/通道异常时不能永远卡在 "flushing" 而丢掉实时音频
     let mut preroll_deadline: u64 = 0;
     let mut preroll_off = 0usize;
-    let mut preroll_seq: u64 = 0;
     let mut preroll_from: u64 = 0;
     // 提示音/开机静音窗: 防扬声器声音被麦克风录进上行
     let mut mic_mute_until_ms: u64 = 0;
@@ -945,13 +943,13 @@ pub async fn run(
                 preroll_off = 0;
                 preroll_deadline = 0;
             } else if let Some(enc) = encoder.as_mut() {
-                let total = ((preroll_seq - preroll_from) as usize).min(preroll_valid);
-                let start = (preroll_w + preroll_len - total) % preroll_len;
+                let total = preroll.available_from(preroll_from);
                 let mut sent = 0;
                 while preroll_off < total && sent < 4 {
-                    let n = (total - preroll_off).min(FRAME_SAMPLES);
-                    for i in 0..n {
-                        pcm_dec[i] = preroll[(start + preroll_off + i) % preroll_len];
+                    let n =
+                        preroll.read_from(preroll_from, preroll_off, &mut pcm_dec[..FRAME_SAMPLES]);
+                    if n == 0 {
+                        break;
                     }
                     for i in n..FRAME_SAMPLES {
                         pcm_dec[i] = 0;
@@ -990,7 +988,6 @@ pub async fn run(
                         total
                     );
                     preroll_flush = false;
-                    preroll_valid = 0;
                     preroll_off = 0;
                     preroll_deadline = 0;
                 }
@@ -1011,7 +1008,7 @@ pub async fn run(
                 // BOOT 建连期间也会丢语音: 只补发按下之后的样本
                 preroll_flush = true;
                 preroll_off = 0;
-                preroll_from = preroll_seq;
+                preroll_from = preroll.seq();
                 preroll_deadline = now_ms + 1_000;
             }
             if held && sm.state() == DialogState::Speaking {
@@ -1299,13 +1296,7 @@ pub async fn run(
                 // VAD 必须在原始电平域 (硬件增益后、无软件增益, 对齐 C++ 参考):
                 // 若在软件增益后跑, 阈值等效原始值被放大, 环境噪声即误触发
                 DialogState::Idle => {
-                    preroll_push(
-                        preroll,
-                        &mut preroll_w,
-                        &mut preroll_valid,
-                        &mut preroll_seq,
-                        &mono_buf[..ns],
-                    );
+                    preroll.push(&mono_buf[..ns]);
                     // 1Hz 电平诊断 (原始域): 阈值调参/假唤醒排查
                     // peak = 自上次打印以来的最大子块 rms
                     //
@@ -1429,13 +1420,7 @@ pub async fn run(
                 },
                 DialogState::Connecting => {
                     // 建连期间继续预录, 避免唤醒后第一句被吞
-                    preroll_push(
-                        preroll,
-                        &mut preroll_w,
-                        &mut preroll_valid,
-                        &mut preroll_seq,
-                        &mono_buf[..ns],
-                    );
+                    preroll.push(&mono_buf[..ns]);
                 },
                 // 服务端 AEC: 播报中继续上行麦克风 (回声由服务器消除),
                 // 服务器 VAD 检出人声即发 tts stop → 打断并转聆听。
@@ -1486,7 +1471,7 @@ pub async fn run(
             ack_pending = false;
             preroll_flush = true;
             preroll_off = 0;
-            preroll_from = preroll_seq;
+            preroll_from = preroll.seq();
             preroll_deadline = now_ms + 1_000;
         }
 
@@ -1699,18 +1684,6 @@ pub async fn run(
 /// PSRAM 分配唤醒预录环 (失败回退内部 RAM)
 pub fn alloc_preroll() -> &'static mut [i16] {
     crate::mem::psram_i16(PREROLL_SAMPLES)
-}
-
-/// 追加原始 PCM 到预录环 (保留最近 len 个样本)
-fn preroll_push(buf: &mut [i16], w: &mut usize, valid: &mut usize, seq: &mut u64, samples: &[i16]) {
-    for &s in samples {
-        buf[*w] = s;
-        *seq += 1;
-        *w = (*w + 1) % buf.len();
-        if *valid < buf.len() {
-            *valid += 1;
-        }
-    }
 }
 
 fn mono_to_stereo(src: &[i16], dst: &mut [u8]) -> usize {
