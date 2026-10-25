@@ -17,27 +17,14 @@ const MAGIC: u32 = 0x5849_4F5A; // 'ZOIX' 小端
 /// 保存配置 (整扇区擦写)
 pub fn save(flash: &mut FlashStorage<'_>, config: &WifiConfig) -> Result<(), &'static str> {
     let mut buf = [0u8; SECTOR_SIZE as usize];
-    buf[..4].copy_from_slice(&MAGIC.to_le_bytes());
-
-    let mut o = 4usize;
-    for part in [
-        config.ssid.as_bytes(),
-        config.password.as_bytes(),
-        config.server.as_bytes(),
-    ] {
-        let len = u16::try_from(part.len()).map_err(|_| "配置字段过长")?;
-        buf[o..o + 2].copy_from_slice(&len.to_le_bytes());
-        o += 2;
-        if o + part.len() > SECTOR_SIZE as usize {
-            return Err("配置超出存储容量");
-        }
-        buf[o..o + part.len()].copy_from_slice(part);
-        o += part.len();
-    }
-    // 末尾 CRC: 部分写入/位翻转不能当成有效凭据
-    let crc = xiaozhi_core::ota::crc32_init_xorout(&buf[..o], 0, 0xFFFF_FFFF);
-    buf[o..o + 4].copy_from_slice(&crc.to_le_bytes());
-
+    let fields = [
+        config.ssid.as_str(),
+        config.password.as_str(),
+        config.server.as_str(),
+    ];
+    // 编码失败只可能是字段超长/容量不足; 写整扇区 (尾部 0) 保持旧格式
+    xiaozhi_core::config_store::encode(MAGIC, &fields, &mut buf)
+        .ok_or("配置字段过长或超出存储容量")?;
     NorFlash::erase(flash, SECTOR, SECTOR + SECTOR_SIZE).map_err(|_| "Flash 擦除失败")?;
     NorFlash::write(flash, SECTOR, &buf).map_err(|_| "Flash 写入失败")
 }
@@ -47,45 +34,17 @@ pub fn load(flash: &mut FlashStorage<'_>) -> Option<WifiConfig> {
     let mut buf = [0u8; SECTOR_SIZE as usize];
     flash.read(SECTOR, &mut buf).ok()?;
 
-    let magic = u32::from_le_bytes(buf[..4].try_into().ok()?);
-    if magic != MAGIC {
-        let h0 = u32::from_le_bytes(buf[..4].try_into().unwrap_or([0; 4]));
-        let h1 = u32::from_le_bytes(buf[4..8].try_into().unwrap_or([0; 4]));
-        defmt::error!(
-            "凭据无效: 扇区头=0x{:08X} 0x{:08X} (期望 magic=0x{:08X})",
-            h0,
-            h1,
-            MAGIC
-        );
+    // 旧格式 (无 CRC) 末尾为 0, legacy_zero_crc=true 兼容
+    let mut fields: [&str; 3] = ["", "", ""];
+    if xiaozhi_core::config_store::decode(MAGIC, &buf, &mut fields, true).is_none() {
+        let h = u32::from_le_bytes(buf[..4].try_into().unwrap_or([0; 4]));
+        defmt::error!("凭据无效或损坏: 扇区头=0x{:08X} (期望 0x{:08X})", h, MAGIC);
         return None;
     }
-
-    let mut o = 4usize;
-    let mut next = |_n: usize| -> Option<&[u8]> {
-        let len = u16::from_le_bytes(buf.get(o..o + 2)?.try_into().ok()?) as usize;
-        o += 2;
-        let out = buf.get(o..o + len)?;
-        o += len;
-        Some(out)
-    };
-
-    let ssid = next(32)?;
-    let password = next(64)?;
-    let server = next(64)?;
-    drop(next);
-
-    // CRC 校验: 旧格式末尾为 0x00, 视为 legacy 接受; 非零且不匹配视为损坏。
-    let crc_stored = u32::from_le_bytes(buf.get(o..o + 4)?.try_into().ok()?);
-    let crc_calc = xiaozhi_core::ota::crc32_init_xorout(&buf[..o], 0, 0xFFFF_FFFF);
-    if crc_stored != 0 && crc_stored != crc_calc {
-        defmt::error!("凭据 CRC 校验失败 (存储损坏)");
-        return None;
-    }
-
     Some(WifiConfig {
-        ssid: heapless::String::try_from(core::str::from_utf8(ssid).ok()?).ok()?,
-        password: heapless::String::try_from(core::str::from_utf8(password).ok()?).ok()?,
-        server: heapless::String::try_from(core::str::from_utf8(server).ok()?).ok()?,
+        ssid: heapless::String::try_from(fields[0]).ok()?,
+        password: heapless::String::try_from(fields[1]).ok()?,
+        server: heapless::String::try_from(fields[2]).ok()?,
     })
 }
 
@@ -203,13 +162,6 @@ pub struct MqttSettings {
 }
 
 impl MqttSettings {
-    /// 各字段容量 (序列化/反序列化共用): endpoint/client_id/username/
-    /// password/publish_topic/subscribe_topic
-    const CAPS: [usize; 6] = [64, 96, 96, 96, 32, 64];
-
-    /// 序列化后的总长度上界 (magic 4 + 6×(len 2 + 容量) + CRC 4)
-    const BUF_LEN: usize = 4 + 6 * 2 + 64 + 96 + 96 + 96 + 32 + 64 + 4;
-
     fn fields(&self) -> [&str; 6] {
         [
             self.endpoint.as_str(),
@@ -229,61 +181,27 @@ const MQTT_MAGIC: u32 = 0x4643_514D; // 'MQCF' 小端
 /// 保存 MQTT 配置 (整扇区擦写; 仅在内容变化时调用)
 pub fn save_mqtt(flash: &mut FlashStorage<'_>, cfg: &MqttSettings) -> Result<(), &'static str> {
     let mut buf = [0u8; 512];
-    if buf.len() < MqttSettings::BUF_LEN {
-        return Err("MQTT 配置缓冲不足");
-    }
-    buf[..4].copy_from_slice(&MQTT_MAGIC.to_le_bytes());
-    let mut o = 4usize;
-    for s in cfg.fields() {
-        let len = u16::try_from(s.len()).map_err(|_| "MQTT 字段过长")?;
-        buf[o..o + 2].copy_from_slice(&len.to_le_bytes());
-        o += 2;
-        if o + s.len() > buf.len() {
-            return Err("MQTT 配置超出容量");
-        }
-        buf[o..o + s.len()].copy_from_slice(s.as_bytes());
-        o += s.len();
-    }
-    // 末尾 CRC: 部分写入/位翻转时必须能被识别, 否则会带着坏配置走 MQTT
-    let crc = xiaozhi_core::ota::crc32_init_xorout(&buf[..o], 0, 0xFFFF_FFFF);
-    buf[o..o + 4].copy_from_slice(&crc.to_le_bytes());
-    o += 4;
+    let fields = cfg.fields();
+    let n = xiaozhi_core::config_store::encode(MQTT_MAGIC, &fields, &mut buf)
+        .ok_or("MQTT 配置超出容量")?;
     NorFlash::erase(flash, MQTT_SECTOR, MQTT_SECTOR + 4096).map_err(|_| "Flash 擦除失败")?;
-    NorFlash::write(flash, MQTT_SECTOR, &buf[..o]).map_err(|_| "Flash 写入失败")
+    NorFlash::write(flash, MQTT_SECTOR, &buf[..n]).map_err(|_| "Flash 写入失败")
 }
 
 /// 读取 MQTT 配置 (无记录/损坏 → None)
 pub fn load_mqtt(flash: &mut FlashStorage<'_>) -> Option<MqttSettings> {
     let mut buf = [0u8; 512];
     flash.read(MQTT_SECTOR, &mut buf).ok()?;
-    if u32::from_le_bytes(buf[..4].try_into().ok()?) != MQTT_MAGIC {
-        return None;
-    }
-    let mut o = 4usize;
-    let mut out: [heapless::String<96>; 6] = core::array::from_fn(|_| heapless::String::new());
-    for (i, cap) in MqttSettings::CAPS.iter().enumerate() {
-        let len = u16::from_le_bytes(buf.get(o..o + 2)?.try_into().ok()?) as usize;
-        o += 2;
-        let s = core::str::from_utf8(buf.get(o..o + len)?).ok()?;
-        o += len;
-        if s.len() > *cap {
-            return None;
-        }
-        *out.get_mut(i)? = heapless::String::try_from(s).ok()?;
-    }
-    // CRC 校验: 旧格式 (末尾 0xFF) 或位翻转一律视为无效 → 回退 WS
-    let crc_stored = u32::from_le_bytes(buf.get(o..o + 4)?.try_into().ok()?);
-    let crc_calc = xiaozhi_core::ota::crc32_init_xorout(&buf[..o], 0, 0xFFFF_FFFF);
-    if crc_stored != crc_calc {
-        return None;
-    }
+    // 旧格式 (末尾 0xFF/无 CRC) 一律拒绝 → 回退 WS
+    let mut fields: [&str; 6] = ["", "", "", "", "", ""];
+    xiaozhi_core::config_store::decode(MQTT_MAGIC, &buf, &mut fields, false)?;
     Some(MqttSettings {
-        endpoint: heapless::String::try_from(out[0].as_str()).ok()?,
-        client_id: heapless::String::try_from(out[1].as_str()).ok()?,
-        username: heapless::String::try_from(out[2].as_str()).ok()?,
-        password: heapless::String::try_from(out[3].as_str()).ok()?,
-        publish_topic: heapless::String::try_from(out[4].as_str()).ok()?,
-        subscribe_topic: heapless::String::try_from(out[5].as_str()).ok()?,
+        endpoint: heapless::String::try_from(fields[0]).ok()?,
+        client_id: heapless::String::try_from(fields[1]).ok()?,
+        username: heapless::String::try_from(fields[2]).ok()?,
+        password: heapless::String::try_from(fields[3]).ok()?,
+        publish_topic: heapless::String::try_from(fields[4]).ok()?,
+        subscribe_topic: heapless::String::try_from(fields[5]).ok()?,
     })
 }
 
