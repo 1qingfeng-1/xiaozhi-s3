@@ -67,7 +67,23 @@ pre-commit autoupdate         # 升级钩子版本
 - **cargo-deny 需要联网**：无法访问 GitHub 时 advisory 数据库拉取会失败，
   可先 `cargo deny fetch` 预热缓存。
 
-## 3. GitHub Actions
+## 3. 模糊测试（本地，不进 CI）
+
+```bash
+cargo install cargo-fuzz --locked
+rustup toolchain install nightly
+rustup component add rust-src --toolchain nightly
+
+# 必须从仓库外启动，避免继承父仓库 build-std 配置
+cd /tmp
+cargo +nightly fuzz run parse_ws \
+  --fuzz-dir /path/to/repo/xiaozhi-core/fuzz -- -runs=10000
+```
+
+target 列表与说明见 [`../xiaozhi-core/fuzz/README.md`](../xiaozhi-core/fuzz/README.md)。
+CI 不跑 fuzz（需要 nightly sanitizer 且耗时）。
+
+## 4. GitHub Actions
 
 工作流：`.github/workflows/ci.yml`，在 `push main` 与 PR 时触发。
 
@@ -86,7 +102,7 @@ pre-commit autoupdate         # 升级钩子版本
 - `xiaozhi-s3.bin`：应用镜像（用于 OTA / `write-bin 0x20000`）
 - `xiaozhi-s3-merged.bin`：整片镜像（bootloader + 分区表 + app）
 
-## 4. 发布
+## 5. 发布
 
 ```bash
 # 1. 确认门禁全绿
@@ -123,7 +139,7 @@ espflash image_info --chip esp32s3 xiaozhi-s3-v1.0.0.bin
 
 > OTA 当前只做 CRC 完整性校验，尚未启用签名验签，见 [`../SECURITY.md`](../SECURITY.md)。
 
-## 5. 发布检查清单
+## 6. 发布检查清单
 
 - [ ] `scripts/check.sh --with-docs` 通过
 - [ ] core 改动已在子仓库提交并推送，父仓库指针已更新
