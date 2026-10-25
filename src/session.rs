@@ -110,24 +110,11 @@ impl WsClient<'_> {
             (rng.random() >> 16) as u8,
             (rng.random() >> 24) as u8,
         ];
-        let mut frame: heapless::Vec<u8, 2048> = heapless::Vec::new();
-        // 容量经 payload 上限保证; 仍显式返回错误而不是静默截断
-        const FULL: &str = "帧组包失败";
-        frame.push(0x80 | opcode).map_err(|_| FULL)?;
-        let len = payload.len();
-        if len < 126 {
-            frame.push(0x80 | len as u8).map_err(|_| FULL)?;
-        } else {
-            frame.push(0x80 | 126).map_err(|_| FULL)?;
-            frame
-                .extend_from_slice(&(len as u16).to_be_bytes())
-                .map_err(|_| FULL)?;
-        }
-        frame.extend_from_slice(&key).map_err(|_| FULL)?;
-        for (i, b) in payload.iter().enumerate() {
-            frame.push(b ^ key[i % 4]).map_err(|_| FULL)?;
-        }
-        write_all(self.socket, &frame, FRAME_TIMEOUT).await
+        // 栈上定长: 不把 ~2KB 的 heapless::Vec 跨 await 放进 future
+        let mut frame = [0u8; MAX_PACKET_BYTES + xiaozhi_core::ws::MAX_HEADER];
+        let n = xiaozhi_core::ws::encode_client_frame(opcode, payload, key, &mut frame)
+            .map_err(|e| e.describe())?;
+        write_all(self.socket, &frame[..n], FRAME_TIMEOUT).await
     }
 
     /// 接收一帧 (服务端帧不掩码), 返回 (opcode, payload)
@@ -140,62 +127,32 @@ impl WsClient<'_> {
         &mut self,
         timeout: embassy_time::Duration,
     ) -> Result<(u8, heapless::Vec<u8, RECV_BUF>), &'static str> {
-        let mut hdr = [0u8; 2];
-        read_exact(self.socket, &mut hdr, timeout)
+        let mut first = [0u8; 2];
+        read_exact(self.socket, &mut first, timeout)
             .await
             .map_err(|_| "读取帧头失败")?;
-        let fin = hdr[0] & 0x80 != 0;
-        let opcode = hdr[0] & 0x0F;
-        // 协议正确性: RSV 必须为 0, 不支持分片/continuation,
-        // 控制帧必须 FIN=1 且 ≤125B (RFC 6455 §5.5)。
-        if hdr[0] & 0x70 != 0 {
-            return Err("WS RSV 非零");
-        }
-        if !fin {
-            return Err("WS 分片帧不支持");
-        }
-        if opcode == 0 {
-            return Err("WS continuation 不支持");
-        }
-        if matches!(opcode, 3..=7 | 11..=15) {
-            return Err("WS 保留 opcode");
-        }
-        let masked = hdr[1] & 0x80 != 0;
-        let len0 = (hdr[1] & 0x7F) as usize;
-        let len = match len0 {
-            126 => {
-                let mut ext = [0u8; 2];
-                read_exact(self.socket, &mut ext, timeout)
-                    .await
-                    .map_err(|_| "读取长度失败")?;
-                u16::from_be_bytes(ext) as usize
-            },
-            127 => return Err("64 位长度不支持"),
-            n => n,
-        };
-        if opcode >= 8 && len > 125 {
-            return Err("WS 控制帧过长");
-        }
-        if len > RECV_BUF {
-            return Err("帧过长");
-        }
-        let mut mask = [0u8; 4];
-        if masked {
-            read_exact(self.socket, &mut mask, timeout)
+        // 先算完整头长度, 再一次性读扩展长度/掩码
+        let hlen = xiaozhi_core::ws::header_len(&first).map_err(|e| e.describe())?;
+        let mut head = [0u8; xiaozhi_core::ws::MAX_HEADER];
+        head[..2].copy_from_slice(&first);
+        if hlen > 2 {
+            read_exact(self.socket, &mut head[2..hlen], timeout)
                 .await
-                .map_err(|_| "读取掩码失败")?;
+                .map_err(|_| "读取帧头失败")?;
         }
+        let fh =
+            xiaozhi_core::ws::parse_header(&head[..hlen], RECV_BUF).map_err(|e| e.describe())?;
         let mut payload = heapless::Vec::<u8, RECV_BUF>::new();
-        payload.resize(len, 0).map_err(|_| "帧过长")?;
-        if len > 0 {
+        payload.resize(fh.payload_len, 0).map_err(|_| "帧过长")?;
+        if fh.payload_len > 0 {
             read_exact(self.socket, &mut payload, timeout)
                 .await
                 .map_err(|_| "读取负载失败")?;
-            if masked {
-                unmask_in_place(&mut payload, &mask);
+            if fh.masked {
+                xiaozhi_core::ws::unmask(&mut payload, fh.mask);
             }
         }
-        Ok((opcode, payload))
+        Ok((fh.opcode, payload))
     }
 }
 
@@ -270,13 +227,6 @@ async fn write_all(
         data = &data[n..];
     }
     Ok(())
-}
-
-/// 就地 XOR 掩码 (WebSocket 客户端帧解码)
-fn unmask_in_place(payload: &mut [u8], mask: &[u8; 4]) {
-    for (i, b) in payload.iter_mut().enumerate() {
-        *b ^= mask[i % 4];
-    }
 }
 
 /// 在既有 socket 上建立会话: TCP 连接 → WS 握手 → 发送 hello → 等待服务器 hello
