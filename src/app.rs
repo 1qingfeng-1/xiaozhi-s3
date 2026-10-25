@@ -22,8 +22,8 @@ use xiaozhi_core::audio::capture::{
 use xiaozhi_core::audio::listen::{ListenTurn, ListenTurnConfig};
 use xiaozhi_core::audio::preroll::PrerollRing;
 use xiaozhi_core::audio::wake::{
-    VadWakeDetector, WakeEngine, WakeEvent, WakePolicy, WakePolicyConfig, adaptive_threshold,
-    update_noise_floor,
+    MAX_ZCR_PERMILLE, VadWakeDetector, WakeEngine, WakeEvent, WakePolicy, WakePolicyConfig,
+    adaptive_threshold, update_noise_floor, zero_crossing_permille,
 };
 use xiaozhi_core::dialog::{Action, DialogEvent, DialogSm, DialogState, ListenMode};
 use xiaozhi_core::idle::IdlePromptPolicy;
@@ -83,8 +83,12 @@ const LISTEN_SILENCE_MS: u64 = 1_500;
 const LISTEN_WARMUP_MS: u64 = 600;
 /// 从未检测到人声时, 12s 后收尾 (给多轮对话留思考时间)
 const LISTEN_NO_VOICE_MS: u64 = 12_000;
-/// 唤醒预录: 保存最近 1s 原始 PCM, 覆盖建连窗口 (~0.7s) 内丢失的语音
-const PREROLL_SAMPLES: usize = 16_000;
+/// 唤醒预录: 保存最近 2s 原始 PCM，覆盖建连窗口 + 完整唤醒词。
+/// 关键词门控需要把「你好小智」整句发给服务器 ASR；1s 会在建连期间
+/// 把前半句冲掉，导致只识别出「你好」。
+const PREROLL_SAMPLES: usize = 32_000;
+/// 关键词门控超时: 建连 + 服务器 ASR 返回 stt 的最长等待
+const KEYWORD_GATE_TIMEOUT_MS: u64 = 8_000;
 
 /// 乒乓窗口 = 单个 DMA 描述符 (4092B ≈ 64ms): available() 按完整描述符计数
 const BLOCK_BYTES: usize = 4092;
@@ -517,6 +521,8 @@ pub struct AppArgs<'a, 'b> {
 ///
 /// 返回本轮成功入队的帧数。时间戳取自 [`AecClock`] (服务端 AEC 对齐);
 /// 协议版本 1 时该队列始终为空, 时间戳恒为 0。
+// 编码热路径保持单函数: 拆分会引入额外的状态传递; 嵌套深度接受。
+#[allow(clippy::excessive_nesting)]
 fn encode_uplink(
     pcm: &[i16],
     acc_buf: &mut [i16],
@@ -571,7 +577,14 @@ fn encode_uplink(
 /// (esp-hal RX 饱和后只能整体重建, 且重建必须在直线路径上做, 见 AGENTS.md)。
 // `unused_variables/unused_assignments`: 诊断计数器只在 `debug-diag` 构建
 // 里被 `diag!` 读取; 默认构建下日志整段消除, 这些赋值会触发告警。
-#[allow(clippy::too_many_arguments, unused_variables, unused_assignments)]
+// `excessive_nesting`: 主循环按"阶段"线性展开, 拆分待后续 LoopPhase 重构
+// (见 docs/ROADMAP.md); 此处显式接受, 避免门禁长期静音。
+#[allow(
+    clippy::too_many_arguments,
+    clippy::excessive_nesting,
+    unused_variables,
+    unused_assignments
+)]
 pub async fn run(
     args: AppArgs<'_, '_>,
     pop_buf: &mut [u8],
@@ -606,8 +619,9 @@ pub async fn run(
         VadWakeDetector::new(VAD_THRESHOLD),
         WakePolicy::new(WakePolicyConfig {
             warmup_ms: 1_000,
-            // 4 帧 ≈256ms 持续人声: 滤掉环境噪声瞬态
-            debounce_frames: 4,
+            // 8 帧 ≈480ms 持续人声: 「嗯哼」等短促出声直接滤掉;
+            // 「你好小智」四音节通常 600ms+。
+            debounce_frames: 8,
             ..Default::default()
         }),
     );
@@ -634,8 +648,9 @@ pub async fn run(
     let mut low_power = false;
     let mut pending_connect = false;
     let mut connect_deadline: u64 = 0;
-    let mut ack_pending = false;
-    let mut ack_flush_at: u64 = 0;
+    // 关键词门控: VAD 唤醒后先让服务器 ASR 确认「小智」, 不播本地应答
+    let mut keyword_gate = false;
+    let mut keyword_gate_deadline: u64 = 0;
     let mut volume_dirty = false;
     let mut preroll = PrerollRing::new(preroll);
     let mut preroll_flush = false;
@@ -800,6 +815,23 @@ pub async fn run(
             match msg {
                 UiMessage::UserText(t) => {
                     crate::diag!("UI 用户: {}", t.as_str());
+                    if keyword_gate {
+                        keyword_gate = false;
+                        if stt_has_keyword(t.as_str()) {
+                            DROP_DOWNLINK.store(false, core::sync::atomic::Ordering::Relaxed);
+                            // 确认是关键词才给功放上电, 避免误唤醒的 pop 声
+                            if !audio.pa_enabled() {
+                                audio.set_pa(true);
+                            }
+                            low_power = false;
+                            info!("关键词确认: {}", t.as_str());
+                        } else {
+                            // 非关键词: 静默结束, 不播放任何回复
+                            info!("非关键词, 静默结束: {}", t.as_str());
+                            let _ = channels.command.try_send(SessionCommand::CloseSession);
+                            dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
+                        }
+                    }
                     last_user_text = t;
                 },
                 UiMessage::AssistantText(t) => {
@@ -866,6 +898,8 @@ pub async fn run(
                 DROP_DOWNLINK.store(false, core::sync::atomic::Ordering::Relaxed);
                 info!("会话已结束, 回到待机监听");
             }
+            keyword_gate = false;
+            keyword_gate_deadline = 0;
             codec_fail_count = 0;
             codec_retry_at = 0;
         } else if encoder.is_none()
@@ -1112,7 +1146,11 @@ pub async fn run(
                 r.capabilities
                     .contains(esp_alloc::MemoryCapability::Internal)
             }) {
-                let used_pct = if r.size > 0 { r.used * 100 / r.size } else { 0 };
+                let used_pct = r
+                    .used
+                    .checked_mul(100)
+                    .and_then(|v| v.checked_div(r.size))
+                    .unwrap_or(0);
                 if used_pct > 90 {
                     warn!(
                         "内部堆水位: {}% ({}KB/{}KB) — 接近耗尽",
@@ -1171,10 +1209,14 @@ pub async fn run(
 
         // ---- 4.5 空闲提示: 离开 Idle 视为活动; 60s 无活动播提示音 ----
         if sm.state() != DialogState::Idle {
-            idle_policy.note_activity(now_ms);
-            low_power = false;
-            if !audio.pa_enabled() {
-                audio.set_pa(true);
+            // 关键词确认阶段不算活动: 不重置空闲窗口、不开功放、不退出低功耗。
+            // 否则随便说一句话就会把 60s 休眠计时清零, 且 PA 上电产生杂音。
+            if !keyword_gate {
+                idle_policy.note_activity(now_ms);
+                low_power = false;
+                if !audio.pa_enabled() {
+                    audio.set_pa(true);
+                }
             }
             if prompt.is_active() && !prompt.is_wake_ack() {
                 // 空闲提示音期间被唤醒: 立即中止 (唤醒应答会另行播放)
@@ -1187,20 +1229,18 @@ pub async fn run(
             audio.set_volume(VOLUME_PCT.load(core::sync::atomic::Ordering::Relaxed));
             prompt_vol_restore_at = 0;
         }
-        if sm.state() == DialogState::Idle {
-            if !prompt.is_active() && idle_policy.poll(now_ms) {
-                let vol = VOLUME_PCT
-                    .load(core::sync::atomic::Ordering::Relaxed)
-                    .min(60);
-                audio.set_volume(vol);
-                prompt.play_idle();
-                prompt_until_ms = now_ms + prompt.duration_ms() + 400;
-                info!(
-                    "空闲 {}s: 播放提示音 (音量 {}%)",
-                    idle_policy.idle_for_ms(now_ms) / 1000,
-                    vol
-                );
-            }
+        if sm.state() == DialogState::Idle && !prompt.is_active() && idle_policy.poll(now_ms) {
+            let vol = VOLUME_PCT
+                .load(core::sync::atomic::Ordering::Relaxed)
+                .min(60);
+            audio.set_volume(vol);
+            prompt.play_idle();
+            prompt_until_ms = now_ms + prompt.duration_ms() + 400;
+            info!(
+                "空闲 {}s: 播放提示音 (音量 {}%)",
+                idle_policy.idle_for_ms(now_ms) / 1000,
+                vol
+            );
         }
 
         // ---- 5. 等回复超时: 20s 无服务器消息恢复待机 ----
@@ -1253,6 +1293,11 @@ pub async fn run(
             };
             let ns = extract_slot(&pop_buf[..(n / 4) * 4], 2, 0, mono_buf);
             match sm.state() {
+                // 建连期间也要写预录环: 唤醒词后半句/紧接的提问不能丢,
+                // 否则关键词门控只能把「你好」发给服务器 ASR。
+                DialogState::Connecting => {
+                    preroll.push(&mono_buf[..ns]);
+                },
                 // VAD 必须在原始电平域 (硬件增益后、无软件增益, 对齐 C++ 参考):
                 // 若在软件增益后跑, 阈值等效原始值被放大, 环境噪声即误触发
                 DialogState::Idle => {
@@ -1314,6 +1359,9 @@ pub async fn run(
                     }
                 },
                 DialogState::Listening => {
+                    // 继续写预录环: 关键词门控补发期间用户可能还在说最后
+                    // 一两个字 ("智"), 不写就会在 Listening 边界被截断。
+                    preroll.push(&mono_buf[..ns]);
                     // 回合结束判定 (auto 模式): 本地能量 VAD 找静音收尾点。
                     // ⚠️ 不做噪声门: 原始人声 rms 仅 200~400, 与噪声 (30~90) 差距小,
                     // 门限稍高就会把说话帧也清零 (真机实测: 服务端只收到 0.6s 零值)。
@@ -1324,7 +1372,11 @@ pub async fn run(
                     let mut voiced_ms = 0u64;
                     if !warmup {
                         for chunk in mono_buf[..ns].chunks(FRAME_SAMPLES) {
-                            if is_voice_active(chunk, LISTEN_VAD_THRESHOLD) {
+                            // 低阈值能量 + 人声 ZCR: 键盘/宽带瞬态不记为"说过话",
+                            // 避免误唤醒后键盘声把回合卡在 WaitingReply。
+                            if is_voice_active(chunk, LISTEN_VAD_THRESHOLD)
+                                && zero_crossing_permille(chunk) <= MAX_ZCR_PERMILLE
+                            {
                                 voiced_ms += chunk.len() as u64 * 1000 / SAMPLE_RATE as u64;
                             }
                         }
@@ -1378,10 +1430,6 @@ pub async fn run(
                         }
                     }
                 },
-                DialogState::Connecting => {
-                    // 建连期间继续预录, 避免唤醒后第一句被吞
-                    preroll.push(&mono_buf[..ns]);
-                },
                 // 服务端 AEC: 播报中继续上行麦克风 (回声由服务器消除),
                 // 服务器 VAD 检出人声即发 tts stop → 打断并转聆听。
                 // 无 AEC 时不能开: 设备会拾取自己的播报形成自问自答。
@@ -1407,48 +1455,56 @@ pub async fn run(
         if triggered {
             let t = TURN_ID.load(core::sync::atomic::Ordering::Relaxed);
             crate::diag!("[T{}] wake t={}", t, now_ms);
-            // 本地应答「我在」: 应答期间不上行、不跑 VAD, 播完再补发之后的预录
-            // (避免把应答本身发给服务器, 也避免服务器听到唤醒词提前收尾)
-            if !audio.pa_enabled() {
-                audio.set_pa(true);
-            }
-            let vol = VOLUME_PCT
-                .load(core::sync::atomic::Ordering::Relaxed)
-                .min(60);
-            audio.set_volume(vol);
-            prompt.play_wake_ack();
-            let ack_end = now_ms + prompt.duration_ms() + 250;
-            mic_mute_until_ms = ack_end;
-            prompt_vol_restore_at = ack_end;
-            ack_pending = true;
-            ack_flush_at = ack_end;
-            info!("唤醒应答: 我在 ({}ms)", prompt.duration_ms());
+            // 注意: 这里先不开功放。非关键词会静默挂断, 提前开 PA 会有
+            // 上电 pop/底噪 (真机听感为"杂音"); 关键词确认后再开。
+            // 关键词门控: 不播「我在」, 先把唤醒前后的音频发给服务器 ASR;
+            // stt 里出现「小智」才继续, 否则静默挂断。这样只有关键词能真正
+            // 唤醒设备, 键盘/嗯哼等环境声不会引出应答。
+            keyword_gate = true;
+            keyword_gate_deadline = now_ms + KEYWORD_GATE_TIMEOUT_MS;
+            DROP_DOWNLINK.store(true, core::sync::atomic::Ordering::Relaxed);
+            preroll_flush = true;
+            preroll_off = 0;
+            // 补发最近 2s (包含完整唤醒词), 不要从当前时刻起算
+            preroll_from = preroll.seq().saturating_sub(PREROLL_SAMPLES as u64);
+            // 建连后才开始编码补发, 3s 音频需要更长的超时上限
+            preroll_deadline = now_ms + 4_000;
+            info!("唤醒: 等待关键词确认");
             dispatch(&mut sm, &mut pending, DialogEvent::WakeTriggered);
         }
 
-        // 应答结束: 从此刻开始补发预录 (丢弃唤醒词与应答音)
-        if ack_pending && now_ms >= ack_flush_at {
-            ack_pending = false;
-            preroll_flush = true;
-            preroll_off = 0;
-            preroll_from = preroll.seq();
-            preroll_deadline = now_ms + 1_000;
+        // 关键词确认超时: 没等到 stt / 服务器不可达 → 静默回待机
+        if keyword_gate && now_ms >= keyword_gate_deadline {
+            keyword_gate = false;
+            warn!("关键词确认超时, 结束会话");
+            let _ = channels.command.try_send(SessionCommand::CloseSession);
+            dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
         }
 
         // auto 模式本地收尾: 说过话且静音 1500ms, 或 12s 无人声 → listen stop
-        if sm.state() == DialogState::Listening && sm.mode() == ListenMode::Auto {
-            if listen_turn.should_stop() {
-                crate::diag!(
-                    "[T{}] stop: heard={} 有声={}ms 静音={}ms 总时长={}ms 上行帧={} rms_max={}",
-                    TURN_ID.load(core::sync::atomic::Ordering::Relaxed),
-                    listen_turn.heard(),
-                    listen_turn.voiced_ms(),
-                    listen_turn.silence_ms(),
-                    listen_turn.total_ms(),
-                    turn_up_frames,
-                    turn_rms_max
-                );
+        if sm.state() == DialogState::Listening
+            && sm.mode() == ListenMode::Auto
+            && listen_turn.should_stop()
+        {
+            crate::diag!(
+                "[T{}] stop: heard={} 有声={}ms 静音={}ms 总时长={}ms 上行帧={} rms_max={}",
+                TURN_ID.load(core::sync::atomic::Ordering::Relaxed),
+                listen_turn.heard(),
+                listen_turn.voiced_ms(),
+                listen_turn.silence_ms(),
+                listen_turn.total_ms(),
+                turn_up_frames,
+                turn_rms_max
+            );
+            if listen_turn.heard() {
+                // 有说话: 正常等服务器回复, 播完继续聆听
                 dispatch(&mut sm, &mut pending, DialogEvent::AutoListenStop);
+            } else {
+                // 只是误唤醒/短促出声, 没人提问: 直接收尾回待机,
+                // 不必再等 20s 服务器回复 (否则整体休眠时间被拉长)。
+                let _ = channels.command.try_send(SessionCommand::SendListenStop);
+                let _ = channels.command.try_send(SessionCommand::CloseSession);
+                dispatch(&mut sm, &mut pending, DialogEvent::SessionClosed);
             }
         }
 
@@ -1585,13 +1641,19 @@ pub async fn run(
         embassy_time::Timer::after(embassy_time::Duration::from_millis(wait_ms)).await;
 
         // ---- 9. 灯语 + 显示状态 ----
-        let led = match sm.state() {
-            DialogState::Idle if low_power => LedMode::Off,
-            DialogState::Idle => LedMode::Breathing(BreathSpeed::Slow),
-            DialogState::Connecting => LedMode::Breathing(BreathSpeed::Fast),
-            DialogState::Listening => LedMode::Breathing(BreathSpeed::Medium),
-            DialogState::WaitingReply => LedMode::Breathing(BreathSpeed::Fast),
-            DialogState::Speaking => LedMode::On,
+        let led = if keyword_gate {
+            // 关键词确认期间保持灯灭: 避免随机说话时呼吸灯亮/暗变化
+            // (用户会误以为设备被唤醒), 确认通过后再恢复正常状态灯。
+            LedMode::Off
+        } else {
+            match sm.state() {
+                DialogState::Idle if low_power => LedMode::Off,
+                DialogState::Idle => LedMode::Breathing(BreathSpeed::Slow),
+                DialogState::Connecting => LedMode::Breathing(BreathSpeed::Fast),
+                DialogState::Listening => LedMode::Breathing(BreathSpeed::Medium),
+                DialogState::WaitingReply => LedMode::Breathing(BreathSpeed::Fast),
+                DialogState::Speaking => LedMode::On,
+            }
         };
         if last_led != Some(led) {
             leds.set_mode(led);
@@ -1694,6 +1756,16 @@ fn state_label(state: DialogState) -> &'static str {
         DialogState::WaitingReply => "等回复",
         DialogState::Speaking => "播报",
     }
+}
+
+/// 服务器 ASR 文本是否包含唤醒词
+///
+/// 容忍常见近音/截断: 「小志」「晓智」, 以及 ASR 只输出「你好，小」的情况。
+fn stt_has_keyword(text: &str) -> bool {
+    text.contains("小智")
+        || text.contains("小志")
+        || text.contains("晓智")
+        || (text.contains("你好") && text.contains('小'))
 }
 
 fn event_label(ev: DialogEvent) -> &'static str {
