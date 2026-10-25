@@ -452,7 +452,10 @@ impl Audio {
             Ok(v) => v,
             Err(_) => return 0,
         };
-        let n = data.len().min(free);
+        // I2S TX 是立体声 16bit, 一个采样帧 4 字节。环形空闲空间不一定是
+        // 4 的倍数, 向下对齐避免写半个采样帧 (调用方按 4 字节推进指针,
+        // 否则会出现重放/丢字节)。
+        let n = data.len().min(free) & !3;
         if n == 0 {
             return 0;
         }

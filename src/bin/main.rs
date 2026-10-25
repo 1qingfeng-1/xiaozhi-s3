@@ -132,8 +132,6 @@ async fn main(spawner: Spawner) -> ! {
     // xiaozhi WS 协议版本 (NVS 0xB000, 默认 1): ≥2 时上行帧带时间戳
     // (最终传输方式由 OTA 是否下发 MQTT 配置决定, 见下方会话任务选择)
     let ws_version = store::load_ws_version(flash);
-    // 仅 v2 帧带服务端 AEC 时间戳; v3 头没有 timestamp
-    let mut server_aec = ws_version == 2;
     info!("WS 协议版本: v{}", ws_version);
 
     // BOOT 键**持续按住 3s**: 清除凭据强制重回配网
@@ -271,13 +269,14 @@ async fn main(spawner: Spawner) -> ! {
         },
         None => None,
     };
-    // UDP 通道恒带时间戳, 服务端 AEC 可用 → 播报中持续上行
-    server_aec |= mqtt_cfg.is_some();
+    // UDP 通道恒带时间戳, 服务端 AEC 可用 → 播报中持续上行。
+    // 仅 v2 帧带 timestamp; v3 头没有。
+    #[cfg(not(feature = "aec-off"))]
+    let server_aec = ws_version == 2 || mqtt_cfg.is_some();
     #[cfg(feature = "aec-off")]
-    {
-        server_aec = false;
-        info!("诊断 aec-off: 播报中不上行");
-    }
+    let server_aec = false;
+    #[cfg(feature = "aec-off")]
+    info!("诊断 aec-off: 播报中不上行");
     if server_aec {
         info!("服务端 AEC: 开 (上行帧携带时间戳)");
     }
