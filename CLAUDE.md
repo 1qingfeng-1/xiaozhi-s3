@@ -25,6 +25,8 @@ cargo run --release --bin audio-loopback  # 其他调试 bin: wifi-test / gpio-t
 cargo fmt --all -- --check
 cargo clippy --all-features -- -D warnings
 cargo check --all
+./scripts/check_layering.sh   # core 不得依赖 esp-hal/embassy
+./scripts/check_features.sh   # 诊断/自测 feature 组合
 ```
 
 `rust-toolchain.toml` 指定 `esp` 工具链；**host 侧命令必须显式 `+stable`**。

@@ -62,7 +62,7 @@ cd xiaozhi-core && cargo +stable nextest run
 ## 文档
 
 - 新功能更新 `AGENTS.md` 对应章节与 `docs/ROADMAP.md`。
-- 架构取舍记录在 [`docs/adr/`](docs/adr/)。
+- 架构取舍记录在 [`docs/adr/`](docs/adr/README.md)。
 - Markdown 需通过 markdownlint；历史过程文档统一放 `docs/archive/`。
 
 ## 安全

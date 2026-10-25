@@ -17,6 +17,9 @@ cargo clippy --all-features -- -D warnings
 echo "== 固件 check =="
 cargo check --all
 
+echo "== core 分层检查 =="
+./scripts/check_layering.sh
+
 echo "== core fmt/clippy/tests =="
 (
     cd xiaozhi-core
@@ -47,6 +50,14 @@ if [ "${1:-}" = "--with-docs" ]; then
         markdownlint-cli2 "**/*.md" "#target" "#vendor" "#CHANGELOG.md" "#docs/archive"
     else
         echo "跳过: 未安装 markdownlint-cli2" >&2
+    fi
+    echo "== Markdown 链接 =="
+    if command -v lychee >/dev/null 2>&1; then
+        lychee --offline --no-progress \
+            --exclude-path docs/archive --exclude-path vendor --exclude-path target \
+            '**/*.md'
+    else
+        echo "跳过: 未安装 lychee" >&2
     fi
 fi
 

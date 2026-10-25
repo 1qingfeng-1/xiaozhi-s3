@@ -213,7 +213,7 @@ git submodule update --init --recursive
 - [开发指南](docs/DEVELOPMENT.md) - 完整的开发流程
 - [快速开始](docs/QUICK_START.md) - 5 分钟上手
 - [门禁 / CI / 发布](docs/CI.md) - 本地检查与 release 流程
-- [架构决策记录](docs/adr/) - 为什么这样设计
+- [架构决策记录](docs/adr/README.md) - 为什么这样设计
 - [移植指南](docs/PORTING.md) - 换板与跨芯片移植
 - [路线图](docs/ROADMAP.md) - 阶段计划与验收清单
 

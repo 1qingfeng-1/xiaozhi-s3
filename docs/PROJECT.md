@@ -62,7 +62,7 @@ xiaozhi-s3/
 - [QUICK_START.md](QUICK_START.md) - 快速开始
 - [DEVELOPMENT.md](DEVELOPMENT.md) - 开发指南
 - [CI.md](CI.md) - 门禁、CI 与发布
-- [历史归档](archive/) - 早期完成记录（不再维护）
+- [历史归档](archive/README.md) - 早期完成记录（不再维护）
 
 ## 🛠️ 技术栈
 

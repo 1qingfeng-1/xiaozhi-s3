@@ -1,7 +1,7 @@
 # 门禁、CI 与发布
 
 本文是本地门禁、pre-commit、GitHub Actions 与 release 的唯一说明。
-历史配置总结见 [`archive/`](archive/)。
+历史配置总结见 [`archive/`](archive/README.md)。
 
 ## 1. 本地门禁（与 CI 同序）
 
@@ -39,6 +39,16 @@ just image        # 生成 dist/xiaozhi-s3.bin 与 merged 镜像
 just stack        # 主任务栈预算
 just fuzz parse_ws 20000
 ```
+
+### 分层门禁
+
+```bash
+./scripts/check_layering.sh
+```
+
+用 `cargo tree -p xiaozhi-core` 断言 core 依赖图不含 `esp-hal` /
+`esp-radio` / `esp-rtos` / `embedded-hal` / `embassy-*` / `smoltcp`，
+保证 host 可测试与跨板复用。
 
 ### 资源门禁
 
@@ -114,10 +124,10 @@ cd xiaozhi-core && cargo mutants --test-tool nextest
 |---|---|
 | `fmt` | `cargo fmt --check` |
 | `clippy` | `cargo clippy --locked --all-features -- -D warnings`（真实门禁） |
-| `check` | `cargo check --locked --all` |
+| `check` | `cargo check --locked --all` + core 分层门禁 |
 | `core-test` | core fmt / clippy / nextest（host） |
 | `core-coverage` | `cargo llvm-cov nextest`，上传 `core-lcov` artifact（不设阈值） |
-| `docs-lint` | `typos` + `markdownlint-cli2@0.17.2` |
+| `docs-lint` | `typos` + `markdownlint-cli2@0.17.2` + lychee 相对链接检查 |
 | `actionlint` | GitHub Actions 工作流静态检查（actionlint 1.7.7） |
 | `deny` | `cargo deny check advisories licenses` |
 | `build` | feature 矩阵编译 → release 构建 → 栈预算 → 镜像生成与大小门禁 → 上传产物 |

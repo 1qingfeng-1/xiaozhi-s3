@@ -33,6 +33,14 @@ mutants:
 features:
     ./scripts/check_features.sh
 
+# core 分层门禁 (禁止硬件依赖)
+layers:
+    ./scripts/check_layering.sh
+
+# Markdown 相对链接检查 (需 cargo install lychee)
+links:
+    lychee --offline --no-progress --exclude-path docs/archive --exclude-path vendor '**/*.md'
+
 # release 构建
 build:
     cargo build --release --locked

@@ -208,7 +208,8 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量映射/时钟/cod
 - pre-commit（`.pre-commit-config.yaml`）：fmt / clippy / check / cargo-deny / typos / markdownlint；
   `vendor/` 整体排除（三方资产保持上游原样）。
 - 格式化 `rustfmt.toml`（max_width 100）；clippy 阈值 `clippy.toml`（栈 1024B）。
-- 门禁顺序：`fmt --check` → `clippy -D warnings` → `check --all` → core 单测（cd 进子目录）。
+- 门禁顺序：`fmt --check` → `clippy -D warnings` → `check --all` →
+  `scripts/check_layering.sh` → `scripts/check_features.sh` → core 单测（cd 进子目录）。
 - 开发流程 `docs/DEVELOPMENT.md`、`docs/QUICK_START.md`；阶段计划与**真机验证清单**
   `docs/ROADMAP.md`（下一步上机验证项以此为准）；引脚表见 README「引脚映射」。
 - MQTT 网关部署与 UDP 加密/时间戳：`docs/MQTT_UDP.md`；换板/跨芯片移植：`docs/PORTING.md`。
@@ -218,4 +219,5 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量映射/时钟/cod
   `session-selftest`（开机 5s 自动唤醒）、`watchdog-selftest`（阻塞主循环验证复位）、
   `tts-selftest`（长句 TTS）、`idle-selftest`（空闲窗口缩到 5s）、
   `ps-adaptive`（WiFi 省电自适应 A/B，默认 None）。
-- 门禁可用 `scripts/check.sh`（含 core fmt/clippy/nextest）；栈预算用 `scripts/check_stack.sh`。
+- 门禁可用 `scripts/check.sh`（含 core fmt/clippy/nextest/分层）；栈预算用
+  `scripts/check_stack.sh`；feature 组合用 `scripts/check_features.sh`。

@@ -16,7 +16,7 @@
 | [`MQTT_UDP.md`](MQTT_UDP.md) | MQTT 网关、UDP 加密、真机记录 |
 | [`PARITY.md`](PARITY.md) | 与 C++ 参考实现的功能对照 |
 | [`PROJECT.md`](PROJECT.md) | 项目结构与里程碑 |
-| [`adr/`](adr/) | 架构决策记录（为什么这样设计） |
+| [`adr/`](adr/README.md) | 架构决策记录（为什么这样设计） |
 
 ## 历史归档
 
