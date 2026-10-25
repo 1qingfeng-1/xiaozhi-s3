@@ -56,8 +56,8 @@ fn now_ms() -> u64 {
 
 /// 解析 `host:port` (OTA 下发的 MQTT endpoint)
 pub fn parse_endpoint(s: &str) -> Option<(Ipv4Address, u16)> {
-    let (host, port) = s.rsplit_once(':')?;
-    Some((host.parse().ok()?, port.parse().ok()?))
+    let (host, port) = xiaozhi_core::http::parse_host_port(s)?;
+    Some((host.parse().ok()?, port))
 }
 
 /// 单次网络读/写等待上限: 半开连接时让会话任务能退出重连

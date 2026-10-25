@@ -312,7 +312,7 @@ async fn handshake(
         chunk.copy_from_slice(&v[..chunk.len()]);
     }
     let mut key_b64 = heapless::String::<32>::new();
-    base64_encode(&key_bytes, &mut key_b64);
+    xiaozhi_core::http::base64_encode(&key_bytes, &mut key_b64);
 
     let mut req = heapless::String::<512>::new();
     let _ = core::fmt::write(
@@ -378,55 +378,13 @@ async fn handshake(
     }
 
     // Sec-WebSocket-Accept = base64(SHA1(key || GUID)), 防中间人/错误端点
-    let mut src = heapless::String::<64>::new();
-    src.push_str(key_b64.as_str()).map_err(|_| "WS key 过长")?;
-    src.push_str("258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
-        .map_err(|_| "WS key 过长")?;
-    let mut expected = heapless::String::<32>::new();
-    base64_encode(&xiaozhi_core::sha1::sha1(src.as_bytes()), &mut expected);
-    match header_value(head, "Sec-WebSocket-Accept") {
+    let expected = xiaozhi_core::http::websocket_accept(key_b64.as_str());
+    match xiaozhi_core::http::header_value(head, "Sec-WebSocket-Accept") {
         Some(v) if v == expected.as_str() => {},
         _ => return Err("WS Accept 校验失败"),
     }
     Ok(())
 }
 
-/// 从 HTTP 响应头取字段值 (大小写不敏感; 跳过状态行)
-fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
-    head.lines().skip(1).find_map(|line| {
-        let (k, v) = line.split_once(':')?;
-        if k.trim().eq_ignore_ascii_case(name) {
-            Some(v.trim())
-        } else {
-            None
-        }
-    })
-}
-
 // JSON 字段扫描已下沉到 core (host 可测); 这里保持原路径兼容调用方
 pub use xiaozhi_core::json_scan::{num_field as json_num_field, str_field as json_str_field};
-
-/// base64 编码 (标准字母表, 带填充)
-fn base64_encode(input: &[u8], out: &mut heapless::String<32>) {
-    const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    for chunk in input.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        let _ = out.push(TBL[(n >> 18) as usize & 63] as char);
-        let _ = out.push(TBL[(n >> 12) as usize & 63] as char);
-        let _ = out.push(if chunk.len() > 1 {
-            TBL[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        let _ = out.push(if chunk.len() > 2 {
-            TBL[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-}

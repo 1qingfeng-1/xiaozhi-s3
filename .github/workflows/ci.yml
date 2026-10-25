@@ -196,6 +196,7 @@ jobs:
           cargo check --no-default-features --features board-gezipai,debug-diag
           cargo check --no-default-features --features board-gezipai,idle-selftest,session-selftest,tts-selftest
           cargo check --no-default-features --features board-gezipai,watchdog-selftest,ota-selftest-crash
+          cargo check --no-default-features --features board-gezipai,aec-off,pa-off,volume-off
 
       - name: Build release firmware
         run: cargo build --release
