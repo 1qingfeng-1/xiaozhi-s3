@@ -28,9 +28,16 @@ WiFi 与 OTA 只能在真机验证。本文描述把"烧录后手测"变成可�
 
 ```text
 PING / VERSION / GET_COUNTERS / RESET_COUNTERS
-SET_VOLUME 60 / PLAY_TONE 1k 3000 / CAPTURE 2000
+SET_VOLUME 60 / PLAY_TONE 1000 3000 / CAPTURE 2000
 WAKE / BARGE_IN / SIM_LOW_BATTERY 15 / REBOOT
 ```
+
+参数范围：`SET_VOLUME` / `SIM_LOW_BATTERY` 为 0~100；
+`PLAY_TONE` 频率 20~20000 Hz、时长 1~60000 ms；`CAPTURE` 1~60000 ms。
+
+命令解析与事件格式化已落在 `xiaozhi-core::hil`（`parse_command` /
+`format_event`，host 测试覆盖）。`hil-agent` bin 只负责串口/USB 收发与
+执行动作，控制协议不进入固件主循环。
 
 - 走第二路 UART 或 USB Serial/JTAG，与音频/网络链路物理隔离；
 - `CAPTURE` 回传 PCM 统计（RMS/峰值/ZCR/削顶数），必要时才回传原始数据；

@@ -144,7 +144,7 @@ espflash write-bin 0x0 xiaozhi-s3-<tag>-merged.bin
 
 ```bash
 cd xiaozhi-core
-cargo +stable nextest run     # 推荐 (并行, 206 个测试)
+cargo +stable nextest run     # 推荐 (并行, 211 个测试)
 # 或
 cargo +stable test
 ```
