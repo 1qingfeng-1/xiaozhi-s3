@@ -20,6 +20,7 @@ ESP32-S3 智能音箱固件（Rust `no_std` + esp-hal v1.1 + esp-rtos/embassy-ne
 cargo build --release
 cargo run --release --bin xiaozhi-s3      # espflash 烧录 + defmt 监视
 cargo run --release --bin audio-loopback  # 其他调试 bin: wifi-test / gpio-test / i2c-scan
+cargo run --release --features hil --bin hil-agent  # HIL 控制代理 (USB Serial/JTAG)
 
 # 门禁（顺序与 pre-commit/CI 一致）
 cargo fmt --all -- --check

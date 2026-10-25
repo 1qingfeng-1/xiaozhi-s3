@@ -15,6 +15,7 @@ COMBOS=(
     "board-gezipai,idle-selftest,session-selftest,tts-selftest"
     "board-gezipai,watchdog-selftest,ota-selftest-crash"
     "board-gezipai,aec-off,pa-off,volume-off"
+    "board-gezipai,hil"
 )
 
 for features in "${COMBOS[@]}"; do

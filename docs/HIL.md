@@ -39,6 +39,15 @@ WAKE / BARGE_IN / SIM_LOW_BATTERY 15 / REBOOT
 `format_event`，host 测试覆盖）。`hil-agent` bin 只负责串口/USB 收发与
 执行动作，控制协议不进入固件主循环。
 
+当前实现（`cargo build --release --features hil --bin hil-agent`）：
+
+- 控制通道：**USB Serial/JTAG**（独立于 UART0 日志）；
+- 已支持：`PING` / `VERSION` / `GET_COUNTERS` / `RESET_COUNTERS` /
+  `SET_VOLUME` / `PLAY_TONE 250 <ms>` / `SIM_LOW_BATTERY` / `REBOOT`；
+- 暂返回 `HIL error reason=not_implemented`：`CAPTURE` / `WAKE` / `BARGE_IN`
+  （需要与主音频/会话链路合流后再实现）；
+- `PLAY_TONE` 目前仅支持 250Hz（蜂鸣器固定频率），任意频率待夹具阶段扩展。
+
 - 走第二路 UART 或 USB Serial/JTAG，与音频/网络链路物理隔离；
 - `CAPTURE` 回传 PCM 统计（RMS/峰值/ZCR/削顶数），必要时才回传原始数据；
 - 开启 `hil` feature 后只输出稳定 `key=value`：

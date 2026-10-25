@@ -109,6 +109,8 @@ pub struct BoardExtras {
     pub sw_interrupt: esp_hal::peripherals::SW_INTERRUPT<'static>,
     pub flash: esp_hal::peripherals::FLASH<'static>,
     pub wifi: esp_hal::peripherals::WIFI<'static>,
+    /// USB Serial/JTAG (HIL 控制通道; 普通固件忽略)
+    pub usb_device: esp_hal::peripherals::USB_DEVICE<'static>,
 }
 
 /// 组装 gezipai 板子运行时对象
@@ -279,6 +281,7 @@ pub fn create_board(peripherals: Peripherals) -> (Board, BoardExtras) {
         sw_interrupt: peripherals.SW_INTERRUPT,
         flash: peripherals.FLASH,
         wifi: peripherals.WIFI,
+        usb_device: peripherals.USB_DEVICE,
     };
     (board, extras)
 }

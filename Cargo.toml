@@ -16,6 +16,12 @@ path = "./src/bin/main.rs"
 name = "wifi-test"
 path = "./src/bin/wifi-test.rs"
 
+# HIL 控制代理: 仅显式 --features hil 时构建
+[[bin]]
+name = "hil-agent"
+path = "./src/bin/hil-agent.rs"
+required-features = ["hil"]
+
 [build-dependencies]
 # vendor/libopus (xiph/opus v1.6.1 裁剪副本) 的 C 交叉编译
 cc = "1"
@@ -94,6 +100,10 @@ board-gezipai = []
 
 ## 关键词唤醒 (esp-sr WakeNet, "你好小智"): 链接级验证待完成, 见 vendor/esp-sr/README.md
 wakenet = []
+
+## HIL 控制代理 (src/bin/hil-agent.rs): 第二路 USB Serial/JTAG 控制通道
+## 与主固件互斥使用, 仅用于真机自动化验证
+hil = []
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
