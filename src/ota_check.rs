@@ -494,11 +494,14 @@ async fn download_and_flash_inner(
         info!("OTA: 清单未提供 SHA-256, 仅做长度校验");
     }
 
-    // 6. 擦除目标 otadata 扇区并写 PENDING_VERIFY 条目
-    //    新镜像首次启动成功、WiFi 连上后才由 confirm_running_image 置 VALID;
-    //    未确认时由二级引导器按 PENDING_VERIFY 回滚到旧槽。
-    let entry =
-        ota::OtaDataEntry::new(new_seq, version.as_str(), ota::OtaImageState::PendingVerify);
+    // 6. 擦除目标 otadata 扇区并写 NEW 条目
+    //
+    // ⚠️ 必须写 NEW(0) 而不是 PENDING_VERIFY(1):
+    // 启用 APP_ROLLBACK 的引导器会在每次启动时先把 PENDING_VERIFY 标为
+    // ABORTED 并回退; 写 NEW 才会被它改为 PENDING_VERIFY 并首次启动。
+    // 未启用回滚的引导器按 seq/crc 选择, NEW 同样可启动。
+    // 应用在 WiFi 连通后由 confirm_running_image 写 VALID。
+    let entry = ota::OtaDataEntry::new(new_seq, version.as_str(), ota::OtaImageState::New);
     let entry_bytes = entry.to_bytes();
     let entry_abs = OTADATA_BASE + ota::otadata_entry_offset(target_slot);
     let otadata_sector = OTADATA_BASE + target_slot as u32 * SECTOR;
@@ -607,8 +610,10 @@ async fn write_all(socket: &mut TcpSocket<'_>, mut data: &[u8]) -> Result<(), ()
     Ok(())
 }
 
-/// 启动确认: 若当前活动条目为 PENDING_VERIFY, 在 WiFi 连通后写 VALID 确认。
+/// 启动确认: 若当前活动条目为 NEW 或 PENDING_VERIFY, 在 WiFi 连通后写 VALID。
 ///
+/// NEW 对应未启用回滚引导器（状态不会被引导器改写）；PENDING_VERIFY 对应
+/// 已启用回滚引导器（首次启动时由 NEW 转换）。两者都必须在运行稳定后确认。
 /// 成功返回确认的 seq; 无待确认条目返回 None。
 pub fn confirm_running_image(flash: &mut FlashStorage<'static>) -> Option<u32> {
     // 两条目各占一扇区 (4KB 间距), 不能按相邻 32B 读
@@ -618,17 +623,17 @@ pub fn confirm_running_image(flash: &mut FlashStorage<'static>) -> Option<u32> {
     flash.read(OTADATA_BASE + SECTOR, &mut b1).ok()?;
     let e0 = ota::OtaDataEntry::from_bytes(&b0);
     let e1 = ota::OtaDataEntry::from_bytes(&b1);
-    let (slot, entry) = if e0.is_pending() {
+    let (slot, entry) = if e0.needs_confirm() {
         (0usize, e0)
-    } else if e1.is_pending() {
+    } else if e1.needs_confirm() {
         (1usize, e1)
     } else {
         return None;
     };
-    // 版本必须匹配当前运行镜像: 回滚后的旧应用不能把坏镜像的 PENDING 确认掉
+    // 版本必须匹配当前运行镜像: 回滚后的旧应用不能把坏镜像的条目确认掉
     if entry.label_str() != env!("CARGO_PKG_VERSION") {
         warn!(
-            "OTA: 忽略不匹配的 PENDING 条目 (label={}, running={})",
+            "OTA: 忽略不匹配的待确认条目 (label={}, running={})",
             entry.label_str(),
             env!("CARGO_PKG_VERSION")
         );

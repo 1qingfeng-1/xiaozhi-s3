@@ -288,8 +288,11 @@ jobs:
         run: |
           ELF=target/xtensa-esp32s3-none-elf/release/xiaozhi-s3
           mkdir -p dist
-          espflash save-image --chip esp32s3 --flash-size 16mb "$ELF" dist/xiaozhi-s3.bin
-          espflash save-image --chip esp32s3 --flash-size 16mb --merge --skip-padding "$ELF" dist/xiaozhi-s3-merged.bin
+          BOOTLOADER=assets/bootloader-esp32s3-rollback.bin
+          espflash save-image --chip esp32s3 --flash-size 16mb \
+            --bootloader "$BOOTLOADER" "$ELF" dist/xiaozhi-s3.bin
+          espflash save-image --chip esp32s3 --flash-size 16mb --merge --skip-padding \
+            --bootloader "$BOOTLOADER" "$ELF" dist/xiaozhi-s3-merged.bin
           SIZE=$(stat -c%s dist/xiaozhi-s3.bin)
           LIMIT=$((0x3F0000))
           echo "app image: ${SIZE} / ${LIMIT} bytes ($((SIZE * 100 / LIMIT))%)"

@@ -148,6 +148,10 @@ git tag -a v1.0.0 -m "v1.0.0"
 git push origin v1.0.0
 ```
 
+> 发布镜像使用启用 OTA 自动回滚的自定义引导器
+> （`assets/bootloader-esp32s3-rollback.bin`）。如修改了分区或引导器配置，
+> 先运行 `./scripts/build_bootloader.sh` 重新生成并提交产物。
+
 `release.yml` 会：
 
 1. `cargo build --release --locked`；

@@ -267,7 +267,7 @@ M1 音频通路 ── M2 WiFi/配网 ── M4.1 WS 协议 ── M4.2 opus 全
 | OTA 回滚保护 (PENDING_VERIFY) | ✅ | 新镜像启动 + WiFi 连通后确认 VALID（日志 `已确认运行镜像 seq=2`）|
 | WiFi 断线重连 | ✅ | AP 关闭 15s：3s 退避重试 → 恢复后自动重连 → 新会话 253ms |
 | 过夜稳定 | ⏭ 跳过 | 按用户决定延后 |
-| 坏镜像实际回滚 | ❌ | 实测崩溃镜像会反复重启：当前 `esp-bootloader-esp-idf` 未启用 `APP_ROLLBACK_ENABLE`，PENDING 不会被引导器回滚；PENDING+启动确认已实现，崩溃镜像需串口恢复 |
+| 坏镜像实际回滚 | ⏳ | 已构建并注入启用 `APP_ROLLBACK_ENABLE` 的自定义引导器（`tools/bootloader` → `assets/bootloader-esp32s3-rollback.bin`）；应用改为写 `NEW`，引导器转 `PENDING_VERIFY`，确认写 `VALID`。待真机用 `ota-selftest-crash` 验证二次启动回旧槽 |
 
 **本轮修复**：OTA URL 缓冲 64→160（原 URL 截断成空导致 `GET /` 404）、
 下载字节计数从 0 起算（原多算 128B 拒绝切槽）、otadata erase 的 `to` 参数、

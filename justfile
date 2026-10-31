@@ -50,8 +50,10 @@ image:
     cargo build --release --locked
     mkdir -p dist
     espflash save-image --chip esp32s3 --flash-size 16mb \
+        --bootloader assets/bootloader-esp32s3-rollback.bin \
         target/xtensa-esp32s3-none-elf/release/xiaozhi-s3 dist/xiaozhi-s3.bin
     espflash save-image --chip esp32s3 --flash-size 16mb --merge --skip-padding \
+        --bootloader assets/bootloader-esp32s3-rollback.bin \
         target/xtensa-esp32s3-none-elf/release/xiaozhi-s3 dist/xiaozhi-s3-merged.bin
 
 # 烧录 + defmt 监视

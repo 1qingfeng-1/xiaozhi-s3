@@ -1,6 +1,8 @@
 [idf_format_args]
 partition_table = "partitions.csv"
 target_app_partition = "ota_0"
+# 启用 APP_ROLLBACK 的二级引导器 (tools/bootloader 构建)
+bootloader = "assets/bootloader-esp32s3-rollback.bin"
 
 [flash]
 size = "16MB"

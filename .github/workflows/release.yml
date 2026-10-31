@@ -60,12 +60,13 @@ jobs:
         run: |
           ELF=target/xtensa-esp32s3-none-elf/release/xiaozhi-s3
           mkdir -p release
+          BOOTLOADER=assets/bootloader-esp32s3-rollback.bin
           # OTA / 手动写 ota_0 用的应用镜像
           espflash save-image --chip esp32s3 --flash-size 16mb \
-            "$ELF" "release/xiaozhi-s3-${TAG}.bin"
+            --bootloader "$BOOTLOADER" "$ELF" "release/xiaozhi-s3-${TAG}.bin"
           # 整片镜像 (bootloader + 分区表 + app), 用于 USB 全量烧录
           espflash save-image --chip esp32s3 --flash-size 16mb --merge --skip-padding \
-            "$ELF" "release/xiaozhi-s3-${TAG}-merged.bin"
+            --bootloader "$BOOTLOADER" "$ELF" "release/xiaozhi-s3-${TAG}-merged.bin"
 
           SIZE=$(stat -c%s "release/xiaozhi-s3-${TAG}.bin")
           LIMIT=$((0x3F0000))

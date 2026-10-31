@@ -37,7 +37,7 @@
 | OTA 下发 WebSocket 配置 | ⬜ | 当前只消费 `mqtt` 对象 |
 | OTA `firmware.force` | ⬜ | 当前按版本比较 |
 | OTA 校时 `server_time` | ⬜ | 待机时钟的前置 |
-| OTA 后确认 / 自动回滚确认 | 🟡 | 启动确认已置 VALID，未实现 PENDING_VERIFY 回滚窗口 |
+| OTA 后确认 / 自动回滚确认 | 🟡 | 新镜像写 `NEW`、启动确认置 `VALID`；自动回滚需替换为启用 `APP_ROLLBACK` 的自定义 bootloader |
 | 资源（assets）OTA | ⬜ | 依赖屏幕 UI 资源分区 |
 | MQTT TLS（8883） | ⬜ | 当前仅明文 1883，受信内网使用 |
 
@@ -69,8 +69,9 @@
 
 ## 显示与交互
 
-> 本机（gezipai 实机）**没有屏幕**，显示类功能整批跳过；状态机/通知行走的是
-> 无屏兜底路径，不影响语音链路。若后续换带屏样机，再按本表补齐。
+> C++ gezipai 参考板明确配置 **240×240 ST7789（SPI3、背光 GPIO4）**，
+> Rust 固件也已初始化并绘制状态/通知；当前仅 3×5 ASCII，中文/表情/状态栏
+> 等待显示批次。早期“本机无屏”的结论与参考配置冲突，已按代码纠正。
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
@@ -88,7 +89,7 @@
 | 低电提醒（<20% 放电，一次） | ✅ | 提示音 + 通知；不自动关机 |
 | 网络错误提示音 | ✅ | 会话异常事件 |
 | 自动关机 / 深睡 | ⛔ | S3 的 BOOT/VOL 键非 RTC-capable，无法按键唤醒 |
-| 空闲低功耗（功放关/LED 灭/WiFi Minimum） | ✅ | 本固件自研；C++ gezipai 板无 PowerSaveTimer |
+| 空闲低功耗（功放关/LED 灭） | ✅ | 本固件自研；WiFi 主路径为 `None`，`ps-adaptive` 才切换；C++ gezipai 板无 PowerSaveTimer |
 
 ## 其他
 

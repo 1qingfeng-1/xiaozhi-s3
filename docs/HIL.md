@@ -1,6 +1,6 @@
 # 真机在环测试 (HIL) 方案
 
-本仓库的 host 测试覆盖 `xiaozhi-core`（206 个用例），但音频时序、DMA、
+本仓库的 host 测试覆盖 `xiaozhi-core`（217 个用例），但音频时序、DMA、
 WiFi 与 OTA 只能在真机验证。本文描述把"烧录后手测"变成可重复 HIL 的方案。
 
 ## 现状

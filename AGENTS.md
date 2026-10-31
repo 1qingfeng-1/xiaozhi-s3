@@ -29,7 +29,8 @@ cd xiaozhi-core && cargo +stable nextest run
 xtensa；从根目录跑 `cargo +stable nextest run -p xiaozhi-core` 会拿父配置编 host 依赖
 （E0463: can't find crate for `core`）。CI 同样 `working-directory: xiaozhi-core` + `cargo nextest run`（不带 `-p`）。
 
-- 仓库共 **5 个 bin**：`xiaozhi-s3`（产品固件）与 `wifi-test` 在 Cargo.toml 声明，
+- 仓库共 **6 个 bin**：`xiaozhi-s3`（产品固件）、`wifi-test`、`hil-agent`
+  （HIL 控制代理）在 Cargo.toml 声明，
   `gpio-test`/`i2c-scan`/`audio-loopback` 靠 `src/bin/` 自动发现；`cargo run` 必须 `--bin` 指定。
 - panic 打印回溯后软复位；符号化：
   `xtensa-esp32s3-elf-addr2line -pfiaC -e target/xtensa-esp32s3-none-elf/release/xiaozhi-s3 <bt 地址...>`
@@ -88,13 +89,18 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量映射/时钟/cod
   | ota_1 | 0x410000 | 0x3F0000 | |
 
 - **无 factory 分区**：otadata 全 0xFF 时二级 bootloader 自愈 → 启 ota_0 并写 seq=1。
-  新 seq = active+1，目标槽 = `(seq-1)%2`；烧写顺序 = 镜像 → otadata 条目（VALID 直写，
-  不走 PENDING_VERIFY）→ `software_reset()`。
+  新 seq = active+1，目标槽 = `(seq-1)%2`；烧写顺序 = 镜像 → otadata 条目
+  （写 `NEW`，由回滚引导器转 `PENDING_VERIFY`，应用确认后写 `VALID`）→ `software_reset()`。
 - **otadata 两条各占一扇区（4KB 间距），不是相邻 32B**——对齐 IDF `bootloader_common_read_otadata`；
   CRC = reflected CRC-32（init 0, xorout 0xFFFFFFFF）对 `ota_seq` 4B LE；
   纯逻辑在 `xiaozhi_core::ota`（`read_otadata`/`next_write`/`otadata_entry_offset`）。
 - **OTA 由 `boot_ota_task` 独立任务执行**（main await done；采集未 start、会话任务未 spawn）：避免 flash 擦写停顿期间
   I2S RX DMA 溢出（`DmaError::Late`）。勿把 flash 写塞进 `app::run` 循环或 `session_task`。
+- **自动回滚 bootloader**：`tools/bootloader/` 用 ESP-IDF 构建启用
+  `APP_ROLLBACK_ENABLE` 的二级引导器 → `assets/bootloader-esp32s3-rollback.bin`，
+  由 `espflash.toml` 注入。应用写 `NEW`，引导器首启转 `PENDING_VERIFY`，
+  确认后写 `VALID`；未确认崩溃则下次启动回退。重新构建：
+  `./scripts/build_bootloader.sh`。
 - Flash 读写走 `esp-storage` `FlashStorage`（ROM 驱动；`features` 含 `defmt` 才能 `{:?}` 打印
   `FlashStorageError`）。同一 `FlashStorage` 实例跨 NVS/OTA 共用（`mk_static!` 单例）。
 
