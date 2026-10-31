@@ -151,6 +151,10 @@ git push origin v1.0.0
 > 发布镜像使用启用 OTA 自动回滚的自定义引导器
 > （`assets/bootloader-esp32s3-rollback.bin`）。如修改了分区或引导器配置，
 > 先运行 `./scripts/build_bootloader.sh` 重新生成并提交产物。
+>
+> ⚠️ **一次性 USB 全量烧录**：OTA 只更新 app 分区，不会替换 bootloader。
+> 从旧版本升级到首个带回滚引导器的版本时，必须用 `merged.bin` 做一次
+> USB 全量烧录；之后的 OTA 才会具备自动回滚能力。
 
 `release.yml` 会：
 

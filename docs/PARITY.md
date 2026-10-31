@@ -37,7 +37,7 @@
 | OTA 下发 WebSocket 配置 | ⬜ | 当前只消费 `mqtt` 对象 |
 | OTA `firmware.force` | ⬜ | 当前按版本比较 |
 | OTA 校时 `server_time` | ⬜ | 待机时钟的前置 |
-| OTA 后确认 / 自动回滚确认 | 🟡 | 新镜像写 `NEW`、启动确认置 `VALID`；自动回滚需替换为启用 `APP_ROLLBACK` 的自定义 bootloader |
+| OTA 后确认 / 自动回滚确认 | 🟡 | 新镜像写 `NEW`、启动确认置 `VALID`；已构建并注入启用 `APP_ROLLBACK` 的自定义 bootloader（`tools/bootloader`），待真机验证二次启动回滚 |
 | 资源（assets）OTA | ⬜ | 依赖屏幕 UI 资源分区 |
 | MQTT TLS（8883） | ⬜ | 当前仅明文 1883，受信内网使用 |
 
