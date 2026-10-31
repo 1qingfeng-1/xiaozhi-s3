@@ -141,13 +141,13 @@ jobs:
           submodules: recursive
 
       - name: Download firmware
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: firmware-release
           path: release/
 
       - name: Download changelog
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: changelog
           path: release/
