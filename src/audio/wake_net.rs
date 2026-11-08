@@ -196,6 +196,11 @@ impl WakeNetSource {
     pub fn chunk_info(&self) -> (usize, usize) {
         (self.ctx.chunk, self.ctx.channels)
     }
+
+    /// 调整软件增益 (%): 原始单麦用 1500, AFE (AGC 归一化) 输出用 100
+    pub fn set_gain_percent(&mut self, gain_percent: i32) {
+        self.gain_percent = gain_percent.max(1);
+    }
 }
 
 /// WakeNet 检测器: 内部缓冲到 block 粒度后逐块送检
@@ -221,6 +226,17 @@ impl WakeWordSource for WakeNetSource {
         let mut consumed = 0usize;
         while self.buf.len() - consumed >= block {
             let frame = &mut self.buf[consumed..consumed + block];
+            // 条件化前的原始统计: 近场削顶排查必须看这一组 (条件化后 mean 恒 0)
+            #[cfg(feature = "debug-diag")]
+            let (raw_mean, raw_peak) = {
+                let (m, _) = xiaozhi_core::audio::capture::level_stats(frame);
+                let peak = frame
+                    .iter()
+                    .map(|&s| (s as i32 - m).abs())
+                    .max()
+                    .unwrap_or(0);
+                (m, peak)
+            };
             // 固定 block 粒度: 去 DC + 峰值限制增益 (纯逻辑在 core, host 可测)。
             // 旧实现 15x 后 clamp + i16 wrapping_sub 去 DC: 大声近场说话时
             // 削顶块会回绕折叠 (真机日志 mean=±8000 / rms≈18000), 模型不命中。
@@ -235,8 +251,15 @@ impl WakeWordSource for WakeNetSource {
             if self.frames_fed == 1 || self.frames_fed.is_multiple_of(50) {
                 let (m, rms) = xiaozhi_core::audio::capture::level_stats(frame);
                 info!(
-                    "wakenet: in mean={} rms={} frame={} gain={}%->{}% last_r={}",
-                    m, rms, self.frames_fed, self.gain_percent, self.last_gain, self.last_r
+                    "wakenet: in raw_mean={} raw_peak={} -> mean={} rms={} gain={}%->{}% last_r={} frame={}",
+                    raw_mean,
+                    raw_peak,
+                    m,
+                    rms,
+                    self.gain_percent,
+                    self.last_gain,
+                    self.last_r,
+                    self.frames_fed
                 );
             }
             unsafe {

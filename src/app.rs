@@ -645,6 +645,14 @@ pub async fn run(
             ..Default::default()
         }),
     );
+    // 输入契约: 无 AFE 时喂原始单麦 (数字电平 1~5% 满幅), 需要 1500% 增益;
+    // AFE 生效时 `pcm` 是 NS+AGC 归一化输出, 再乘 1500% 会削顶, 必须用 100%。
+    #[cfg(feature = "wakenet")]
+    wake.source_mut().set_gain_percent(if afe_active {
+        100
+    } else {
+        crate::audio::wake_net::DEFAULT_GAIN_PERCENT
+    });
     let mut encoder: Option<OpusEncoder> = None;
     let mut decoder: Option<OpusDecoder> = None;
     // 编解码器创建失败退避: 避免每 1ms 重试 + error! 日志风暴
@@ -1540,8 +1548,8 @@ pub async fn run(
             }
         }
         if triggered {
-            // 关键词在空闲提示音期间命中: 立即停掉提示音并把音量恢复到用户值,
-            // 否则提示音尾音会和接下来的唤醒应答/建连提示音叠在一起。
+            // 关键词在空闲提示音期间命中: 停掉后续提示音数据并把音量恢复到
+            // 用户值。TX 环形里已入队的 ≤128ms 尾音无法撤回, 属可接受残留。
             if prompt.is_active() {
                 prompt.stop();
                 prompt_vol_restore_at = now_ms + 300;
@@ -1716,18 +1724,24 @@ pub async fn run(
 
         // TtsStop 延迟派发: 队列空 + DMA 播完后才回到 Listening (防回声)
         if playback.poll_stop(now_ms) {
-            wake.policy_mut().note_playback_end(now_ms);
-            // 软件队列已空, 但 TX DMA 环里可能还有 ~128ms 尾音:
-            // 留 500ms 本地静默期, 避免一进入 Listening 就录到自己的尾音。
-            listen_grace_until_ms = now_ms + 800;
-            // 尾音同样禁止上行: 否则服务端 ASR 会把扬声器尾音/混响识别成
-            // 用户说话, 回一句「我听到啦」形成自问自答 (真机日志可见)。
-            mic_mute_until_ms = mic_mute_until_ms.max(now_ms + 600);
-            // 播报期间积压的上行帧里全是扬声器回声, 不能等会话任务慢慢发完:
-            // 全部丢弃, 否则 tts stop 之后服务器还会收到 1~2s 的“用户说话”。
-            while channels.uplink.try_receive().is_ok() {}
-            acc_len = 0;
-            dispatch(&mut sm, &mut pending, DialogEvent::TtsStop);
+            if sm.state() == DialogState::Speaking {
+                wake.policy_mut().note_playback_end(now_ms);
+                // 软件队列已空, 但 TX DMA 环里可能还有 ~128ms 尾音:
+                // 留 500ms 本地静默期, 避免一进入 Listening 就录到自己的尾音。
+                listen_grace_until_ms = now_ms + 800;
+                // 尾音同样禁止上行: 否则服务端 ASR 会把扬声器尾音/混响识别成
+                // 用户说话, 回一句「我听到啦」形成自问自答 (真机日志可见)。
+                mic_mute_until_ms = mic_mute_until_ms.max(now_ms + 600);
+                // 播报期间积压的上行帧里全是扬声器回声, 不能等会话任务慢慢发完:
+                // 全部丢弃, 否则 tts stop 之后服务器还会收到 1~2s 的“用户说话”。
+                while channels.uplink.try_receive().is_ok() {}
+                acc_len = 0;
+                dispatch(&mut sm, &mut pending, DialogEvent::TtsStop);
+            } else {
+                // 打断 (barge-in) 之后迟到的 tts stop: 播放已 reset, 状态已是
+                // Listening。此时用户正在说追问, 不能再设置静音/冷却把开头吞掉。
+                acc_len = 0;
+            }
         }
         // 让出 CPU: 会话任务/网络任务需要被轮询才能推进连接与收发。
         // 活跃态 4ms (原 1ms): 下行解码 3 帧/轮仍 >45x 实时, RX 环 512ms,

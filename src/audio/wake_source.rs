@@ -25,14 +25,29 @@ impl WakeDetector {
         let _ = wn_gain_percent;
         #[cfg(feature = "wakenet")]
         match crate::audio::wake_net::WakeNetSource::new(wn_gain_percent) {
-            Ok(net) => {
+            // 主循环的 Idle/Speaking 只按单通道原始单麦喂检测器; 多通道模型
+            // 的输入契约尚未接线, 明确回退而不是静默拿错数据。
+            Ok(net) if net.channels() == 1 => {
                 defmt::info!("唤醒源: WakeNet 关键词「你好小智」");
                 return Self::Net(net);
             },
+            Ok(net) => warn!(
+                "WakeNet 模型通道数 {} 非 1 (未接线), 回退能量 VAD",
+                net.channels()
+            ),
             Err(e) => warn!("WakeNet 初始化失败, 回退能量 VAD: {}", e),
         }
         defmt::info!("唤醒源: 能量 VAD");
         Self::Vad(VadWakeDetector::new(vad_threshold))
+    }
+
+    /// 调整送 WakeNet 的软件增益 (AFE 生效时必须为 100: AFE 输出已归一化)
+    pub fn set_gain_percent(&mut self, gain_percent: i32) {
+        match self {
+            Self::Vad(_) => {},
+            #[cfg(feature = "wakenet")]
+            Self::Net(net) => net.set_gain_percent(gain_percent),
+        }
     }
 
     /// 动态阈值仅对能量 VAD 有意义 (WakeNet 阈值由模型/模式决定)
