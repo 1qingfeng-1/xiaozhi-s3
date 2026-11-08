@@ -30,8 +30,10 @@ pub struct UpdateReport {
     pub update_available: bool,
     /// 服务端强制升级标志 (`firmware.force == 1`)
     pub force: bool,
-    /// 服务端时间 `(已按时区偏移换算的 Unix 毫秒, 原始时区分钟)`;
-    /// 清单未下发 → None。换算语义对齐 C++ `ota.cc` (timestamp + offset)。
+    /// 服务端时间 `(UTC Unix 毫秒, 时区偏移分钟)`; 清单未下发 → None。
+    ///
+    /// 时钟只使用 UTC 原值, 时区仅用于本地时间显示; C++ `ota.cc` 的
+    /// `timestamp + timezone_offset` 本地化由消费方按需调用 `epoch_ms()`。
     pub server_time: Option<(u64, i32)>,
     /// 固件下载 url (清单 firmware.url)
     pub url: heapless::String<160>,
@@ -87,7 +89,7 @@ pub async fn boot_ota_task(
     if let Some((timestamp_ms, tz_min)) = report.as_ref().and_then(|r| r.server_time) {
         crate::clock::set_from_server_time(timestamp_ms);
         info!(
-            "服务器时间: {}ms (已含时区 {} 分钟), 时钟已校准",
+            "服务器时间: {}ms UTC (时区 {} 分钟), 时钟已校准",
             timestamp_ms, tz_min
         );
     }
@@ -240,10 +242,9 @@ async fn check_inner(
     // force=1: 即使版本不高于当前也升级 (服务端强制)
     let update_available = manifest.force
         || ota::compare_versions(manifest.version, current) == core::cmp::Ordering::Greater;
-    let mut latest = heapless::String::<32>::new();
-    let _ = latest.push_str(manifest.version);
-    let mut url = heapless::String::<160>::new();
-    let _ = url.push_str(manifest.url);
+    // 反转义 + 定长: PHP 类服务端会把 `/` 输出为 `\/`, 原样使用会解析失败
+    let latest = unescape_field::<32>(manifest.version)?;
+    let url = unescape_field::<160>(manifest.url)?;
     if update_available {
         info!(
             "OTA: 有新版本 {} (当前 {}){}",
@@ -260,9 +261,11 @@ async fn check_inner(
     }
     let mqtt = ota::parse_mqtt_config(body).and_then(to_mqtt_settings);
     let websocket = manifest.websocket.and_then(to_websocket_settings);
+    // 时钟只接受 UTC 原值 (时区偏移单独带回用于显示), 否则 now_unix_ms
+    // 会按本地时间走, 未来接 TLS/日志时东八区会整体偏 +8h。
     let server_time = manifest
         .server_time
-        .map(|st| (st.epoch_ms().max(0) as u64, st.timezone_offset_min));
+        .map(|st| (st.timestamp_ms, st.timezone_offset_min));
     // 可选 SHA-256: 出现但格式非法时拒绝清单 (不能悄悄跳过校验)
     let sha256 = match manifest.sha256 {
         Some(h) => match heapless::String::<64>::try_from(h) {
@@ -286,15 +289,22 @@ async fn check_inner(
     })
 }
 
+/// JSON 字符串字段 → 反转义后的定长字符串 (超长/非法转义 → None)
+fn unescape_field<const N: usize>(src: &str) -> Option<heapless::String<N>> {
+    let mut out = heapless::String::new();
+    ota::unescape_json(src, &mut out)?;
+    Some(out)
+}
+
 /// 清单里的 MQTT 配置 → 定长持久化结构 (字段超长则视为无效)
 fn to_mqtt_settings(m: ota::MqttConfig<'_>) -> Option<crate::wifi::store::MqttSettings> {
     Some(crate::wifi::store::MqttSettings {
-        endpoint: heapless::String::try_from(m.endpoint).ok()?,
-        client_id: heapless::String::try_from(m.client_id).ok()?,
-        username: heapless::String::try_from(m.username).ok()?,
-        password: heapless::String::try_from(m.password).ok()?,
-        publish_topic: heapless::String::try_from(m.publish_topic).ok()?,
-        subscribe_topic: heapless::String::try_from(m.subscribe_topic).ok()?,
+        endpoint: unescape_field::<64>(m.endpoint)?,
+        client_id: unescape_field::<96>(m.client_id)?,
+        username: unescape_field::<96>(m.username)?,
+        password: unescape_field::<96>(m.password)?,
+        publish_topic: unescape_field::<32>(m.publish_topic)?,
+        subscribe_topic: unescape_field::<64>(m.subscribe_topic)?,
     })
 }
 
@@ -305,8 +315,8 @@ fn to_websocket_settings(w: ota::WebsocketConfig<'_>) -> Option<WirelessConfig> 
         return None;
     }
     Some(WirelessConfig {
-        url: heapless::String::try_from(w.url).ok()?,
-        token: heapless::String::try_from(w.token).ok()?,
+        url: unescape_field::<160>(w.url)?,
+        token: unescape_field::<96>(w.token)?,
         version: w.version,
     })
 }
@@ -618,10 +628,15 @@ fn load_fail_record(flash: &mut FlashStorage<'_>) -> Option<(heapless::String<32
     if count == 0 || count == 0xFF {
         return None;
     }
-    let ver = core::str::from_utf8(&buf[4..36]).ok()?;
-    let end = ver.find('\0').unwrap_or(ver.len());
+    // 记录尾部是擦除态 0xFF (save_fail_record 只写 40B), 必须先截断再做
+    // UTF-8 校验; 否则整段 from_utf8 必失败, 跨重启退避永远读不回来。
+    let end = buf[4..36]
+        .iter()
+        .position(|&b| b == 0 || b == 0xFF)
+        .unwrap_or(32);
+    let ver = core::str::from_utf8(&buf[4..4 + end]).ok()?;
     let mut s = heapless::String::<32>::new();
-    s.push_str(&ver[..end]).ok()?;
+    s.push_str(ver).ok()?;
     Some((s, count))
 }
 
@@ -629,7 +644,11 @@ fn save_fail_record(flash: &mut FlashStorage<'_>, version: &str, count: u8) {
     // 只写 40B 记录, 不要 4KB 静态 (主任务栈吃紧)
     let mut buf = [0xFFu8; 40];
     buf[0..4].copy_from_slice(&OTA_FAIL_MAGIC.to_le_bytes());
-    let n = version.len().min(31);
+    let mut n = version.len().min(31);
+    while n > 0 && !version.is_char_boundary(n) {
+        n -= 1;
+    }
+    buf[4..36].fill(0);
     buf[4..4 + n].copy_from_slice(&version.as_bytes()[..n]);
     buf[36] = count;
     // Storage::write 对非扇区对齐会整扇区 RMW, 40B 足够
@@ -687,12 +706,16 @@ pub fn confirm_running_image(flash: &mut FlashStorage<'static>) -> Option<u32> {
     } else {
         return None;
     };
-    // 版本必须匹配当前运行镜像: 回滚后的旧应用不能把坏镜像的条目确认掉
-    if entry.label_str() != env!("CARGO_PKG_VERSION") {
+    // 版本必须匹配当前运行镜像: 回滚后的旧应用不能把坏镜像的条目确认掉。
+    // label 在 otadata 中只有 19 字节, 必须用同一截断规则构造期望值比较,
+    // 否则版本串 ≥20 字符时确认永远失败, 条目停在 PENDING_VERIFY。
+    let running = env!("CARGO_PKG_VERSION");
+    let expected = ota::OtaDataEntry::new(0, running, ota::OtaImageState::Valid);
+    if entry.label_str() != expected.label_str() {
         warn!(
             "OTA: 忽略不匹配的待确认条目 (label={}, running={})",
             entry.label_str(),
-            env!("CARGO_PKG_VERSION")
+            expected.label_str()
         );
         return None;
     }

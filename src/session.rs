@@ -52,8 +52,9 @@ impl WsEndpoint {
 
 /// 解析 OTA 下发的 `websocket.url` (当前仅支持 `ws://<ipv4>[:port][/path]`)
 ///
-/// - 端口缺省 8000, 路径缺省 [`WS_PATH`];
-/// - `token` 若已带 `Bearer ` 前缀则去掉 (握手时统一补), 空 token 用默认值;
+/// - 端口缺省 8000 (端口 0 视为非法), 路径缺省 [`WS_PATH`];
+/// - `token` 若已带 `Bearer ` 前缀则去掉 (握手时统一补); **空 token 表示
+///   服务端未启用鉴权, 握手不带 Authorization 头** (对齐 C++ ota.cc 语义);
 /// - `version` 只接受 1/2/3, 非法返回 None (调用方回退默认端点)。
 ///
 /// 域名/`wss://` 暂不支持: 自建服务端用 IPv4 即可; 需要时再走 DNS/加密。
@@ -75,6 +76,9 @@ pub fn parse_endpoint(url: &str, token: &str, version: u8) -> Option<WsEndpoint>
         Some(_) => return None,
         None => (hostport, WS_PORT),
     };
+    if port == 0 {
+        return None;
+    }
     let host: Ipv4Address = host.parse().ok()?;
     // 路径来自网络, 拒绝控制字符/空白 (防请求行注入)
     if path.bytes().any(|b| b <= 0x20 || b == 0x7F) {
@@ -88,7 +92,12 @@ pub fn parse_endpoint(url: &str, token: &str, version: u8) -> Option<WsEndpoint>
         .or_else(|| token.strip_prefix("bearer "))
         .unwrap_or(token)
         .trim_start();
-    let token = if token.is_empty() { WS_TOKEN } else { token };
+    // 空 token = 服务端未启用鉴权 (握手不带 Authorization), 不能回退默认值
+    // WS_TOKEN, 否则自建无鉴权服务端会收到意外的 Bearer 头。
+    // 同时拒绝控制字符/空白 (防头注入; token 只应含可见 ASCII)。
+    if token.bytes().any(|b| b <= 0x20 || b == 0x7F) {
+        return None;
+    }
 
     Some(WsEndpoint {
         host,
@@ -374,20 +383,28 @@ async fn handshake(
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: {}\r\n\
-             Sec-WebSocket-Version: 13\r\n\
-             Authorization: Bearer {}\r\n\
-             Protocol-Version: {}\r\n\
-             Device-Id: {}\r\n\
-             Client-Id: {}\r\n\
-             \r\n",
+             Sec-WebSocket-Version: 13\r\n",
             endpoint.path.as_str(),
             endpoint.host,
             endpoint.port,
             key_b64.as_str(),
-            endpoint.token.as_str(),
-            endpoint.version,
-            mac,
-            mac
+        ),
+    );
+    // 空 token = 服务端未启用鉴权: 不发送 Authorization 头
+    if !endpoint.token.is_empty() {
+        let _ = core::fmt::write(
+            &mut req,
+            format_args!("Authorization: Bearer {}\r\n", endpoint.token.as_str()),
+        );
+    }
+    let _ = core::fmt::write(
+        &mut req,
+        format_args!(
+            "Protocol-Version: {}\r\n\
+             Device-Id: {}\r\n\
+             Client-Id: {}\r\n\
+             \r\n",
+            endpoint.version, mac, mac
         ),
     );
 

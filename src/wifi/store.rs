@@ -178,14 +178,19 @@ impl MqttSettings {
 const MQTT_SECTOR: u32 = 0xA000;
 const MQTT_MAGIC: u32 = 0x4643_514D; // 'MQCF' 小端
 
-/// 保存 MQTT 配置 (整扇区擦写; 仅在内容变化时调用)
+/// 保存 MQTT 配置 (整扇区擦写; 内容未变不擦写)
 pub fn save_mqtt(flash: &mut FlashStorage<'_>, cfg: &MqttSettings) -> Result<(), &'static str> {
-    let mut buf = [0u8; 512];
+    // 内容未变: 不重复擦写 (OTA 每次开机都会下发同一份配置)
+    if load_mqtt(flash).as_ref() == Some(cfg) {
+        return Ok(());
+    }
+    // 写整扇区: esp-storage 要求写入长度 4B 对齐, 只写 record 长度会在
+    // 字段串长度之和 mod 4 != 0 时返回 NotAligned (与 save_websocket 同因)。
+    let mut buf = [0u8; SECTOR_SIZE as usize];
     let fields = cfg.fields();
-    let n = xiaozhi_core::config_store::encode(MQTT_MAGIC, &fields, &mut buf)
-        .ok_or("MQTT 配置超出容量")?;
-    NorFlash::erase(flash, MQTT_SECTOR, MQTT_SECTOR + 4096).map_err(|_| "Flash 擦除失败")?;
-    NorFlash::write(flash, MQTT_SECTOR, &buf[..n]).map_err(|_| "Flash 写入失败")
+    xiaozhi_core::config_store::encode(MQTT_MAGIC, &fields, &mut buf).ok_or("MQTT 配置超出容量")?;
+    NorFlash::erase(flash, MQTT_SECTOR, MQTT_SECTOR + SECTOR_SIZE).map_err(|_| "Flash 擦除失败")?;
+    NorFlash::write(flash, MQTT_SECTOR, &buf).map_err(|_| "Flash 写入失败")
 }
 
 /// 读取 MQTT 配置 (无记录/损坏 → None)

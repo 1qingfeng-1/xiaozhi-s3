@@ -31,12 +31,17 @@ esp-hal (no_std) 下的 esp-sr 集成, feature `wakenet` 门控。
 | `lib/` | libwakenet / libdl_lib / libhufzip / libc_speech_features (esp32s3 预编译) | espressif/esp-sr v1.9.5 |
 | `include/` | 公开头文件 (esp_wn_iface / model_path / dl_lib*) | 同上 |
 | `model/srmodels.bin` | 「你好小智」(wn9_nihaoxiaozhi) 模型包, hufzip 压缩 ~284KB | `pack_model.py` 打包 |
+| `model/srmodels_tts.bin` | tts 变体 `wn9_nihaoxiaozhi_tts`（真机实测可命中；base 模型不命中），~284KB | 同上，取自 esp-sr v1.9.5 `model/` 目录 |
+| `lib/libesp_audio_processor.a` | AFE 算法层 (NS/AGC/VAD, feature `afe`) | espressif/esp-sr v1.9.5 |
 | `src/model_path_shim.c` | esp-hal 环境垫片 (本项目编写) | — |
 | `../esp-dsp/` | esp-dsp 1.5.2 源码子集 (FFT/点积, ANSI 路径) + compat 桥接 | espressif/esp-dsp |
 | `../cjson/` | cJSON 1.7.18 | DaveGamble/cJSON |
 
 模型以 `include_bytes!` 嵌入固件 flash rodata (`src/audio/wake_net.rs`),
 经 `srmodel_load` 语义原地解析 —— **无需模型分区与 SPIFFS**。
+
+预编译库与模型版权归 Espressif，遵循 [esp-sr](https://github.com/espressif/esp-sr)
+的 Apache-2.0 许可；本项目仅做 esp-hal 环境适配与链接，未修改二进制内容。
 
 ## 架构
 
