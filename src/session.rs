@@ -20,6 +20,85 @@ const WS_TOKEN: &str = match option_env!("XIAOZHI_WS_TOKEN") {
     None => "xiaozhi-test",
 };
 
+/// WebSocket 连接参数 (可由 OTA 下发配置覆盖默认地址)
+///
+/// 默认由 [`WsEndpoint::default_for`] 构造 (配置 `server` + :8000 + 默认路径);
+/// OTA 清单 `websocket.url` 可用 [`parse_endpoint`] 解析后替换。
+#[derive(Clone, PartialEq, Eq)]
+pub struct WsEndpoint {
+    pub host: Ipv4Address,
+    pub port: u16,
+    /// 请求路径 (含前导 `/`)
+    pub path: heapless::String<64>,
+    /// 原始 token (不含 `Bearer `; 握手时统一补前缀)
+    pub token: heapless::String<96>,
+    /// xiaozhi 协议版本 (1/2/3)
+    pub version: u8,
+}
+
+impl WsEndpoint {
+    /// 默认端点: 配置服务器 + 默认端口/路径/token
+    pub fn default_for(host: Ipv4Address, version: u16) -> Self {
+        let version = version.clamp(VERSION_MIN, VERSION_MAX) as u8;
+        Self {
+            host,
+            port: WS_PORT,
+            path: heapless::String::try_from(WS_PATH).unwrap_or_default(),
+            token: heapless::String::try_from(WS_TOKEN).unwrap_or_default(),
+            version,
+        }
+    }
+}
+
+/// 解析 OTA 下发的 `websocket.url` (当前仅支持 `ws://<ipv4>[:port][/path]`)
+///
+/// - 端口缺省 8000, 路径缺省 [`WS_PATH`];
+/// - `token` 若已带 `Bearer ` 前缀则去掉 (握手时统一补), 空 token 用默认值;
+/// - `version` 只接受 1/2/3, 非法返回 None (调用方回退默认端点)。
+///
+/// 域名/`wss://` 暂不支持: 自建服务端用 IPv4 即可; 需要时再走 DNS/加密。
+pub fn parse_endpoint(url: &str, token: &str, version: u8) -> Option<WsEndpoint> {
+    if !(VERSION_MIN..=VERSION_MAX).contains(&u16::from(version)) {
+        return None;
+    }
+    // 只接受 ws://, 不做隐式 scheme 推断
+    let rest = url.trim().strip_prefix("ws://")?;
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, WS_PATH),
+    };
+    if hostport.is_empty() {
+        return None;
+    }
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() => (h, p.parse::<u16>().ok()?),
+        Some(_) => return None,
+        None => (hostport, WS_PORT),
+    };
+    let host: Ipv4Address = host.parse().ok()?;
+    // 路径来自网络, 拒绝控制字符/空白 (防请求行注入)
+    if path.bytes().any(|b| b <= 0x20 || b == 0x7F) {
+        return None;
+    }
+    let path = heapless::String::<64>::try_from(path).ok()?;
+
+    let token = token.trim();
+    let token = token
+        .strip_prefix("Bearer ")
+        .or_else(|| token.strip_prefix("bearer "))
+        .unwrap_or(token)
+        .trim_start();
+    let token = if token.is_empty() { WS_TOKEN } else { token };
+
+    Some(WsEndpoint {
+        host,
+        port,
+        path,
+        token: heapless::String::try_from(token).ok()?,
+        version,
+    })
+}
+
 /// WS 帧载荷上限: opus 最大包 1276B, 但 MCP/tools 文本可达数 KB
 const RECV_BUF: usize = 4096;
 /// 单帧读/写上限: 防止一条慢帧把会话任务卡住 10s (上行通道只有 ~1.4s)
@@ -241,18 +320,17 @@ async fn write_all(
 /// 返回服务器音频参数: 采样率 / 帧长 ms。
 pub async fn connect(
     socket: &mut TcpSocket<'static>,
-    server: Ipv4Address,
+    endpoint: &WsEndpoint,
     mac: &str,
-    version: u16,
 ) -> Result<(u32, u32), &'static str> {
-    let version = version.clamp(VERSION_MIN, VERSION_MAX);
+    let version = u16::from(endpoint.version).clamp(VERSION_MIN, VERSION_MAX);
     socket.abort();
     socket
-        .connect((server, WS_PORT))
+        .connect((endpoint.host, endpoint.port))
         .await
         .map_err(|_| "WS TCP 连接失败")?;
 
-    handshake(socket, mac, server, version).await?;
+    handshake(socket, mac, endpoint).await?;
 
     let mut ws = WsClient { socket };
     let hello = hello_message(version);
@@ -275,8 +353,7 @@ pub async fn connect(
 async fn handshake(
     socket: &mut TcpSocket<'static>,
     mac: &str,
-    server: Ipv4Address,
-    version: u16,
+    endpoint: &WsEndpoint,
 ) -> Result<(), &'static str> {
     // Sec-WebSocket-Key: 16 随机字节的 base64
     let mut key_bytes = [0u8; 16];
@@ -303,12 +380,12 @@ async fn handshake(
              Device-Id: {}\r\n\
              Client-Id: {}\r\n\
              \r\n",
-            WS_PATH,
-            server,
-            WS_PORT,
+            endpoint.path.as_str(),
+            endpoint.host,
+            endpoint.port,
             key_b64.as_str(),
-            WS_TOKEN,
-            version,
+            endpoint.token.as_str(),
+            endpoint.version,
             mac,
             mac
         ),

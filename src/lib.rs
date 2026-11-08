@@ -15,6 +15,7 @@ extern crate alloc;
 pub mod app;
 pub mod audio;
 pub mod bsp;
+pub mod clock;
 pub mod control;
 pub mod macros;
 pub mod mem;

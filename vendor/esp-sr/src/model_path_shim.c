@@ -16,6 +16,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 /* ------------------------------------------------------------------ */
 /* Rust 注入的内嵌模型 (src/audio/wake_net.rs include_bytes!)           */
@@ -41,9 +42,13 @@ typedef struct {
     int *sizes;
 } srmodel_data_t;
 
+/* 布局必须与 include/model_path.h (ESP_PLATFORM 分支) 完全一致:
+ * model_name, model_info, partition, mmap_handle, num, model_data。
+ * 预编译库按 ESP_PLATFORM 编译, 省掉 partition 会让 num/model_data 错位。 */
 typedef struct {
     char **model_name;
     char **model_info;
+    void *partition; /* esp_partition_t*, 本环境不使用 */
     void *mmap_handle;
     int num;
     srmodel_data_t **model_data;
@@ -67,6 +72,7 @@ static char *g_names[1];
 static char *g_infos[1];
 static srmodel_list_t g_models;
 static srmodel_list_t *g_loaded;
+static char g_wake_words[128];
 
 static char *dup_range(const char *src, int len) {
     /* src 为 minified 包内字符串 (定长 32, 带尾 0) */
@@ -113,10 +119,30 @@ srmodel_list_t *esp_srmodel_init(const char *partition_label) {
 
     g_name = dup_range(name, SRMODEL_STRING_LENGTH);
     g_names[0] = g_name;
-    /* model_info 取数据区尾部的 _MODEL_INFO_ 内容 (打包时作为最后一个文件) */
-    g_infos[0] = NULL;
+
+    /* model_info: 从 _MODEL_INFO_ 文件内容复制并去掉结尾换行
+     * (格式: wakenet9_v1h12_<唤醒词>_<窗口>_<阈值90>_<阈值95>) */
+    g_info = NULL;
+    for (int i = 0; i < (int)file_num; i++) {
+        if (strcmp(g_files[i], "_MODEL_INFO_") == 0 && g_sizes[i] > 0) {
+            int len = g_sizes[i];
+            if (len > 127) len = 127;
+            g_info = (char *)malloc((size_t)len + 1);
+            if (g_info != NULL) {
+                memcpy(g_info, g_datas[i], (size_t)len);
+                while (len > 0 && (g_info[len - 1] == '\n' || g_info[len - 1] == '\r')) {
+                    len--;
+                }
+                g_info[len] = 0;
+            }
+            break;
+        }
+    }
+    g_infos[0] = g_info;
+
     g_models.model_name = g_names;
     g_models.model_info = g_infos;
+    g_models.partition = NULL;
     g_models.mmap_handle = NULL;
     g_models.num = 1;
     g_models.model_data = &g_model_data_ptr;
@@ -140,20 +166,52 @@ char *esp_srmodel_filter(srmodel_list_t *models, const char *keyword1, const cha
     return NULL;
 }
 
+/* 官方契约: 返回模型下标, 不存在返回 -1 */
 int esp_srmodel_exists(srmodel_list_t *models, char *model_name) {
-    if (models == NULL) return 0;
+    if (models == NULL) return -1;
     for (int i = 0; i < models->num; i++) {
-        if (strcmp(models->model_name[i], model_name) == 0) return 1;
+        if (strcmp(models->model_name[i], model_name) == 0) return i;
     }
-    return 0;
+    return -1;
 }
 
+/* 与官方 get_wake_words_from_info 一致: 按下划线切分, 第 3、7、11... 段
+ * (i % 4 == 3, i 从 1 起) 为唤醒词, 多词用 ';' 连接 */
 char *esp_srmodel_get_wake_words(srmodel_list_t *models, char *model_name) {
-    /* model_info 格式: wakenet9_v1h12_你好小智_3_0.585_0.595
-     * 官方解析取第 3 段为唤醒词; shim 直接返回打包信息中的固定词 */
-    (void)models;
-    (void)model_name;
-    return "你好小智";
+    const char *info = NULL;
+    if (models != NULL) {
+        for (int i = 0; i < models->num; i++) {
+            if (model_name == NULL || strcmp(models->model_name[i], model_name) == 0) {
+                if (models->model_info != NULL) info = models->model_info[i];
+                break;
+            }
+        }
+    }
+    if (info == NULL) return NULL;
+
+    g_wake_words[0] = 0;
+    size_t out = 0;
+    int idx = 1;
+    const char *p = info;
+    while (*p != 0) {
+        const char *start = p;
+        while (*p != 0 && *p != '_') p++;
+        size_t len = (size_t)(p - start);
+        if (idx % 4 == 3) {
+            if (out != 0 && out + 1 < sizeof(g_wake_words)) {
+                g_wake_words[out++] = ';';
+            }
+            if (out + len >= sizeof(g_wake_words)) {
+                len = sizeof(g_wake_words) - 1 - out;
+            }
+            memcpy(g_wake_words + out, start, len);
+            out += len;
+            g_wake_words[out] = 0;
+        }
+        if (*p == '_') p++;
+        idx++;
+    }
+    return out != 0 ? g_wake_words : NULL;
 }
 
 char *get_model_base_path(void) {
@@ -165,8 +223,9 @@ srmodel_list_t *get_static_srmodels(void) {
 }
 
 srmodel_list_t *srmodel_load(const void *root) {
-    g_root = (const uint8_t *)root;
-    g_root_len = 0; /* 调用方保证越界安全 (rodata) */
+    /* RAM 加载入口: root 已由 shim_srmodel_init 注入时无需重设。
+     * 无长度参数, 不能安全解析新指针, 保持现有 g_root/g_root_len。 */
+    (void)root;
     return esp_srmodel_init(NULL);
 }
 
@@ -359,8 +418,84 @@ void *_sbrk_r(struct _reent *reent, ptrdiff_t inc) {
     return (void *)-1; /* 无 sbrk 堆: newlib 内部分配失败即报错 */
 }
 
-void *heap_caps_malloc(size_t size, unsigned int caps) { (void)caps; return malloc(size); }
-void *heap_caps_calloc(size_t n, size_t size, unsigned int caps) { (void)caps; return calloc(n, size); }
+/* MALLOC_CAP_SPIRAM (1 << 10): 模型权重/解压缓冲必须落 PSRAM。
+ * esp-alloc 的普通 malloc 从内部堆 (128KB) 起分配, 模型必然 OOM;
+ * 这些块全部由 C 侧 free() 释放, shim_psram_malloc 采用与 esp-alloc
+ * 相同的 4 字节头, 因此 free() 可直接回收。 */
+#define MALLOC_CAP_SPIRAM (1u << 10)
+
+extern void *shim_heap_caps_alloc(size_t size, unsigned int caps, bool zero);
+
+void *heap_caps_malloc(size_t size, unsigned int caps) {
+    if (caps & MALLOC_CAP_SPIRAM) {
+        return shim_heap_caps_alloc(size, caps, false);
+    }
+    return malloc(size);
+}
+
+void *heap_caps_calloc(size_t n, size_t size, unsigned int caps) {
+    if (caps & MALLOC_CAP_SPIRAM) {
+        if (size != 0 && n > (size_t)-1 / size) return NULL; /* 溢出 */
+        return shim_heap_caps_alloc(n * size, caps, true);
+    }
+    return calloc(n, size);
+}
+
+/* ------------------------------------------------------------------ */
+/* esp-sr 专用分配器                                                   */
+/*                                                                     */
+/* build.rs 用 objcopy 把 esp-sr 预编译库里的 malloc/calloc/realloc/   */
+/* free 重命名为 esp_sr_*。这样只有 esp-sr 的堆分配优先落 PSRAM,       */
+/* WiFi/opus/newlib 的全局 malloc 行为不受影响。                       */
+/*                                                                     */
+/* 返回块沿用 esp-alloc 的 4 字节头, 因此 C 侧 free() 可直接回收;      */
+/* PSRAM 不可用/分配失败时回退内部堆。                                 */
+/* ------------------------------------------------------------------ */
+
+extern void *shim_psram_malloc(size_t size);
+
+void *esp_sr_malloc(size_t size) {
+    void *p = shim_psram_malloc(size);
+    return p != NULL ? p : malloc(size);
+}
+
+void *esp_sr_calloc(size_t n, size_t size) {
+    if (size != 0 && n > (size_t)-1 / size) return NULL; /* 溢出 */
+    size_t total = n * size;
+    void *p = esp_sr_malloc(total);
+    if (p != NULL) memset(p, 0, total);
+    return p;
+}
+
+void esp_sr_free(void *ptr) {
+    free(ptr);
+}
+
+void *esp_sr_realloc(void *ptr, size_t size) {
+    if (ptr == NULL) return esp_sr_malloc(size);
+    if (size == 0) {
+        esp_sr_free(ptr);
+        return NULL;
+    }
+    size_t old_total = ((size_t *)ptr)[-1]; /* esp-alloc 头部: 总大小 */
+    size_t old_len = old_total >= 4 ? old_total - 4 : 0;
+    void *p = esp_sr_malloc(size);
+    if (p == NULL) return NULL;
+    memcpy(p, ptr, old_len < size ? old_len : size);
+    esp_sr_free(ptr);
+    return p;
+}
+
+/* WebRTC SPL 初始化用 pthread_once (单线程固件: 直接执行一次) */
+int pthread_once(int *once_control, void (*init_routine)(void)) {
+    static int fallback_once;
+    if (once_control == NULL) once_control = &fallback_once;
+    if (*once_control == 0) {
+        if (init_routine != NULL) init_routine();
+        *once_control = 1;
+    }
+    return 0;
+}
 
 /* esp_aes (模型加密路径; 免费模型未加密, 不应被调用) */
 struct esp_aes_context { int dummy; };

@@ -6,10 +6,12 @@
 
 ## 总体路线
 
-> **状态 (2026-10-23)**：M1–M4.2 已上机验证；M5–M10 代码完成，其中
+> **状态 (2026-10-31)**：M1–M4.2 已上机验证；M5–M10 代码完成，其中
 > M8/M10 的真机验收清单尚待逐项勾销。
-> wakenet 特性链接闭环但真机运行时失败（MMU block 1），VAD 声音唤醒为默认路径。
-> AEC barge-in 推迟 v1.1。host 单测 103/103，全 bin 编译/clippy/fmt 全绿；代码已推送 origin。
+> wakenet 的「MMU block 1」失败已复查为 **FFI 结构体错位**并修复，调用链闭环；
+> VAD 仍是默认路径，`--features wakenet` 切换关键词唤醒。
+> AEC barge-in 推迟 v1.1（缺 AFE 预编译库与真实 FreeRTOS 任务桥接）。
+> host 单测 103/103，全 bin 编译/clippy/fmt 全绿；代码已推送 origin。
 > **当前阶段 = M10 真机验证 + v1.0 发布**。
 
 ```text
@@ -65,9 +67,10 @@ M1 音频通路 ── M2 WiFi/配网 ── M4.1 WS 协议 ── M4.2 opus 全
 - 每修一个问题保持「编译 + clippy + 95 单测全绿」；真机复验通过再勾销上表。
 - 11 项全过 + 无人值守过夜 OK → M8 完成。
 
-> **关键词唤醒 (wakenet) 不在 M8 范围**：真机运行时失败（wn9 经函数指针跳
-> MMU block 1，见 AGENTS.md 与 `vendor/esp-sr/README.md`），VAD 为默认路径；
-> wakenet 作为可选增强留待 M9 评估（写 MMU 页表 / 换 esp-sr 2.x+esp-dl）。
+> **关键词唤醒 (wakenet) 不在 M8 范围**：2026-10-31 已把「MMU block 1」误判
+> 修正为 FFI 结构体错位并修复，`--features wakenet` 的 create/detect/clean
+> 调用链已闭环（见 AGENTS.md 与 `vendor/esp-sr/README.md`）；检测准确率与
+> 误唤醒需真机录音标定。VAD 仍为默认路径。
 
 ---
 
@@ -85,15 +88,26 @@ M1 音频通路 ── M2 WiFi/配网 ── M4.1 WS 协议 ── M4.2 opus 全
   newlib(libc/libm/libgcc)。
 - 模型加载：`model_path.c` 是源码可整体替换（绕开 SPIFFS）；hufzip（闭源）
   经 POSIX `fopen/fread` 读模型文件 → 以内存文件表 shim。
-- **深水区**：wakenet 内部以 FreeRTOS 任务跑 MFCC（`mfcc_runner_task`，闭源，
-  任务语义不可见），且模型解压/内存布局等运行时行为在无真机条件下不可验证。
+- **运行时结论（2026-10-31 修正）**：旧记录称「wn9 经函数指针跳 MMU block 1」，
+  实际是 Rust `WnIface` 多了一个头文件不存在的成员，`detect` 读到函数表尾的
+  rodata 常量 `0x1FFE2000`。wn9 的 MFCC 走 `esp_fbank_f32` 直通函数表，
+  **不依赖** `mfcc_runner_task`；模型权重经 `heap_caps_malloc(SPIRAM)` 落 PSRAM。
+  现已按头文件逐位修正并用编译期 `offset_of!` 断言锁死。
+- **2026-11-08 真机补完**：FFI 修正后仍需 **调度器先于 WakeNet 初始化**；
+  使用 `wn9_nihaoxiaozhi_tts` 模型、单麦、增益 1500%、阈值 0.50 时，
+  真机 `detect r=1` → 80ms 建连 → TTS 正常。base 模型实测不命中。
+- **2026-11-08 二次修复（空闲提示后叫不醒）**：近场大声说话经 15x 增益后削顶，
+  旧去 DC 用 `i16::wrapping_sub` 把削顶块负半周回绕折叠（`mean=±8000,
+  rms≈18000`），MFCC 被毁 → `detect` 恒 0。改为 `condition_wakenet_block()`
+  在 i32 域去 DC + 块内峰值限制增益（host 单测 4 例），并取消唤醒检测在
+  空闲提示音期间的静音门控。
 
 **交付分层**：
 
 | 层 | 内容 | 验证 |
 |---|---|---|
 | 声音唤醒（默认，上机即用） | 能量 VAD 持续人声检测 + 唤醒策略（去抖/冷却/抑制），纯逻辑进 core | host 单测全覆盖 |
-| 关键词唤醒（feature `wakenet`） | esp-sr v1.9.5 vendoring + shim + 模型分区 + 烧录脚本 | 链接级验证；运行时留待真机阶段 |
+| 关键词唤醒（feature `wakenet`） | esp-sr v1.9.5 vendoring + shim + 内嵌模型 + 唤醒源选择 | 调用链闭环（FFI 布局编译期锁死）；准确率待真机标定 |
 
 两层共用同一检测器 trait 与唤醒流程，切换只改实现。
 
@@ -103,8 +117,8 @@ M1 音频通路 ── M2 WiFi/配网 ── M4.1 WS 协议 ── M4.2 opus 全
    含 VAD 实现，host 单测。
 2. 固件接入：时钟全程常开（待机也维持监听）；Idle 循环喂检测器；
    触发 → 提示音 + LED → 连接 WS → listen start（对齐 C++ 语义）。
-3. feature `wakenet`：vendor esp-sr v1.9.5 库 + shim 层（链接级），
-   模型分区与烧录脚本，运行时验证留待真机阶段。
+3. feature `wakenet`：vendor esp-sr v1.9.5 库 + shim 层 + 内嵌模型；
+   `WakeDetector` 启动时优先 WakeNet、失败回退 VAD，命中跳过服务端关键词门控。
 
 **验收**（真机）：安静环境说话 1s 内唤醒；夜间无人值守误唤醒可控
 （冷却与阈值参数化）；唤醒 → 可说话 < 1.5s。
@@ -160,10 +174,11 @@ M1 音频通路 ── M2 WiFi/配网 ── M4.1 WS 协议 ── M4.2 opus 全
    （esp-hal 无 `esp_ota` 助手，需手动 erase/write + otadata），砖片风险、串口可
    恢复，列 M10。
 3. **AEC 全双工 barge-in（推迟 v1.1）**：需 ESP-SR AFE（AEC/NS/AGC）+ ES7210 TDM
-   参考通道。评估结论：① 当前 `vendor/esp-sr` 子集只有 wakenet，无 AFE；② wakenet
-   spike 已证 ESP-SR NN 推理路径在 esp-hal 下必撞 MMU block 1（`InstrProhibited @
-   0x1FFE2000`，esp-hal 只映射 block 0），AFE 同款推理路径预期同样失败。故 v1.0
-   保留按钮 barge-in + VAD 唤醒，AEC 归 v1.1（需先解 MMU block 1 再引入 AFE）。
+   参考通道。评估结论：① 当前 `vendor/esp-sr` 子集只有 wakenet，无 AFE；② AFE
+   预编译库内部依赖 FreeRTOS 的 `afe_se_task` + 阻塞环形缓冲，esp-hal/esp-rtos
+   下必须先做真实任务桥接；③ ES7210 目前是双麦非 TDM，没有回采参考通道。
+   旧的「MMU block 1 必撞」结论已证伪，不再是障碍。故 v1.0 保留按钮 barge-in +
+   VAD 唤醒，AEC 归 v1.1。
 
 ## M10 产品化收尾与 v1.0 发布
 
@@ -214,7 +229,7 @@ M1 音频通路 ── M2 WiFi/配网 ── M4.1 WS 协议 ── M4.2 opus 全
 | M2 | WiFi 配网（SoftAP + 表单页）、Flash 凭据存储 | ✅ 上机验证 |
 | M4.1 | WebSocket 协议层（握手/hello/listen/重连） | ✅ 上机验证 |
 | M4.2 | opus 全双工（mic→opus 上行、TTS opus→播放），上机对话验证通过 | ✅ 上机验证 |
-| M5 | 声音唤醒（VAD 默认 / wakenet feature 链接闭环） | 代码完成，待 M8 上机 |
+| M5 | 声音唤醒（VAD 默认 / wakenet feature 调用链闭环） | 代码完成，待 M8 上机 |
 | M6 | 对话状态机 / 主固件 / 灯效 / 打断 | 代码完成，待 M8 上机 |
 | M7 | MCP（未接线）/ OTA 检查 / ST7789 显示 / 电池上报 | 代码完成，MCP/OTA 下载待 M9 |
 | M8 | 真机验证与稳定化（11 项验收） | 进行中 |

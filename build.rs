@@ -8,7 +8,7 @@
 //! 3. espup 默认安装目录 `~/.espressif/tools/xtensa-esp-elf/*/xtensa-esp-elf/bin`
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const OPUS_DIR: &str = "vendor/libopus";
 const XTENSA_GCC: &str = "xtensa-esp32s3-elf-gcc";
@@ -127,16 +127,77 @@ fn build_wakenet(compiler: &str) {
     }
     dsp_build.compile("esp_dsp_subset");
 
-    // 3) 预编译库 (顺序敏感: wakenet 最后; group 允许循环引用)
-    println!("cargo:rustc-link-search=native={sr}/lib");
-    println!("cargo:rustc-link-lib=static=c_speech_features");
-    println!("cargo:rustc-link-lib=static=dl_lib");
-    println!("cargo:rustc-link-lib=static=hufzip");
-    println!("cargo:rustc-link-lib=static=wakenet");
+    // 3) 预编译库: malloc/free 改名为 esp_sr_* 后再链接, 让 esp-sr 的
+    //    所有分配走 PSRAM (内部堆只有 128KB; 不改 WiFi/opus 的全局堆行为)。
+    //    group 允许库间循环引用。
+    let mut esr_libs: Vec<&str> = vec!["c_speech_features", "dl_lib", "hufzip", "wakenet"];
+    // AFE 算法层 (NS/VAD/AGC): afe feature 隐含 wakenet
+    if env::var_os("CARGO_FEATURE_AFE").is_some() {
+        esr_libs.push("esp_audio_processor");
+    }
+    let patched = patch_esp_sr_libs(compiler, &esr_libs);
+    // cc 生成的归档必须与 esp-sr 库同组: 重命名后的 esp_sr_* 由 shim 提供,
+    // cJSON/esp-dsp 又被 esp-sr 反向引用, 分组消除静态库顺序问题。
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let mut group: Vec<PathBuf> = ["esp_sr_shim", "cjson_wrap", "esp_dsp_subset"]
+        .iter()
+        .map(|n| out_dir.join(format!("lib{n}.a")))
+        .collect();
+    group.extend(patched);
+    println!("cargo:rustc-link-arg=-Wl,--start-group");
+    for p in &group {
+        println!("cargo:rustc-link-arg={}", p.display());
+    }
+    println!("cargo:rustc-link-arg=-Wl,--end-group");
     println!("cargo:rerun-if-changed={sr}");
 
     // 数学函数 (libm; libc 的 ssp/stdio 与固件冲突, 缺口全部走 shim)
     println!("cargo:rustc-link-lib=m");
+}
+
+/// 复制 esp-sr 预编译库并用 objcopy 重命名堆符号
+///
+/// 只影响这些归档内部的引用: `malloc/calloc/realloc/free` → `esp_sr_*`。
+/// 由 model_path_shim.c 提供 `esp_sr_*` 实现 (优先 PSRAM, 失败回退内部堆)。
+fn patch_esp_sr_libs(compiler: &str, names: &[&str]) -> Vec<PathBuf> {
+    let sr = "vendor/esp-sr";
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("esp-sr-psram");
+    std::fs::create_dir_all(&out).expect("创建 esp-sr 补丁目录失败");
+    let objcopy = objcopy_for(compiler);
+    let mut paths = Vec::new();
+    for name in names {
+        let src = format!("{sr}/lib/lib{name}.a");
+        let dst = out.join(format!("lib{name}_psram.a"));
+        std::fs::copy(&src, &dst).expect("复制 esp-sr 归档失败");
+        let status = std::process::Command::new(&objcopy)
+            .args([
+                "--redefine-sym",
+                "malloc=esp_sr_malloc",
+                "--redefine-sym",
+                "calloc=esp_sr_calloc",
+                "--redefine-sym",
+                "realloc=esp_sr_realloc",
+                "--redefine-sym",
+                "free=esp_sr_free",
+            ])
+            .arg(&dst)
+            .status()
+            .unwrap_or_else(|e| panic!("调用 {objcopy} 失败: {e}"));
+        assert!(status.success(), "objcopy 重命名失败: {}", dst.display());
+        paths.push(dst);
+    }
+    paths
+}
+
+/// 由 xtensa GCC 路径推导 objcopy (同目录优先, 否则依赖 PATH)
+fn objcopy_for(compiler: &str) -> String {
+    let dir = Path::new(compiler).parent().unwrap_or(Path::new("."));
+    let cand = dir.join("xtensa-esp32s3-elf-objcopy");
+    if cand.exists() {
+        cand.display().to_string()
+    } else {
+        "xtensa-esp32s3-elf-objcopy".to_string()
+    }
 }
 
 /// 按文件头注释的顺序探测 xtensa GCC

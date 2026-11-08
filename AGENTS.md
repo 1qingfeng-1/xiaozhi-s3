@@ -19,7 +19,7 @@ cargo fmt --all -- --check
 cargo clippy --all-features -- -D warnings   # 与 CI/pre-commit 一致
 cargo check --all
 
-# 核心层 217 个 host 单测 — 必须在 xiaozhi-core/ 目录内跑
+# 核心层 234 个 host 单测 — 必须在 xiaozhi-core/ 目录内跑
 cd xiaozhi-core && cargo +stable nextest run
 # 单测过滤: cargo +stable nextest run ota_crc
 # 或 cargo +stable test
@@ -40,7 +40,7 @@ xtensa；从根目录跑 `cargo +stable nextest run -p xiaozhi-core` 会拿父�
 - **不要在仓库根目录跑 `cargo test`**（作用于 xtensa target，必失败）；
 - xiaozhi-core 是独立 workspace 根（空 `[workspace]` + 自带 `.cargo/config.toml` 覆盖回 host target），
   不继承父目录的 esp target/-nostartfiles；
-- 只有 xiaozhi-core 有单测，且只能在 host 上跑（217 个，当前全绿）。
+- 只有 xiaozhi-core 有单测，且只能在 host 上跑（234 个，当前全绿）。
 
 ## 架构与分层
 
@@ -62,7 +62,7 @@ xiaozhi-s3/          固件 crate (no_std, esp-rtos 双任务)
 ├── vendor/          libopus (v1.6.1 裁剪) / esp-sr / esp-dsp 子集 / cjson (均 build.rs 编译或链接)
 xiaozhi-core/        git submodule, 纯逻辑层: audio (音量映射/时钟/codec 序列/唤醒 VAD/播放流程) +
                      dialog (对话状态机) + mcp (JSON-RPC 解析) + ota (清单/版本/e9 头/otadata 条目) +
-                     display + board 规则 + protocol/aes/mqtt/udp 编解码; host 可单测 (217 个), #![deny(unsafe_code)]
+                     display + board 规则 + protocol/aes/mqtt/udp 编解码; host 可单测 (234 个), #![deny(unsafe_code)]
 ```
 
 分层规则（改代码前必读）：
@@ -172,16 +172,34 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量映射/时钟/cod
 
 ## opus / wakenet 集成
 
-- **wakenet（esp-sr v1.9.5，feature 门控）真机已验证失败**（2026-08-30）：链接闭环，
-  但首次 `detect` 即 InstrProhibited（PC=0x1FFE2000）——wn9 推理路径经函数指针跳到
-  **MMU cache block 1**（IDF 专有的 PSRAM 窗口 0x1FC00000/0x5FC00000），esp-hal 只映射
-  block 0，非垫片可修。出路（写 MMU block 1 页表 / 换 esp-sr 2.x+esp-dl / 继续 VAD）
-  见 `vendor/esp-sr/README.md`。**VAD 声音唤醒（`VadWakeDetector` + `WakePolicy`）
-  是默认且已验证的路径**，两层共用 `WakeWordSource` trait，切换约 5 行。
-- **AEC 全双工 barge-in 推迟 v1.1**：需 ESP-SR AFE（AEC/NS/AGC）+ ES7210 TDM 参考
-  通道，但 ① `vendor/esp-sr` 子集只有 wakenet、无 AFE；② 同款 NN 推理路径预期撞
-  同款 MMU block 1（见上 wakenet 条目）。故 v1.0 保留按钮打断 + VAD 唤醒；做 AEC
-  前先解 MMU block 1（写 block 1 页表 / 换 esp-sr 2.x+esp-dl）再引入 AFE。
+- **wakenet（esp-sr v1.9.5，feature 门控）已接入，默认仍走 VAD**：2026-08-30 记录的
+  `InstrProhibited (PC=0x1FFE2000)` 曾被误判为 MMU cache block 1；2026-10-31 复核
+  最终 ELF 确认根因是 **FFI 结构体错位**：Rust `WnIface` 多了头文件里不存在的
+  `reset_det_threshold`（15 项），`detect` 读到函数表尾之后的 rodata 常量
+  `0x1FFE2000`。真实函数表只有 14 项，`detect` 在偏移 0x2c。现已按
+  `esp_wn_iface.h` 逐位修正并用 `offset_of!`/`size_of!` 编译期断言锁死。
+- **2026-11-08 真机补完**：FFI 布局正确后仍不命中，根因是 **WakeNet 在
+  `esp_rtos::start` 之前初始化**；把调度器启动提前后，真机立即出现
+  `detect r=1` → 80ms 建连 → TTS 正常。另需使用 **`wn9_nihaoxiaozhi_tts`**
+  模型（base 模型实测不命中）、单通道、原始单麦、增益 **1500%**、阈值 **0.50**。
+- **2026-11-08 第二次真机补完（提示音后叫不醒）**：根因是**近场大声说话把
+  WakeNet 输入打爆**——15x 增益后大量样本削顶成方波，旧代码去 DC 用
+  `i16::wrapping_sub` 又把削顶块负半周回绕折叠（日志特征 `mean=±8000,
+  rms≈18000`），MFCC 被毁 → `detect` 恒 0。修复：`condition_wakenet_block()`
+  （`xiaozhi-core::audio::capture`）在 i32 域去 DC + 按块 AC 峰值等比限制增益
+  （目标 30000，不产生新谐波），host 单测覆盖削顶方波回归；同时关键词检测
+  不再被空闲提示音 `prompt_until_ms` 门控（提示音尾音未落时说唤醒词也能命中）。
+- 启用：`cargo build --release --features wakenet`。`WakeDetector` 在启动时优先
+  创建 WakeNet（失败自动回退 VAD），命中即视为关键词确认，跳过服务端 ASR 门控；
+  能量 VAD 仍是默认构建路径，两者共用 `WakeWordSource` trait。
+- 模型权重经 `heap_caps_malloc(.., MALLOC_CAP_SPIRAM)` 落 PSRAM（内部堆仅 128KB）；
+  `srmodel_list_t` 布局按 ESP_PLATFORM 分支补上 `partition` 字段。详见
+  `vendor/esp-sr/README.md`。
+- **AEC 全双工 barge-in 仍推迟 v1.1**：MMU block 1 不再构成障碍；真正的门槛是
+  ① `vendor/esp-sr` 子集现在含 `esp_audio_processor`（NS/VAD/AGC 同步算法层，
+  `afe` feature 已在工作区实现）；② AEC 需要 ES7210 TDM 回采参考通道，当前
+  双麦非 TDM；③ AFE 全链路（afe_se_task）仍需 FreeRTOS 任务桥接。故 v1.0
+  保留按钮打断 + VAD 唤醒，`afe` 仅作实验特性。
 - `vendor/libopus` 是 xiph/opus v1.6.1 裁剪副本（fixed-point，无 float/dnn/x86/ARM），
   `build.rs` 用 xtensa GCC 交叉编译（探测：`CC_xtensa_esp32s3_none_elf`/`CC` → PATH →
   espup 默认目录）；更新以官方 `*_sources.mk` 清单为准。BSD-3（`vendor/libopus/COPYING`）。

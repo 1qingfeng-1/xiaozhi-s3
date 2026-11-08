@@ -81,6 +81,14 @@ async fn main(spawner: Spawner) -> ! {
     // 板子工厂: 内部堆第一行注册 → 音频 DMA 缓冲 → PSRAM 最后注册
     let (mut board, extras) = create_board(peripherals);
     info!("板子 [{}] 初始化完成", board.name);
+    // 调度器必须先于 AFE/WakeNet 初始化: esp-sr 模型/算法内部依赖
+    // esp-rtos 的时基/任务基础设施; 真机对比发现"离线可检出、在线永不命中"
+    // 与模型在 scheduler 启动前创建有关。
+    let timg0 = TimerGroup::new(extras.timg0);
+    // MWDT 与 timer0 同组: 先取出看门狗句柄, timer0 交给 embassy 时基
+    let mwdt = timg0.wdt;
+    let sw_interrupt = SoftwareInterruptControl::new(extras.sw_interrupt);
+    esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
     // 音频大缓冲 (PCM 环 512KB + 预录/MQTT 等) 必须落 PSRAM; 没有 PSRAM
     // 时内部堆 128KB 必然 OOM。与其随机崩溃, 不如明确报错重启 (硬件故障)。
     if !xiaozhi_s3::mem::psram_available() {
@@ -88,6 +96,44 @@ async fn main(spawner: Spawner) -> ! {
         embassy_time::Timer::after(embassy_time::Duration::from_secs(10)).await;
         esp_hal::system::software_reset();
     }
+
+    // 唤醒检测器常驻: WakeNet 模型加载 (解压 + PSRAM 分配) 必须在采集
+    // 启动前完成, 否则模型加载期间 RX DMA 环形溢出 → CaptureFault 重入 →
+    // 又加载一次模型 (死循环)。放在开机提示音之前, 也避免 TX 环形补静音空档。
+    info!(
+        "堆基线: internal_free={} external_free={}",
+        xiaozhi_s3::mem::internal_free(),
+        xiaozhi_s3::mem::external_free()
+    );
+    // AFE 与唤醒检测器都在采集启动前创建 (模型/算法状态主要落 PSRAM)
+    #[cfg(feature = "afe")]
+    let mut afe = match xiaozhi_s3::audio::frontend::FrontEnd::new() {
+        Ok(a) => {
+            info!("AFE 已启用: NS/AGC/VAD (无回采参考, AEC 关闭)");
+            Some(a)
+        },
+        Err(e) => {
+            defmt::warn!("AFE 初始化失败, 使用原始音频: {}", e);
+            None
+        },
+    };
+    #[cfg(not(feature = "afe"))]
+    let mut afe: Option<xiaozhi_s3::audio::frontend::FrontEnd> = None;
+
+    // WakeNet 消费原始 2 麦交织输入 (不经过 AFE AGC), 直连麦克风数字电平
+    // 仅 1~5% 满幅, 必须用默认 600% 增益; AFE 只影响上行/预录。
+    #[cfg(feature = "wakenet")]
+    let wn_gain = xiaozhi_s3::audio::wake_net::DEFAULT_GAIN_PERCENT;
+    #[cfg(not(feature = "wakenet"))]
+    let wn_gain = 600;
+
+    let mut wake =
+        xiaozhi_s3::audio::wake_source::WakeDetector::new(xiaozhi_s3::app::VAD_THRESHOLD, wn_gain);
+    info!(
+        "唤醒源创建后: internal_free={} external_free={}",
+        xiaozhi_s3::mem::internal_free(),
+        xiaozhi_s3::mem::external_free()
+    );
 
     // 电池电量: ADC 只在 WiFi 启动前读一次 (S3 的 WiFi PHY 与 SARADC 共用,
     // WiFi 激活期间读 ADC1 会干扰 PHY, 曾触发 WiFi blob 崩溃, 见 app.rs)
@@ -105,12 +151,6 @@ async fn main(spawner: Spawner) -> ! {
         core::sync::atomic::Ordering::Relaxed,
     );
 
-    let timg0 = TimerGroup::new(extras.timg0);
-    // MWDT 与 timer0 同组: 先取出看门狗句柄, timer0 交给 embassy 时基
-    let mwdt = timg0.wdt;
-    let sw_interrupt = SoftwareInterruptControl::new(extras.sw_interrupt);
-    esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
-
     let flash = xiaozhi_s3::mk_static!(FlashStorage<'static>, FlashStorage::new(extras.flash));
 
     // 音量恢复 (NVS 0xD000; 无记录 → 默认 60): 原子量 + ES8311 硬件同步
@@ -124,7 +164,10 @@ async fn main(spawner: Spawner) -> ! {
     // xiaozhi WS 协议版本 (NVS 0xB000, 默认 1): ≥2 时上行帧带时间戳
     // (最终传输方式由 OTA 是否下发 MQTT 配置决定, 见下方会话任务选择)
     let ws_version = store::load_ws_version(flash);
-    info!("WS 协议版本: v{}", ws_version);
+    info!(
+        "默认 WS 协议版本: v{} (OTA websocket 配置可覆盖)",
+        ws_version
+    );
 
     // BOOT 键**持续按住 3s**: 清除凭据强制重回配网
     // (下载模式 BOOT+RST 也会在复位时按住 BOOT, 不能一按下就清)
@@ -219,15 +262,17 @@ async fn main(spawner: Spawner) -> ! {
     // 大块 CPU 缓冲放 PSRAM: 内部堆只有 128KB, 不能把 40KB 常驻缓冲留在内部
     let pop_buf: &'static mut [u8] = psram_bytes(POP_BUF_SIZE);
     let mono_buf: &'static mut [i16] = psram_i16(POP_BUF_SIZE / 4);
+    // AFE 输出缓冲 (NS/AGC 处理后的音频): 最多比输入多一个 10ms carry 帧
+    let afe_buf: &'static mut [i16] = psram_i16(POP_BUF_SIZE / 4 + 160);
+    // 2 麦 L/R 交织缓冲: POP_BUF_SIZE 字节 = POP_BUF_SIZE/4 帧 → 2×i16
+    let wake_buf: &'static mut [i16] = psram_i16(2 * (POP_BUF_SIZE / 4));
     let acc_buf: &'static mut [i16] = psram_i16(1920);
     let silence_buf: &'static mut [u8] = psram_bytes(BLOCK_BYTES);
 
-    // wakenet 自检 (feature `wakenet`): 强制链接 esp-sr 符号闭包
-    #[cfg(feature = "wakenet")]
-    match xiaozhi_s3::audio::wake_net::wakenet_selftest() {
-        Ok(()) => info!("wakenet 自检通过"),
-        Err(e) => error!("wakenet 自检失败: {}", e),
-    }
+    // 注: 不在主固件里跑 wakenet_selftest/afe_selftest —— 它们会在
+    // 常驻模型/AFE 之外再创建一份实例, 共享的 esp-sr 模型状态会被二次
+    // 初始化/销毁破坏, 真机表现为"录音离线可检出、在线永不命中"。
+    // 自检请用独立 bin (`wakenet-probe` / `wakenet-live-probe`)。
 
     // 开机预热: 先让 I2S/DAC 输出 300ms 静音, 稳定 Codec/功放后再出声
     // (reset/刷机后的第一轮播报杂音即上电瞬态)
@@ -258,10 +303,41 @@ async fn main(spawner: Spawner) -> ! {
         },
         None => None,
     };
-    // UDP 通道恒带时间戳, 服务端 AEC 可用 → 播报中持续上行。
-    // 仅 v2 帧带 timestamp; v3 头没有。
+    // WS 端点: OTA 下发的 websocket 配置优先 (mqtt 未下发时才实际走 WS);
+    // URL 解析失败/版本非法 → 回退默认服务器:8000 + 构建期 token。
+    let ws_endpoint = match store::load_websocket(flash) {
+        Some(cfg) => match xiaozhi_s3::session::parse_endpoint(
+            cfg.url.as_str(),
+            cfg.token.as_str(),
+            cfg.version,
+        ) {
+            Some(ep) => {
+                info!(
+                    "WS 配置: {:?}:{}{} (v{})",
+                    defmt::Debug2Format(&ep.host),
+                    ep.port,
+                    ep.path.as_str(),
+                    ep.version
+                );
+                ep
+            },
+            None => {
+                defmt::warn!(
+                    "WS 配置 URL 无法解析 ({}), 回退默认服务器",
+                    cfg.url.as_str()
+                );
+                xiaozhi_s3::session::WsEndpoint::default_for(server, ws_version)
+            },
+        },
+        None => xiaozhi_s3::session::WsEndpoint::default_for(server, ws_version),
+    };
+    let ws_version = u16::from(ws_endpoint.version);
+
+    // 服务端 AEC 需要上行时间戳与参考对齐。WS v2 帧带 timestamp, 可用;
+    // MQTT+UDP 当前链路时间戳恒 0 (网关日志可证), AEC 无法对齐 → 播报中
+    // 上行会被自己的 TTS 触发, 形成自问自答循环。MQTT 暂走半双工。
     let aec_off = cfg!(feature = "aec-off");
-    let server_aec = !aec_off && (ws_version == 2 || mqtt_cfg.is_some());
+    let server_aec = !aec_off && ws_version == 2 && mqtt_cfg.is_none();
     if aec_off {
         info!("诊断 aec-off: 播报中不上行");
     }
@@ -287,10 +363,9 @@ async fn main(spawner: Spawner) -> ! {
         // 会话任务 (WS 连接/收发; 长阻塞 await 集中于此)
         let token = app::session_task(app::SessionArgs {
             stack,
-            server,
+            endpoint: ws_endpoint,
             mac: mac.clone(),
             channels,
-            ws_version,
         })
         .unwrap();
         spawner.spawn(token);
@@ -331,6 +406,10 @@ async fn main(spawner: Spawner) -> ! {
                 flash,
                 playback: &mut playback,
                 preroll: &mut preroll[..],
+                wake: &mut wake,
+                afe: &mut afe,
+                afe_buf: &mut afe_buf[..],
+                wake_buf: &mut wake_buf[..],
                 server_aec,
             },
             &mut pop_buf[..],

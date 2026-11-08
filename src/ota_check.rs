@@ -18,19 +18,29 @@ use esp_storage::FlashStorage;
 use xiaozhi_core::http;
 use xiaozhi_core::ota;
 
+/// OTA 下发的 WebSocket 配置 (固定容量, 不借用清单生命周期)
+pub use crate::wifi::store::WebsocketSettings as WirelessConfig;
+
 /// 检查结果
 #[derive(Clone, PartialEq, Eq)]
 pub struct UpdateReport {
     /// 服务器最新版本
     pub latest_version: heapless::String<32>,
-    /// 是否比当前固件新
+    /// 是否升级 (高于当前版本, 或服务端 `firmware.force == 1`)
     pub update_available: bool,
+    /// 服务端强制升级标志 (`firmware.force == 1`)
+    pub force: bool,
+    /// 服务端时间 `(已按时区偏移换算的 Unix 毫秒, 原始时区分钟)`;
+    /// 清单未下发 → None。换算语义对齐 C++ `ota.cc` (timestamp + offset)。
+    pub server_time: Option<(u64, i32)>,
     /// 固件下载 url (清单 firmware.url)
     pub url: heapless::String<160>,
     /// 可选镜像 SHA-256 (清单 firmware.sha256 / hash; 服务端不支持时为 None)
     pub sha256: Option<heapless::String<64>>,
     /// MQTT 网关配置 (服务器启用 `mqtt_gateway` 时下发)
     pub mqtt: Option<crate::wifi::store::MqttSettings>,
+    /// WebSocket 连接配置 (清单 `websocket` 对象; 缺失/非法 → None)
+    pub websocket: Option<WirelessConfig>,
 }
 
 /// 板型标识 (服务器按 `board.type` 匹配 `data/bin/<type>_<version>.bin`;
@@ -73,6 +83,14 @@ pub async fn boot_ota_task(
     done: embassy_sync::channel::Sender<'static, RawMutex, &'static mut FlashStorage<'static>, 1>,
 ) {
     let report = check(stack, server, &mac).await;
+    // 服务端时间: 校准本次上电的单调时钟 (无 RTC, 重启后需重新同步)
+    if let Some((timestamp_ms, tz_min)) = report.as_ref().and_then(|r| r.server_time) {
+        crate::clock::set_from_server_time(timestamp_ms);
+        info!(
+            "服务器时间: {}ms (已含时区 {} 分钟), 时钟已校准",
+            timestamp_ms, tz_min
+        );
+    }
     // MQTT 网关配置: 服务器下发 → 持久化 (内容未变不重复擦写)
     if let Some(mqtt) = report.as_ref().and_then(|r| r.mqtt.as_ref())
         && crate::wifi::store::load_mqtt(flash).as_ref() != Some(mqtt)
@@ -80,6 +98,15 @@ pub async fn boot_ota_task(
         match crate::wifi::store::save_mqtt(flash, mqtt) {
             Ok(()) => info!("MQTT 配置已更新: {}", mqtt.endpoint.as_str()),
             Err(e) => error!("MQTT 配置保存失败: {}", e),
+        }
+    }
+    // WebSocket 配置 (mqtt 未下发时生效): 内容变化才写 flash
+    if let Some(ws) = report.as_ref().and_then(|r| r.websocket.as_ref())
+        && crate::wifi::store::load_websocket(flash).as_ref() != Some(ws)
+    {
+        match crate::wifi::store::save_websocket(flash, ws) {
+            Ok(()) => info!("WebSocket 配置已更新: {}", ws.url.as_str()),
+            Err(e) => error!("WebSocket 配置保存失败: {}", e),
         }
     }
     match report {
@@ -210,18 +237,32 @@ async fn check_inner(
         return None;
     };
     let current = env!("CARGO_PKG_VERSION");
-    let update_available =
-        ota::compare_versions(manifest.version, current) == core::cmp::Ordering::Greater;
+    // force=1: 即使版本不高于当前也升级 (服务端强制)
+    let update_available = manifest.force
+        || ota::compare_versions(manifest.version, current) == core::cmp::Ordering::Greater;
     let mut latest = heapless::String::<32>::new();
     let _ = latest.push_str(manifest.version);
     let mut url = heapless::String::<160>::new();
     let _ = url.push_str(manifest.url);
     if update_available {
-        info!("OTA: 有新版本 {} (当前 {})", latest.as_str(), current);
+        info!(
+            "OTA: 有新版本 {} (当前 {}){}",
+            latest.as_str(),
+            current,
+            if manifest.force {
+                ", 服务端强制"
+            } else {
+                ""
+            }
+        );
     } else {
         info!("OTA: 已是最新 ({})", current);
     }
     let mqtt = ota::parse_mqtt_config(body).and_then(to_mqtt_settings);
+    let websocket = manifest.websocket.and_then(to_websocket_settings);
+    let server_time = manifest
+        .server_time
+        .map(|st| (st.epoch_ms().max(0) as u64, st.timezone_offset_min));
     // 可选 SHA-256: 出现但格式非法时拒绝清单 (不能悄悄跳过校验)
     let sha256 = match manifest.sha256 {
         Some(h) => match heapless::String::<64>::try_from(h) {
@@ -236,9 +277,12 @@ async fn check_inner(
     Some(UpdateReport {
         latest_version: latest,
         update_available,
+        force: manifest.force,
+        server_time,
         url,
         sha256,
         mqtt,
+        websocket,
     })
 }
 
@@ -251,6 +295,19 @@ fn to_mqtt_settings(m: ota::MqttConfig<'_>) -> Option<crate::wifi::store::MqttSe
         password: heapless::String::try_from(m.password).ok()?,
         publish_topic: heapless::String::try_from(m.publish_topic).ok()?,
         subscribe_topic: heapless::String::try_from(m.subscribe_topic).ok()?,
+    })
+}
+
+/// 清单里的 WebSocket 配置 → 定长持久化结构 (字段超长/版本非法则丢弃)
+fn to_websocket_settings(w: ota::WebsocketConfig<'_>) -> Option<WirelessConfig> {
+    if !(1..=3).contains(&w.version) {
+        warn!("OTA: WebSocket 协议版本非法 ({}), 忽略配置", w.version);
+        return None;
+    }
+    Some(WirelessConfig {
+        url: heapless::String::try_from(w.url).ok()?,
+        token: heapless::String::try_from(w.token).ok()?,
+        version: w.version,
     })
 }
 

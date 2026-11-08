@@ -98,8 +98,11 @@ board-gezipai = []
 ## 新增板子: 先建 src/bsp/<board>.rs, 再加 feature 与 src/bsp/mod.rs 注册
 # board-<name> = []
 
-## 关键词唤醒 (esp-sr WakeNet, "你好小智"): 链接级验证待完成, 见 vendor/esp-sr/README.md
+## 关键词唤醒 (esp-sr WakeNet, "你好小智"): 启动时优先于能量 VAD, 失败自动回退
 wakenet = []
+
+## AFE 信号前端 (esp-sr NS/VAD/AGC 算法层): 依赖 wakenet; 无回采参考, AEC 暂不启用
+afe = ["wakenet"]
 
 ## HIL 控制代理 (src/bin/hil-agent.rs): 第二路 USB Serial/JTAG 控制通道
 ## 与主固件互斥使用, 仅用于真机自动化验证

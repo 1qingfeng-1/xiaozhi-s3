@@ -6,6 +6,16 @@
 
 use core::alloc::Layout;
 
+/// 内部堆剩余字节 (诊断: 量化大块常驻分配的占用)
+pub fn internal_free() -> usize {
+    esp_alloc::HEAP.free_caps(esp_alloc::MemoryCapability::Internal.into())
+}
+
+/// 外部堆 (PSRAM) 剩余字节
+pub fn external_free() -> usize {
+    esp_alloc::HEAP.free_caps(esp_alloc::MemoryCapability::External.into())
+}
+
 /// PSRAM 是否可用 (存在 size > 0 的 External 区域)
 ///
 /// 本固件的音频大缓冲 (PCM 环/预录/网络) 合计 >150KB, 没有 PSRAM 时

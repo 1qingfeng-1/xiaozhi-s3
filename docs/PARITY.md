@@ -5,15 +5,16 @@
 > MIT），以及同板 `main/boards/gezipai`。盘点日期 2026-10-25。
 >
 > 目标不是逐行移植，而是**同一块 gezipai 硬件上用户可感知的功能对齐**。
-> 语音链路受 esp-hal MMU block 1 限制（WakeNet/AFE 推理跑不起来），见
-> `AGENTS.md` 与 `vendor/esp-sr/README.md`，相关项单独标注。
+> WakeNet 的「MMU block 1」限制已证伪并修复（实为 FFI 结构体错位，见
+> `vendor/esp-sr/README.md`）；AFE 仍缺预编译库与真实 FreeRTOS 任务桥接，
+> 相关项单独标注。
 
 ## 状态图例
 
 - ✅ 已对齐（行为等价）
 - 🟡 部分对齐 / 有替代实现
 - ⬜ 未实现
-- ⛔ 当前硬件/工具链受限（需先解决 MMU 或没有对应外设）
+- ⛔ 当前硬件/工具链受限（缺预编译库、参考通道或对应外设）
 
 ## 协议与会话
 
@@ -31,7 +32,7 @@
 | `goodbye`（MQTT，按 session_id 过滤） | ✅ | 建连期/过期通知忽略 |
 | `custom` | 🟡 | 仅记录日志（C++ 默认也不显示） |
 | 设备主动 `goodbye`（MQTT 关会话） | ✅ | 复用 `GOODBYE` 常量 |
-| `listen detect`（唤醒词音频上传） | ⛔ | 依赖 WakeNet；当前 VAD 唤醒 + 本地「我在」 |
+| `listen detect`（唤醒词音频上传） | 🟡 | `--features wakenet` 可本地识别「你好小智」；预录补发已覆盖唤醒词音频，但未按协议单独上传 detect |
 | realtime 聆听（播报中持续上行 + 服务端 AEC） | ✅ | `server_aec` 为真时 Speaking 持续上行，服务端 VAD 收尾 |
 | 激活码 / 激活挑战（HMAC） | ⬜ | 接官方 xiaozhi.me 时需要 |
 | OTA 下发 WebSocket 配置 | ⬜ | 当前只消费 `mqtt` 对象 |
@@ -59,9 +60,9 @@
 |---|---|---|
 | Opus 16k/60ms 全双工、下行重采样 | ✅ | 与 C++ 相同参数 |
 | 丢包隐藏（PLC） | ✅ | 本固件增强 |
-| 能量 VAD 唤醒 / 本地断句 | 🟡 | C++ 用 WakeNet + 服务端 VAD；本机 VAD 为替代方案 |
-| AFE（AEC/NS/AGC） | ⛔ | esp-sr 推理撞 MMU block 1 |
-| WakeNet 关键词唤醒 | ⛔ | 同上；任意人声即唤醒是当前限制 |
+| 能量 VAD 唤醒 / 本地断句 | 🟡 | 默认构建用 VAD；`--features wakenet` 切本地关键词 |
+| AFE（AEC/NS/AGC） | 🟡 | `--features afe` 已实现 NS/AGC/VAD 同步算法层；AEC 仍缺 TDM 回采参考，实验特性 |
+| WakeNet 关键词唤醒 | ✅ | `--features wakenet`：调度器先启动 + tts 模型 + 1500% 增益/0.50 阈值；真机 `detect r=1`、80ms 建连、TTS 正常。2026-11-08 修复近场大声削顶 + i16 去 DC 回绕导致的“提示音后叫不醒”（峰值限制增益进 core，host 单测覆盖）；提示音播放期间也持续检测 |
 | 提示音（空闲/唤醒/低电/错误/alert/成功） | ✅ | 2026-10-25 增加 4 段（`tools/convert_prompts.sh` 转码） |
 | 配置模式音效（wificonfig）/ 升级音（upgrade） | ⬜ | 配网阶段音频未初始化 |
 | 音频自测（配网下按键录放） | ⬜ | 调试 bin 有回环，未接产品流程 |
@@ -150,8 +151,8 @@
 
 ## 下一批建议
 
-1. **语音链路**：先真机验证 realtime 模式的服务端 AEC 打断质量，再评估 WakeNet
-   MMU block 1 修复（高风险）。
+1. **语音链路**：真机标定 WakeNet 阈值/误唤醒，并验证 realtime 模式的服务端
+   AEC 打断质量；AFE 需先补预编译库与 FreeRTOS 任务桥接（高风险）。
 2. **服务端兼容**：激活/挑战、资源 OTA、MQTT TLS、校时（接官方服务器时优先）。
 3. **网关 pacing**：已在本机网关实现（1.4x 实时、tts stop 排在音频后），
    待真机复测固化；带屏样机的 UI 批次暂缓（本机无屏）。

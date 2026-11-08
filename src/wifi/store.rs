@@ -210,14 +210,87 @@ pub fn clear_mqtt(flash: &mut FlashStorage<'_>) -> Result<(), &'static str> {
     NorFlash::erase(flash, MQTT_SECTOR, MQTT_SECTOR + 4096).map_err(|_| "Flash 擦除失败")
 }
 
-/// 启动自检: 写已知模式到备用扇区并读回, 验证存储层工作正常
+/// WebSocket 连接参数 (OTA 下发; 存在时优先于默认 WS 地址)
+#[derive(Clone, PartialEq, Eq)]
+pub struct WebsocketSettings {
+    /// `ws://<ipv4>[:port][/path]`
+    pub url: heapless::String<160>,
+    /// 原始 token (不含 `Bearer ` 前缀, 握手时统一补)
+    pub token: heapless::String<96>,
+    /// xiaozhi 协议版本 (1/2/3)
+    pub version: u8,
+}
+
+impl WebsocketSettings {
+    fn fields<'a>(&'a self, version: &'a mut heapless::String<3>) -> [&'a str; 3] {
+        use core::fmt::Write as _;
+        version.clear();
+        let _ = write!(version, "{}", self.version);
+        [self.url.as_str(), self.token.as_str(), version.as_str()]
+    }
+}
+
+/// WebSocket 配置扇区 (0x9000, NVS 分区首扇区, 与 MQTT 0xA000 分离)
+const WS_CONFIG_SECTOR: u32 = 0x9000;
+const WS_CONFIG_MAGIC: u32 = 0x4643_5357; // 'WSCF' 小端
+
+/// 保存 WebSocket 配置 (整扇区擦写; 内容未变不擦写)
+pub fn save_websocket(
+    flash: &mut FlashStorage<'_>,
+    cfg: &WebsocketSettings,
+) -> Result<(), &'static str> {
+    if !(1..=3).contains(&cfg.version) {
+        return Err("WS 协议版本超出范围");
+    }
+    // 内容未变: 不重复擦写 (OTA 每次开机都会下发同一份配置)
+    if load_websocket(flash).as_ref() == Some(cfg) {
+        return Ok(());
+    }
+    // 写整扇区: 部分 flash 驱动要求写入长度 4B 对齐, 只写 record 长度
+    // 会返回 "Flash 写入失败" (真机 OTA 下发 WS 配置时已复现)。
+    let mut buf = [0u8; SECTOR_SIZE as usize];
+    let mut version = heapless::String::<3>::new();
+    let fields = cfg.fields(&mut version);
+    xiaozhi_core::config_store::encode(WS_CONFIG_MAGIC, &fields, &mut buf)
+        .ok_or("WebSocket 配置超出容量")?;
+    NorFlash::erase(flash, WS_CONFIG_SECTOR, WS_CONFIG_SECTOR + SECTOR_SIZE)
+        .map_err(|_| "Flash 擦除失败")?;
+    NorFlash::write(flash, WS_CONFIG_SECTOR, &buf).map_err(|_| "Flash 写入失败")
+}
+
+/// 读取 WebSocket 配置 (无记录/损坏/版本非法 → None)
+pub fn load_websocket(flash: &mut FlashStorage<'_>) -> Option<WebsocketSettings> {
+    let mut buf = [0u8; 512];
+    flash.read(WS_CONFIG_SECTOR, &mut buf).ok()?;
+    let mut fields: [&str; 3] = ["", "", ""];
+    xiaozhi_core::config_store::decode(WS_CONFIG_MAGIC, &buf, &mut fields, false)?;
+    let version: u8 = fields[2].parse().ok()?;
+    if !(1..=3).contains(&version) {
+        return None;
+    }
+    Some(WebsocketSettings {
+        url: heapless::String::try_from(fields[0]).ok()?,
+        token: heapless::String::try_from(fields[1]).ok()?,
+        version,
+    })
+}
+
+/// 启动自检: 写已知模式到 0x9000 并读回, 验证存储层工作正常
+///
+/// 0x9000 现在存放 WebSocket 配置: 自检前后读回/恢复原内容,
+/// 避免调试 bin 把 OTA 下发的配置擦掉。
 pub fn self_test(flash: &mut FlashStorage<'_>) -> bool {
-    const TEST_SECTOR: u32 = 0x9000; // NVS 分区首扇区 (未使用)
+    const TEST_SECTOR: u32 = WS_CONFIG_SECTOR;
+    let mut saved = alloc::vec![0xFFu8; SECTOR_SIZE as usize];
+    if flash.read(TEST_SECTOR, &mut saved).is_err() {
+        defmt::error!("存储自检: 读取原内容失败");
+        return false;
+    }
     let mut w = [0u8; 256];
     for (i, b) in w.iter_mut().enumerate() {
         *b = (i % 251) as u8;
     }
-    if NorFlash::erase(flash, TEST_SECTOR, TEST_SECTOR + 4096).is_err() {
+    if NorFlash::erase(flash, TEST_SECTOR, TEST_SECTOR + SECTOR_SIZE).is_err() {
         defmt::error!("存储自检: 擦除失败");
         return false;
     }
@@ -231,6 +304,13 @@ pub fn self_test(flash: &mut FlashStorage<'_>) -> bool {
         return false;
     }
     let ok = w == r;
+    // 恢复原内容 (即使自检失败也尝试, 失败只能重新 OTA 下发)
+    let restored = NorFlash::erase(flash, TEST_SECTOR, TEST_SECTOR + SECTOR_SIZE).is_ok()
+        && NorFlash::write(flash, TEST_SECTOR, &saved).is_ok();
+    if !restored {
+        defmt::error!("存储自检: 原内容恢复失败");
+        return false;
+    }
     if ok {
         defmt::info!("存储自检: 通过");
     } else {

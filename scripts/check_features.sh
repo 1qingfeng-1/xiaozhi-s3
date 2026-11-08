@@ -16,6 +16,9 @@ COMBOS=(
     "board-gezipai,watchdog-selftest,ota-selftest-crash"
     "board-gezipai,aec-off,pa-off,volume-off"
     "board-gezipai,hil"
+    "board-gezipai,wakenet"
+    "board-gezipai,wakenet,afe"
+    "board-gezipai,wakenet,debug-diag"
 )
 
 for features in "${COMBOS[@]}"; do

@@ -9,20 +9,24 @@
 
 use core::fmt::Write as _;
 
-use embassy_net::{Ipv4Address, Stack};
+use embassy_net::Stack;
 use embassy_sync::channel::Channel;
 
 use esp_hal::{Blocking, dma::DmaTransferRxCircular, i2s::master::I2sRx};
 
 use defmt::{error, info, warn};
 
-use xiaozhi_core::audio::capture::{condition_for_uplink, extract_slot, level_stats};
+use crate::audio::frontend::FrontEnd;
+use crate::audio::wake_source::WakeDetector;
+use xiaozhi_core::audio::capture::{
+    condition_for_uplink, extract_slot, extract_two_slots, level_stats,
+};
 use xiaozhi_core::audio::encode::FrameQueue;
 use xiaozhi_core::audio::listen::{ListenTurn, ListenTurnConfig, voiced_ms as measure_voiced_ms};
 use xiaozhi_core::audio::preroll::PrerollRing;
 use xiaozhi_core::audio::wake::{
-    MAX_ZCR_PERMILLE, VadWakeDetector, WakeEngine, WakeEvent, WakePolicy, WakePolicyConfig,
-    adaptive_threshold, update_noise_floor,
+    MAX_ZCR_PERMILLE, WakeEngine, WakeEvent, WakePolicy, WakePolicyConfig, adaptive_threshold,
+    update_noise_floor,
 };
 use xiaozhi_core::dialog::{
     Action, DialogEvent, DialogSm, DialogState, ListenMode, LoopPhase, stt_has_keyword,
@@ -83,7 +87,12 @@ const LISTEN_SILENCE_MS: u64 = 1_500;
 /// 聆听前 600ms 不统计有声 (codec/DMA 上电瞬态)
 const LISTEN_WARMUP_MS: u64 = 600;
 /// 从未检测到人声时, 12s 后收尾 (给多轮对话留思考时间)
-const LISTEN_NO_VOICE_MS: u64 = 12_000;
+// 无人声收尾: tts-selftest 需要在文本请求后尽快 listen stop, 2s 即可
+const LISTEN_NO_VOICE_MS: u64 = if cfg!(feature = "tts-selftest") {
+    4_000
+} else {
+    12_000
+};
 /// 唤醒预录: 保存最近 2s 原始 PCM，覆盖建连窗口 + 完整唤醒词。
 /// 关键词门控需要把「你好小智」整句发给服务器 ASR；1s 会在建连期间
 /// 把前半句冲掉，导致只识别出「你好」。
@@ -224,11 +233,10 @@ pub struct Channels {
 /// 会话任务依赖 ('static: embassy 任务要求参数永久存活)
 pub struct SessionArgs {
     pub stack: Stack<'static>,
-    pub server: Ipv4Address,
+    /// WS 端点 (默认服务器或 OTA 下发的 websocket 配置)
+    pub endpoint: session::WsEndpoint,
     pub mac: heapless::String<32>,
     pub channels: &'static Channels,
-    /// xiaozhi 协议版本 (1 = 裸 opus, 2/3 = 带帧头)
-    pub ws_version: u16,
 }
 
 /// 会话任务: 连接/握手/收发 (所有长阻塞 await 集中在此, 不影响音频主循环)
@@ -236,11 +244,12 @@ pub struct SessionArgs {
 pub async fn session_task(args: SessionArgs) {
     let SessionArgs {
         stack,
-        server,
+        endpoint,
         mac,
         channels,
-        ws_version,
     } = args;
+    // xiaozhi 协议版本 (1 = 裸 opus, 2/3 = 带帧头): 由端点统一携带
+    let ws_version = u16::from(endpoint.version);
 
     // socket 持有于任务内, 跨重连复用 (每次 connect 泄漏缓冲会耗尽内部堆)
     let rx = alloc::vec![0u8; 4096].leak();
@@ -298,7 +307,7 @@ pub async fn session_task(args: SessionArgs) {
                 let started = esp_hal::time::Instant::now().duration_since_epoch();
                 match embassy_time::with_timeout(
                     embassy_time::Duration::from_secs(8),
-                    session::connect(&mut socket, server, &mac, ws_version),
+                    session::connect(&mut socket, &endpoint, &mac),
                 )
                 .await
                 {
@@ -514,6 +523,15 @@ pub struct AppArgs<'a, 'b> {
     pub playback: &'a mut Playback,
     /// 常驻唤醒预录环: 同上, 避免每次重入泄漏 32KB
     pub preroll: &'a mut [i16],
+    /// 常驻唤醒检测器: 由 main 在采集启动前创建 (WakeNet 模型加载可能
+    /// 超过 RX DMA 环形长度, 放在 run 里会因 CaptureFault 重入反复加载)
+    pub wake: &'a mut WakeDetector,
+    /// 常驻音频前端 (NS/AGC/VAD); None = 关闭 feature 或初始化失败
+    pub afe: &'a mut Option<FrontEnd>,
+    /// AFE 输出缓冲 (mono 输入长度 + 一个 10ms carry 上界)
+    pub afe_buf: &'a mut [i16],
+    /// 2 麦 L/R 交织缓冲 (仅 2ch WakeNet 使用; 容量 = 2 × 帧数)
+    pub wake_buf: &'a mut [i16],
     /// 服务端 AEC 已启用 (协议版本 ≥2): 播报期间持续上行, 由服务端消除回声
     pub server_aec: bool,
 }
@@ -595,9 +613,15 @@ pub async fn run(
         flash,
         playback,
         preroll,
+        wake: wake_detector,
+        afe,
+        afe_buf,
+        wake_buf,
         server_aec,
     } = args;
 
+    // AFE 是否生效 (常量; 决定上行/WakeNet 的软件增益)
+    let afe_active = afe.is_some();
     // 复用常驻管线: 上一次 CaptureFault 可能留下未播完的帧
     playback.reset();
 
@@ -606,13 +630,18 @@ pub async fn run(
     let mut aec_clock = xiaozhi_core::protocol::AecClock::new();
     // 开机预热 1s: codec/DMA 上电瞬态 (含 DC 漂移) 可能越过 VAD 阈值,
     // 曾致开机假唤醒 → 卡死 (见 ROADMAP M8); 与 VAD 去 DC 双保险。
+    // 关键词检测一次只命中一帧; 能量 VAD 需要连续多帧避免环境噪声误触发。
+    // 检测器由 main 在采集启动前创建并常驻; 这里只借用, 重入不重复加载模型。
+    let keyword_wake = wake_detector.is_keyword();
+    // 检测器是否期望真实多通道输入 (WakeNet 2CH): 是则 Idle 用 L/R 交织
+    // 原始采样喂检测器, 否则保持 mono (能量 VAD / 1ch 模型) 路径。
+    let wake_2ch = wake_detector.channels() > 1;
     let mut wake = WakeEngine::new(
-        VadWakeDetector::new(VAD_THRESHOLD),
+        wake_detector,
         WakePolicy::new(WakePolicyConfig {
             warmup_ms: 1_000,
-            // 8 帧 ≈480ms 持续人声: 「嗯哼」等短促出声直接滤掉;
-            // 「你好小智」四音节通常 600ms+。
-            debounce_frames: 8,
+            // 能量 VAD: 8 帧 ≈480ms 持续人声; WakeNet: 单帧命中即触发。
+            debounce_frames: if keyword_wake { 1 } else { 8 },
             ..Default::default()
         }),
     );
@@ -942,7 +971,7 @@ pub async fn run(
                     }
                     condition_for_uplink(
                         &mut pcm_dec[..FRAME_SAMPLES],
-                        GAIN_PERCENT,
+                        if afe_active { 100 } else { GAIN_PERCENT },
                         UPLINK_CEILING,
                     );
                     let mut raw = [0u8; MAX_PACKET_BYTES];
@@ -1286,17 +1315,28 @@ pub async fn run(
                     return RunOutcome::CaptureFault;
                 },
             };
-            let ns = extract_slot(&pop_buf[..(n / 4) * 4], 2, 0, mono_buf);
+            let ns = extract_slot(&pop_buf[..(n / 4) * 4], 2, 1, mono_buf);
+            // AFE (NS/AGC/VAD): 处理后音频用于预录、WakeNet、上行与回合 VAD。
+            // feature 关闭或初始化失败时 `afe` 为 None, 原样使用 mono_buf。
+            let (pcm, pcm_n, afe_voiced_ms) = if let Some(fe) = afe.as_mut() {
+                let out_n = fe.process(&mono_buf[..ns], afe_buf);
+                let vad_ms = fe.voiced_ms() as u64;
+                (&mut afe_buf[..out_n], out_n, vad_ms)
+            } else {
+                (&mut mono_buf[..ns], ns, 0)
+            };
+            // AGC 已归一化电平: 上行不再叠加 600% 软件增益
+            let uplink_gain = if afe_active { 100 } else { GAIN_PERCENT };
             match sm.state() {
                 // 建连期间也要写预录环: 唤醒词后半句/紧接的提问不能丢,
                 // 否则关键词门控只能把「你好」发给服务器 ASR。
                 DialogState::Connecting => {
-                    preroll.push(&mono_buf[..ns]);
+                    preroll.push(pcm);
                 },
                 // VAD 必须在原始电平域 (硬件增益后、无软件增益, 对齐 C++ 参考):
                 // 若在软件增益后跑, 阈值等效原始值被放大, 环境噪声即误触发
                 DialogState::Idle => {
-                    preroll.push(&mono_buf[..ns]);
+                    preroll.push(pcm);
                     // 1Hz 电平诊断 (原始域): 阈值调参/假唤醒排查
                     // peak = 自上次打印以来的最大子块 rms
                     //
@@ -1306,7 +1346,16 @@ pub async fn run(
                     let mut mean = 0i32;
                     let mut rms = 0i32;
                     let mut wake_threshold = adaptive_threshold(noise_ema, VAD_THRESHOLD, 650);
-                    for chunk in mono_buf[..ns].chunks(FRAME_SAMPLES) {
+                    // WakeNet 输入: 直接取原始 I2S 的 L/R 交织样本。
+                    // - 2ch 模型: 原样喂 L,R 交织
+                    // - 1ch 模型: 先做 L+R 平均, 双麦合并提高信噪比
+                    // AFE/上行/预录仍是 mono, 不受影响。
+                    let stereo_n = if wake_2ch {
+                        extract_two_slots(&pop_buf[..(n / 4) * 4], wake_buf)
+                    } else {
+                        0
+                    };
+                    for chunk in pcm.chunks(FRAME_SAMPLES) {
                         let (m, r) = level_stats(chunk);
                         mean = m;
                         rms = r;
@@ -1319,9 +1368,28 @@ pub async fn run(
                             noise_ema = update_noise_floor(noise_ema, r);
                         }
                         wake.source_mut().set_threshold(wake_threshold);
-                        // 提示音播放期 + 尾音窗口: 不喂 VAD, 防扬声器自唤醒
-                        if now_ms >= prompt_until_ms {
+                        // 能量 VAD: 原始 mono; WakeNet 走 L/R 双麦缓冲
+                        if !keyword_wake && now_ms >= prompt_until_ms {
                             triggered |= wake.feed(chunk, now_ms) == WakeEvent::Triggered;
+                        }
+                    }
+                    // WakeNet 输入按 mono 帧长喂, now_ms 不变。
+                    //
+                    // 关键词检测**不**受 `prompt_until_ms` 门控: 用户常在空闲
+                    // 提示「我先休息了，叫我就行」尾音未落时就说「你好小智」,
+                    // 旧逻辑会在提示音播放期 + 400ms 静音窗内整句丢弃, 表现为
+                    // 「播放提示音后无法唤醒」。提示音本身不含唤醒词, 被本地
+                    // 模型误触发的概率极低; 真误触发也只是多建一次会话。
+                    if keyword_wake {
+                        if wake_2ch {
+                            for chunk in wake_buf[..stereo_n].chunks(FRAME_SAMPLES * 2) {
+                                triggered |= wake.feed(chunk, now_ms) == WakeEvent::Triggered;
+                            }
+                        } else {
+                            // 1ch 模型: 直接喂 R 槽单麦 (14:06 真机已命中过)
+                            for chunk in pcm.chunks(FRAME_SAMPLES) {
+                                triggered |= wake.feed(chunk, now_ms) == WakeEvent::Triggered;
+                            }
                         }
                     }
                     if now_ms.saturating_sub(last_level_log_ms) >= 1_000 {
@@ -1338,11 +1406,12 @@ pub async fn run(
                                     .unwrap_or(0xFF)
                             };
                             crate::diag!(
-                                "待机电平: mean={} rms={} peak={} (阈值 {}) ES7210 01={:02X} 08={:02X} 02={:02X}",
+                                "待机电平: mean={} rms={} peak={} (阈值 {}) 内部堆空闲={} ES7210 01={:02X} 08={:02X} 02={:02X}",
                                 mean,
                                 rms,
                                 idle_peak_rms,
                                 wake_threshold,
+                                crate::mem::internal_free(),
                                 rd(0x01),
                                 rd(0x08),
                                 rd(0x02)
@@ -1356,20 +1425,21 @@ pub async fn run(
                 DialogState::Listening => {
                     // 继续写预录环: 关键词门控补发期间用户可能还在说最后
                     // 一两个字 ("智"), 不写就会在 Listening 边界被截断。
-                    preroll.push(&mono_buf[..ns]);
+                    preroll.push(pcm);
                     // 回合结束判定 (auto 模式): 本地能量 VAD 找静音收尾点。
                     // ⚠️ 不做噪声门: 原始人声 rms 仅 200~400, 与噪声 (30~90) 差距小,
                     // 门限稍高就会把说话帧也清零 (真机实测: 服务端只收到 0.6s 零值)。
-                    let frame_ms = ns as u64 * 1000 / SAMPLE_RATE as u64;
+                    let frame_ms = pcm_n as u64 * 1000 / SAMPLE_RATE as u64;
                     let warmup = listen_turn.total_ms() <= LISTEN_WARMUP_MS;
-                    // 按 60ms 子块做 VAD: pop 块可能长达 ~448ms, 整块判定会
-                    // 让短语音 (<400ms) 永远累计不够、噪声块却能一票置 heard。
-                    // 能量 + ZCR 的组合判定在 core (host 可测)。
+                    // AFE 开启时用 esp-sr VAD 的语音时长; 否则用 core 的
+                    // 能量 + ZCR 组合判定 (host 可测)。
                     let voiced_ms = if warmup {
                         0
+                    } else if afe_active {
+                        afe_voiced_ms
                     } else {
                         measure_voiced_ms(
-                            &mono_buf[..ns],
+                            pcm,
                             FRAME_SAMPLES,
                             LISTEN_VAD_THRESHOLD,
                             MAX_ZCR_PERMILLE,
@@ -1390,10 +1460,9 @@ pub async fn run(
                         }
                     }
                     listen_turn.feed(voiced_ms, frame_ms, now_ms < mic_mute_until_ms, in_grace);
-                    let limited =
-                        condition_for_uplink(&mut mono_buf[..ns], GAIN_PERCENT, UPLINK_CEILING);
+                    let limited = condition_for_uplink(pcm, uplink_gain, UPLINK_CEILING);
                     // 1Hz 上行电平诊断 (增益后): 调增益/查削顶
-                    let (lmean, lrms) = level_stats(&mono_buf[..ns]);
+                    let (lmean, lrms) = level_stats(pcm);
                     listen_peak_rms = listen_peak_rms.max(lrms);
                     if now_ms.saturating_sub(last_level_log_ms) >= 1_000 {
                         last_level_log_ms = now_ms;
@@ -1407,11 +1476,13 @@ pub async fn run(
                         );
                         listen_peak_rms = 0;
                     }
-                    if preroll_flush || now_ms < mic_mute_until_ms {
-                        // 等预录补发完成 / 提示音静音窗内: 不编码实时音频
+                    if preroll_flush || now_ms < mic_mute_until_ms || now_ms < listen_grace_until_ms
+                    {
+                        // 等预录补发完成 / 提示音静音窗 / TTS 尾音静默期:
+                        // 不编码实时音频, 防止服务端 ASR 把喇叭尾音当成提问
                     } else if let Some(encoder) = encoder.as_mut() {
                         let sent = encode_uplink(
-                            &mono_buf[..ns],
+                            pcm,
                             acc_buf,
                             &mut acc_len,
                             encoder,
@@ -1425,14 +1496,36 @@ pub async fn run(
                         }
                     }
                 },
+                // 本地关键词打断: WS v1/无服务端 AEC 时，播报中仍跑 WakeNet;
+                // 只有命中「你好小智」才打断，避免普通环境声/自回声误触发。
+                // TTS 开头 1.2s 不检测 (功放上电/首句自回声)，之后才允许。
+                DialogState::Speaking
+                    if keyword_wake
+                        && !server_aec
+                        && now_ms.saturating_sub(state_since_ms) >= 1_200 =>
+                {
+                    let mut barge = false;
+                    for chunk in pcm.chunks(FRAME_SAMPLES) {
+                        barge |= wake.feed(chunk, now_ms) == WakeEvent::Triggered;
+                    }
+                    if barge {
+                        info!("播报中 WakeNet 关键词打断");
+                        DROP_DOWNLINK.store(true, core::sync::atomic::Ordering::Relaxed);
+                        while channels.downlink.try_receive().is_ok() {}
+                        playback.reset();
+                        aec_clock.clear();
+                        barge_in_active = true;
+                        dispatch(&mut sm, &mut pending, DialogEvent::BargeIn);
+                    }
+                },
                 // 服务端 AEC: 播报中继续上行麦克风 (回声由服务器消除),
                 // 服务器 VAD 检出人声即发 tts stop → 打断并转聆听。
                 // 无 AEC 时不能开: 设备会拾取自己的播报形成自问自答。
                 DialogState::Speaking if server_aec => {
                     if let Some(encoder) = encoder.as_mut() {
-                        condition_for_uplink(&mut mono_buf[..ns], GAIN_PERCENT, UPLINK_CEILING);
+                        condition_for_uplink(pcm, uplink_gain, UPLINK_CEILING);
                         let sent = encode_uplink(
-                            &mono_buf[..ns],
+                            pcm,
                             acc_buf,
                             &mut acc_len,
                             encoder,
@@ -1447,23 +1540,35 @@ pub async fn run(
             }
         }
         if triggered {
+            // 关键词在空闲提示音期间命中: 立即停掉提示音并把音量恢复到用户值,
+            // 否则提示音尾音会和接下来的唤醒应答/建连提示音叠在一起。
+            if prompt.is_active() {
+                prompt.stop();
+                prompt_vol_restore_at = now_ms + 300;
+            }
             let t = TURN_ID.load(core::sync::atomic::Ordering::Relaxed);
             crate::diag!("[T{}] wake t={}", t, now_ms);
-            // 注意: 这里先不开功放。非关键词会静默挂断, 提前开 PA 会有
-            // 上电 pop/底噪 (真机听感为"杂音"); 关键词确认后再开。
-            // 关键词门控: 不播「我在」, 先把唤醒前后的音频发给服务器 ASR;
-            // stt 里出现「小智」才继续, 否则静默挂断。这样只有关键词能真正
-            // 唤醒设备, 键盘/嗯哼等环境声不会引出应答。
-            keyword_gate = true;
-            keyword_gate_deadline = now_ms + KEYWORD_GATE_TIMEOUT_MS;
-            DROP_DOWNLINK.store(true, core::sync::atomic::Ordering::Relaxed);
+            // 能量 VAD 唤醒: 先不开功放, 用服务端 ASR 确认关键词后继续;
+            // 非关键词静默挂断 (提前开 PA 会有上电 pop/底噪)。
+            // WakeNet 唤醒: 关键词已在本地确认, 跳过服务端门控直接建连。
+            keyword_gate = !keyword_wake;
+            keyword_gate_deadline = if keyword_gate {
+                now_ms + KEYWORD_GATE_TIMEOUT_MS
+            } else {
+                0
+            };
+            DROP_DOWNLINK.store(keyword_gate, core::sync::atomic::Ordering::Relaxed);
             preroll_flush = true;
             preroll_off = 0;
             // 补发最近 2s (包含完整唤醒词), 不要从当前时刻起算
             preroll_from = preroll.seq().saturating_sub(PREROLL_SAMPLES as u64);
             // 建连后才开始编码补发, 3s 音频需要更长的超时上限
             preroll_deadline = now_ms + 4_000;
-            info!("唤醒: 等待关键词确认");
+            if keyword_wake {
+                info!("唤醒: WakeNet 关键词命中");
+            } else {
+                info!("唤醒: 等待关键词确认");
+            }
             dispatch(&mut sm, &mut pending, DialogEvent::WakeTriggered);
         }
 
@@ -1490,8 +1595,8 @@ pub async fn run(
                 turn_up_frames,
                 turn_rms_max
             );
-            if listen_turn.heard() {
-                // 有说话: 正常等服务器回复, 播完继续聆听
+            // 有说话, 或 tts-selftest 的文本请求: 正常等服务器回复
+            if listen_turn.heard() || cfg!(feature = "tts-selftest") {
                 dispatch(&mut sm, &mut pending, DialogEvent::AutoListenStop);
             } else {
                 // 只是误唤醒/短促出声, 没人提问: 直接收尾回待机,
@@ -1614,7 +1719,7 @@ pub async fn run(
             wake.policy_mut().note_playback_end(now_ms);
             // 软件队列已空, 但 TX DMA 环里可能还有 ~128ms 尾音:
             // 留 500ms 本地静默期, 避免一进入 Listening 就录到自己的尾音。
-            listen_grace_until_ms = now_ms + 500;
+            listen_grace_until_ms = now_ms + 800;
             // 尾音同样禁止上行: 否则服务端 ASR 会把扬声器尾音/混响识别成
             // 用户说话, 回一句「我听到啦」形成自问自答 (真机日志可见)。
             mic_mute_until_ms = mic_mute_until_ms.max(now_ms + 600);
