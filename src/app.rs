@@ -82,8 +82,9 @@ const LISTEN_VAD_THRESHOLD: i16 = 180;
 /// 安静就判停 (总时长仅 1.5s), 用户还没开口回合已结束 → 服务器只收到
 /// 噪声/静音。改为累计有声时长门槛, 滤掉瞬态噪声。
 const LISTEN_MIN_VOICED_MS: u64 = 250;
-/// 回合结束: 说完后持续静音 1500ms 才收尾 (原 500ms/800ms 都太短)
-const LISTEN_SILENCE_MS: u64 = 1_500;
+/// 回合结束的静音判停基准 (实际阈值由 `ListenTurn` 按已说时长动态放宽:
+/// 短句 ~800ms、长句最长 1800ms)。
+const LISTEN_SILENCE_MS: u64 = 900;
 /// 聆听前 600ms 不统计有声 (codec/DMA 上电瞬态)
 const LISTEN_WARMUP_MS: u64 = 600;
 /// 从未检测到人声时, 12s 后收尾 (给多轮对话留思考时间)
@@ -807,6 +808,10 @@ pub async fn run(
                     // 新一轮播报: 丢弃上一轮残留的 AEC 时间戳
                     aec_clock.clear();
                     playback.on_tts_start();
+                    // 打断窗口重新武装: 从唤醒到播报开始只有 1~2s, 唤醒触发
+                    // 设置的 2s 冷却 + 1.5s 会话后抑制会覆盖整个播报开头,
+                    // 表现为"能打断但不够灵敏"。清掉抑制并保留 warmup。
+                    wake.policy_mut().note_playback_start(now_ms);
                     dispatch(&mut sm, &mut pending, DialogEvent::TtsStart)
                 },
                 Ok(SessionEvent::TtsStop) => {
@@ -1198,9 +1203,9 @@ pub async fn run(
             let cmd = match action {
                 Action::ConnectSession => {
                     // 等 WiFi 省电切到 None 再建连 (UDP 音频对 modem sleep 敏感);
-                    // 最多等 500ms, 超时照常连接
+                    // 最多等 250ms (配合 wifi 侧 100ms 轮询, 通常 1 个周期内完成)
                     pending_connect = true;
-                    connect_deadline = now_ms + 500;
+                    connect_deadline = now_ms + 250;
                     turn_up_frames = 0;
                     turn_rms_max = 0;
                     preroll_frames = 0;
@@ -1219,14 +1224,19 @@ pub async fn run(
         }
         pending.clear();
 
-        // WiFi 省电策略: 默认常开 `None`。
-        // ROADMAP 记录自适应切换 (空闲 Minimum / 会话 None) 会因切换瞬间
-        // 丢 1~3 包导致长句断序, 已在真机回退; 用 `ps-adaptive` 重新做 A/B,
-        // 未复测前不作为默认。
+        // WiFi 省电策略: 空闲 `Minimum` / 会话 `None` (默认)。
+        //
+        // 真机反馈「待机摸芯片烫手」: 射频常开 `None` 是主要热源 (~80-100mA,
+        // 整机 150-200mA ≈ 0.7-1W)。当初为了 UDP 下行不丢包才全程 `None`,
+        // 但那只在**会话期**必要。唤醒链路 (麦克风 → WakeNet) 完全不依赖
+        // 射频睡眠, 建连瞬间会切回 `None`。
+        //
+        // 曾经的顾虑「切换瞬间丢 1-3 包」只影响首句开头, 现在由 350ms 预缓冲
+        // 与欠载淡入吸收; `ps-adaptive` 保留为「全程 None」的 A/B 开关。
         let session_active = if cfg!(feature = "ps-adaptive") {
-            sm.state() != DialogState::Idle
-        } else {
             true
+        } else {
+            sm.state() != DialogState::Idle || prompt.is_active() || pending_connect
         };
         crate::wifi::WIFI_AUDIO_ACTIVE.store(session_active, core::sync::atomic::Ordering::Relaxed);
         if pending_connect
@@ -1506,12 +1516,18 @@ pub async fn run(
                 },
                 // 本地关键词打断: WS v1/无服务端 AEC 时，播报中仍跑 WakeNet;
                 // 只有命中「你好小智」才打断，避免普通环境声/自回声误触发。
-                // TTS 开头 1.2s 不检测 (功放上电/首句自回声)，之后才允许。
+                //
+                // 起始保护 400ms 而非 1.2s: 功放上电 pop 与首句自回声集中在
+                // 前几百毫秒, 再长会把"播报刚开口就想打断"的窗口挡掉。
                 DialogState::Speaking
                     if keyword_wake
                         && !server_aec
-                        && now_ms.saturating_sub(state_since_ms) >= 1_200 =>
+                        && now_ms.saturating_sub(state_since_ms) >= 400 =>
                 {
+                    // 打断检测是用户的主动动作, 不能被打断前那轮唤醒的冷却
+                    // 吞掉: 唤醒后 1~2s 就建连进入播报, 策略仍在 2s 冷却内,
+                    // 直接喂会一直返回 None —— 这是"能打断但不够灵敏"的主因。
+                    // 冷却已在 TtsStart 时清除 (见 note_playback_start)。
                     let mut barge = false;
                     for chunk in pcm.chunks(FRAME_SAMPLES) {
                         barge |= wake.feed(chunk, now_ms) == WakeEvent::Triggered;
@@ -1746,8 +1762,10 @@ pub async fn run(
         // 让出 CPU: 会话任务/网络任务需要被轮询才能推进连接与收发。
         // 活跃态 4ms (原 1ms): 下行解码 3 帧/轮仍 >45x 实时, RX 环 512ms,
         // 足以覆盖; 唤醒次数降 4 倍。Idle 保持 10ms。
+        // 低功耗待机时放宽到 40ms: WakeNet 按 32ms 一块喂, 余量足够;
+        // 唤醒延迟最多增加 40ms, 换 CPU 从 100Hz 唤醒降到 25Hz。
         let wait_ms = if sm.state() == DialogState::Idle {
-            10
+            if low_power { 40 } else { 10 }
         } else {
             4
         };
@@ -1770,6 +1788,11 @@ pub async fn run(
         if last_led != Some(led) {
             leds.set_mode(led);
             last_led = Some(led);
+        }
+        // 背光: 低功耗待机熄灭 (纯热损耗 20-40mA), 其余阶段点亮
+        let want_backlight = phase != LoopPhase::LowPowerIdle;
+        if display.backlight_on() != want_backlight {
+            display.set_backlight(want_backlight);
         }
         // 音量落盘: 仅在 Idle 稳定 1s 后写, 避免 Listening/Speaking 期擦写 Flash
         if volume_dirty

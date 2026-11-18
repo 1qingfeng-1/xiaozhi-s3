@@ -230,7 +230,10 @@ pub async fn reconnect_task(mut controller: esp_radio::wifi::WifiController<'sta
 
             match select(
                 controller.wait_for_disconnect_async(),
-                embassy_time::Timer::after(embassy_time::Duration::from_millis(500)),
+                // 100ms 轮询: 省电切换直接决定建连前的等待时间
+                // (`app::run` 最多等 500ms 的 `connect_deadline`),
+                // 原来 500ms 会让每次唤醒多等近半秒。
+                embassy_time::Timer::after(embassy_time::Duration::from_millis(100)),
             )
             .await
             {

@@ -51,7 +51,7 @@ pub struct Display {
     spi: Spi<'static, Blocking>,
     dc: Output<'static>,
     _rst: Output<'static>,
-    _backlight: Output<'static>,
+    backlight: Output<'static>,
     /// 面板尺寸来自 BoardConfig, 不在驱动层硬编码
     w: u16,
     h: u16,
@@ -78,7 +78,7 @@ impl Display {
             spi,
             dc,
             _rst: rst,
-            _backlight: backlight,
+            backlight,
             w: width,
             h: height,
         };
@@ -224,6 +224,23 @@ impl Display {
     }
 
     /// 状态行: 清区 + 写文本 (水平居中, 2 倍字高)
+    /// 背光开关 (待机低功耗: 背光是纯热损耗, 通常 20-40mA)
+    ///
+    /// 关闭后仍可正常绘制 (SPI 写入不回读), 下次点亮即看到最新内容,
+    /// 因此不需要重绘逻辑。
+    pub fn set_backlight(&mut self, on: bool) {
+        if on {
+            self.backlight.set_high();
+        } else {
+            self.backlight.set_low();
+        }
+    }
+
+    /// 背光当前是否点亮
+    pub fn backlight_on(&self) -> bool {
+        self.backlight.is_set_high()
+    }
+
     pub fn draw_status(&mut self, text: &str, fg: Rgb565) {
         const BG: Rgb565 = Rgb565::BLACK;
         let (w, h) = text_size(text);
