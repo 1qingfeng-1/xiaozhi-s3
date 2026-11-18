@@ -137,7 +137,11 @@ xiaozhi-core/        git submodule, 纯逻辑层: audio (音量映射/时钟/cod
   曾崩 WiFi blob 信标路径（`pm_on_beacon_rx` LoadProhibited）；故电量 ADC 只在 **Idle 且
   10s 限频**时读一次（会话/播报期绝不读，见 `app.rs` 主循环），充电态用 GPIO
   （CHARGING=41/DONE=42）实时。排查 WiFi 崩溃先确认电池 ADC 未在活跃期被读。
-- WiFi 默认常开 `PowerSaveMode::None`（长句 TTS 音质优先）；自适应「空闲 Minimum / 会话 None」放在 feature `ps-adaptive` 后（实测切换瞬间会丢 1~3 包）；deep-sleep 唤醒
+- WiFi 省电默认**自适应**：空闲 `Minimum` / 会话 `None`（2026-11-18 起；
+  全程 `None` 使待机 150-200mA ≈ 0.7-1W，真机反馈芯片烫手）。`ps-adaptive`
+  feature 现在表示"保持全程 `None`"的 A/B 开关。唤醒链路（麦克风 → WakeNet）
+  不依赖射频睡眠，建连瞬间切回 `None`；切换瞬间的 1~3 包丢失由 350ms 预缓冲
+  与欠载淡入吸收。低功耗待机另关背光、主循环放宽到 40ms。deep-sleep 唤醒
   **v1.0 不做**：BOOT/VOL± 是 GPIO1/18/2，S3 上非 RTC-capable，无法做按键唤醒。
 - embassy-net `StackResources` 容量按**每张表**计（`TcpSocket::new` 超容 panic → 重启循环）：
   STA 栈 `StackResources<6>`（wifi/mod.rs，DHCP+OTA+会话 TCP+UDP 音频）；SoftAP 配网表
