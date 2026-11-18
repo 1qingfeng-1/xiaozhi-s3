@@ -6,8 +6,8 @@
 >
 > 目标不是逐行移植，而是**同一块 gezipai 硬件上用户可感知的功能对齐**。
 > WakeNet 的「MMU block 1」限制已证伪并修复（实为 FFI 结构体错位，见
-> `vendor/esp-sr/README.md`）；AFE 仍缺预编译库与真实 FreeRTOS 任务桥接，
-> 相关项单独标注。
+> `vendor/esp-sr/README.md`）；AFE 的 NS/AGC/VAD 算法层已接入（`afe` feature），
+> AEC 仍缺 TDM 回采参考。最近一轮盘点 2026-11-18。
 
 ## 状态图例
 
@@ -35,9 +35,9 @@
 | `listen detect`（唤醒词音频上传） | 🟡 | `--features wakenet` 可本地识别「你好小智」；预录补发已覆盖唤醒词音频，但未按协议单独上传 detect |
 | realtime 聆听（播报中持续上行 + 服务端 AEC） | ✅ | `server_aec` 为真时 Speaking 持续上行，服务端 VAD 收尾 |
 | 激活码 / 激活挑战（HMAC） | ⬜ | 接官方 xiaozhi.me 时需要 |
-| OTA 下发 WebSocket 配置 | ⬜ | 当前只消费 `mqtt` 对象 |
-| OTA `firmware.force` | ⬜ | 当前按版本比较 |
-| OTA 校时 `server_time` | ⬜ | 待机时钟的前置 |
+| OTA 下发 WebSocket 配置 | ✅ | 2026-11 接通: 清单 `websocket` 对象 → NVS 0x9000 (url/token/version), 下次建连优先使用 |
+| OTA `firmware.force` | ✅ | 2026-11 接通: `force=1` 时同版本也升级 |
+| OTA 校时 `server_time` | ✅ | 2026-11 接通: 时钟存 UTC 原值, 时区单独返回 (待机时钟的前置) |
 | OTA 后确认 / 自动回滚确认 | 🟡 | 新镜像写 `NEW`、启动确认置 `VALID`；已构建并注入启用 `APP_ROLLBACK` 的自定义 bootloader（`tools/bootloader`），待真机验证二次启动回滚 |
 | 资源（assets）OTA | ⬜ | 依赖屏幕 UI 资源分区 |
 | MQTT TLS（8883） | ⬜ | 当前仅明文 1883，受信内网使用 |
@@ -82,7 +82,7 @@
 | 表情（21 种） | ⬜ | 屏幕 UI 批次 |
 | 状态栏（WiFi/电池/静音） | ⬜ | 屏幕 UI 批次 |
 | 聊天气泡（stt/tts 文本） | ⬜ | 文本已缓存，待 UI |
-| 待机时钟 | ⬜ | 依赖校时 |
+| 待机时钟 | 🟡 | 校时已接通 (`server_time`), 渲染待屏幕 UI 批次 |
 | 亮度 PWM / 息屏 | ⬜ | 当前背光常亮 |
 | 多语言（22 种，编译期） | ⬜ | 当前提示音固定中文 |
 | 音量单击 ±10 / 长按最大/静音 | ✅ | 2026-10-25 对齐 |
